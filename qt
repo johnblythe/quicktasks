@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+"""qt: fire-and-forget quicktasks for Claude Code.
+
+Queue a one-shot task from anywhere, get a desktop notification when it
+finishes. No session to babysit; every run is recorded in a ledger and
+can be reopened later with `qt resume <id>`.
+
+Data lives in ~/.quicktasks (override with QT_DATA). Dependencies:
+python3 and the claude CLI. Notifications use terminal-notifier when
+installed (app-style, clickable), else osascript. `qt setup` configures
+the preferred terminal for resume, the trusted-dir list, and permission
+mode. `qt doctor` is a read-only check that everything is wired up.
+
+Permissions model:
+- Default: headless runs use --permission-mode from QT_PERMISSIONS
+  (acceptEdits). In print mode Claude cannot prompt, so tool calls
+  outside the mode/allowlist are auto-denied.
+- A denied run is marked "blocked" and raises a clickable notification
+  (or a dialog without terminal-notifier) that reopens the session in
+  the user's preferred terminal, where the denied action can be
+  approved interactively so the task finishes.
+- Trusted dirs: the user can explicitly mark directories via
+  `qt trust <dir>` or `qt setup`. Tasks running in a trusted dir run in
+  that dir itself under "trusted_permissions" (default "auto": a model
+  approves safe tool calls and denies risky ones; set it to
+  "bypassPermissions" to skip approval entirely). The trusted list is
+  empty until the user adds to it; escalation is always user-configured,
+  never a default.
+"""
+
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+QT_DATA = os.path.expanduser(os.environ.get("QT_DATA", "~/.quicktasks"))
+TASKS_DIR = os.path.join(QT_DATA, "tasks")
+LOGS_DIR = os.path.join(QT_DATA, "logs")
+WORKSPACE = os.path.join(QT_DATA, "workspace")
+TMP_DIR = os.path.join(QT_DATA, "tmp")
+CONFIG_PATH = os.path.join(QT_DATA, "config.json")
+TIMEOUT = int(os.environ.get("QT_TIMEOUT", "1800"))
+MODEL = os.environ.get("QT_MODEL", "")
+# Permission mode for non-trusted runs. Resolution: QT_PERMISSIONS env >
+# config.json "permissions" > acceptEdits. Users who want classifier-driven
+# approvals can set "permissions": "auto" in their config: a model
+# (Sonnet 5) approves safe tool calls and denies risky ones, with no prompt
+# fallback in headless. Auto requires a session model that supports it
+# (Sonnet 4.6+/Opus 4.6+/Fable 5); unsupported models (e.g. Haiku) silently
+# downgrade to Manual, which in headless denies everything non-allowlisted.
+PERMISSIONS_ENV = os.environ.get("QT_PERMISSIONS")
+
+
+def resolve_permissions():
+    return PERMISSIONS_ENV or load_config().get("permissions") or "acceptEdits"
+
+
+def resolve_trusted_permissions():
+    return load_config().get("trusted_permissions") or "auto"
+
+WORKSPACE_CLAUDE_MD = """\
+# Quicktask runner
+
+You are executing a one-shot, unattended task. No user is watching and
+nobody can answer questions.
+
+- Never ask for clarification. Make the most reasonable assumption and
+  state it in your final message.
+- Lead your final message with the outcome in one or two sentences. It
+  becomes a desktop notification, so the first line must stand alone.
+- Do exactly what the task says. Do not expand scope.
+- If the task references "this repo" or "current directory", use the
+  invocation directory noted at the end of the prompt.
+- Save artifacts where the task says; otherwise save them in this
+  directory and name the path in your final message.
+- If a tool call is denied by permissions, do not look for another way
+  to do the same thing. Stop that line of work and report exactly what
+  was blocked; the user gets offered a resume to approve it.
+- If the task cannot be completed, say exactly what is missing in one
+  sentence.
+"""
+
+
+# --- config -------------------------------------------------------------
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(cfg):
+    os.makedirs(QT_DATA, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def trusted_dirs():
+    return [
+        os.path.realpath(os.path.expanduser(d))
+        for d in load_config().get("trusted_dirs", [])
+    ]
+
+
+def is_trusted(path):
+    p = os.path.realpath(os.path.expanduser(path))
+    for t in trusted_dirs():
+        if p == t or p.startswith(t + os.sep):
+            return True
+    return False
+
+
+def find_bin(name, extra=()):
+    w = shutil.which(name)
+    if w and "/T/" not in w:
+        return w
+    for c in extra:
+        c = os.path.expanduser(c)
+        if os.path.exists(c):
+            return c
+    return w
+
+
+def find_claude():
+    """Prefer a stable install over session shims (cmux temp dirs)."""
+    w = shutil.which("claude")
+    if w and "/T/" not in w and "cmux" not in w:
+        return w
+    for c in (
+        os.path.expanduser("~/.local/bin/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        os.path.expanduser("~/.claude/local/claude"),
+    ):
+        if os.path.exists(c):
+            return c
+    return w  # last resort: the shim, or None
+
+
+def find_cmux():
+    return find_bin("cmux", ["/Applications/cmux.app/Contents/Resources/bin/cmux"])
+
+
+def find_notifier():
+    """terminal-notifier is opt-in ("notifier": "terminal-notifier" in
+    config): on modern macOS its notifications are silently dropped unless
+    the user has authorized the app, so the reliable osascript path is the
+    default and terminal-notifier is for users who have set it up."""
+    if load_config().get("notifier") != "terminal-notifier":
+        return None
+    return find_bin("terminal-notifier", ["/opt/homebrew/bin/terminal-notifier",
+                                          "/usr/local/bin/terminal-notifier"])
+
+
+def detect_terminals():
+    found = []
+    if find_cmux():
+        found.append("cmux")
+    if os.path.isdir("/Applications/Ghostty.app"):
+        found.append("Ghostty")
+    if os.path.isdir("/Applications/iTerm.app"):
+        found.append("iTerm")
+    found.append("Terminal")
+    return found
+
+
+# --- notifications ------------------------------------------------------
+
+def notify(title, subtitle, body, execute=None):
+    """App-style via terminal-notifier when present; osascript fallback.
+    `execute` = shell string run when the notification is clicked."""
+    try:
+        tn = find_notifier()
+        if tn:
+            cmd = [tn, "-title", title, "-subtitle", subtitle[:60],
+                   "-message", body[:240], "-group", "qt-" + subtitle[:20]]
+            if execute:
+                cmd += ["-execute", execute]
+            subprocess.run(cmd, capture_output=True, timeout=10)
+            return
+        script = "display notification {} with title {} subtitle {}".format(
+            json.dumps(body[:200]), json.dumps(title), json.dumps(subtitle[:60])
+        )
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+    except Exception:
+        pass  # notification failure must never fail the task
+
+
+def write_command_file(name, argv):
+    """A .command file that execs `argv` via zsh; used by terminal launchers
+    that need an openable script rather than a raw argv (Terminal/Ghostty/
+    custom templates all take a path, not a command line)."""
+    cmd_file = os.path.join(TMP_DIR, f"{name}.command")
+    os.makedirs(TMP_DIR, exist_ok=True)
+    with open(cmd_file, "w") as f:
+        f.write("#!/bin/zsh\nexec {}\n".format(shlex.join(argv)))
+    os.chmod(cmd_file, 0o755)
+    return cmd_file
+
+
+def _run_quiet(argv, timeout=15):
+    """Run argv, swallowing the ways a launch command can fail to start at
+    all. Returns True on rc 0."""
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=timeout).returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _cmux_ready(cmux):
+    """Whether the cmux socket is up right now (CMUX_QUIET suppresses its
+    alias notices, which would otherwise print on every check)."""
+    try:
+        env = dict(os.environ, CMUX_QUIET="1")
+        return subprocess.run([cmux, "workspace", "list"], capture_output=True,
+                              timeout=3, env=env).returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _launch_cmux(workspace_name, argv):
+    """Try cmux new-workspace with argv as the command. If the socket is
+    down (app not running), launch the app and poll for it before retrying
+    once. Returns True only if a new-workspace call actually succeeded."""
+    cmux = find_cmux()
+    if not cmux:
+        return False
+    new_workspace = [cmux, "new-workspace", "--name", workspace_name,
+                      "--command", shlex.join(argv), "--focus", "true"]
+    if _run_quiet(new_workspace):
+        return True
+    if not _run_quiet(["open", "-ga", "cmux"]):  # app probably isn't running
+        return False
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if _cmux_ready(cmux):
+            return _run_quiet(new_workspace)
+        time.sleep(0.5)
+    return False
+
+
+def _launch_in_terminal(file_stub, workspace_name, argv):
+    """Launch `argv` in the user's preferred terminal (config "terminal"),
+    following the cmux -> Ghostty -> custom template -> Terminal.app chain.
+    Any fallback away from the configured terminal raises a notification
+    instead of failing silently, and an unexpected exception still ends in
+    a Terminal attempt rather than a stack trace: this path runs from
+    notification clicks and Raycast, where stderr is invisible."""
+    try:
+        term = load_config().get("terminal", "Terminal")
+
+        if term == "cmux":
+            if _launch_cmux(workspace_name, argv):
+                return
+            notify("Quicktask resume", workspace_name,
+                   "cmux unreachable, opened in Terminal instead · qt doctor")
+            term = "Terminal"
+
+        script = write_command_file(file_stub, argv)
+
+        if term == "Ghostty":
+            if _run_quiet(["open", "-na", "Ghostty", "--args", "-e", script]):
+                return
+            notify("Quicktask resume", workspace_name,
+                   "Ghostty unreachable, opened in Terminal instead · qt doctor")
+            term = "Terminal"
+
+        if "{script}" in term:  # custom command template, tokenized (no shell)
+            custom_argv = [a.replace("{script}", script) for a in shlex.split(term)]
+            if _run_quiet(custom_argv):
+                return
+            notify("Quicktask resume", workspace_name,
+                   "custom terminal command failed, opened in Terminal instead · qt doctor")
+            term = "Terminal"
+
+        _run_quiet(["open", "-a", term, script])
+    except Exception:
+        try:
+            script = write_command_file(file_stub, argv)
+            subprocess.run(["open", "-a", "Terminal", script], capture_output=True, timeout=15)
+        except Exception:
+            pass
+        notify("Quicktask resume", workspace_name,
+               "terminal launch failed, opened in Terminal instead · qt doctor")
+
+
+def launch_resume_terminal(tid):
+    """Open the user's preferred terminal running `qt resume <tid>`."""
+    argv = [sys.executable, os.path.abspath(__file__), "resume", tid]
+    _launch_in_terminal(f"resume-{tid}", f"qt {tid}", argv)
+
+
+def launch_test_terminal():
+    """Open the user's preferred terminal running a harmless self-test
+    command. Used by `qt setup`'s "test launch now?" prompt; never resumes
+    a real session."""
+    argv = [sys.executable, os.path.abspath(__file__), "_test-echo"]
+    _launch_in_terminal("test-launch", "qt test launch", argv)
+
+
+def notify_blocked(task, denials):
+    names = ", ".join(sorted({d.get("tool_name", "?") for d in denials})) or "a tool call"
+    if find_notifier():
+        qt_bin = os.path.abspath(__file__)
+        execute = "{} {} _resume-launch {}".format(
+            shlex.quote(sys.executable), shlex.quote(qt_bin), shlex.quote(task["id"])
+        )
+        term = load_config().get("terminal", "Terminal")
+        notify(
+            "Quicktask ⊘ blocked",
+            task["prompt"],
+            f"Denied: {names} · click to resume in {term}",
+            execute=execute,
+        )
+    else:
+        notify(
+            "Quicktask ⊘ blocked",
+            task["prompt"],
+            f"Denied: {names} · resume via Raycast 'Quick Task Resume' or qt resume {task['id']}",
+        )
+
+
+# --- plumbing -----------------------------------------------------------
+
+def bootstrap():
+    for d in (TASKS_DIR, LOGS_DIR, WORKSPACE, TMP_DIR):
+        os.makedirs(d, exist_ok=True)
+    claude_md = os.path.join(WORKSPACE, "CLAUDE.md")
+    if not os.path.exists(claude_md):
+        with open(claude_md, "w") as f:
+            f.write(WORKSPACE_CLAUDE_MD)
+
+
+def task_path(tid):
+    return os.path.join(TASKS_DIR, tid + ".json")
+
+
+def load(tid):
+    with open(task_path(tid)) as f:
+        return json.load(f)
+
+
+def save(task):
+    tmp = task_path(task["id"]) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(task, f, indent=2)
+    os.replace(tmp, task_path(task["id"]))
+
+
+def now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def new_id(prompt):
+    stamp = datetime.datetime.now().strftime("%m%d-%H%M%S")
+    words = re.sub(r"[^a-z0-9 ]", "", prompt.lower()).split()[:3]
+    slug = "-".join(words)[:24].strip("-")
+    return f"{stamp}-{slug}" if slug else stamp
+
+
+# --- queue / run --------------------------------------------------------
+
+def queue(prompt, wait=False, in_dir=None, model=None):
+    bootstrap()
+    invoked = os.getcwd()
+    if in_dir:
+        run_cwd = os.path.realpath(os.path.expanduser(in_dir))
+        if not os.path.isdir(run_cwd):
+            sys.exit(f"--in: not a directory: {run_cwd}")
+    elif is_trusted(invoked):
+        run_cwd = invoked
+    else:
+        run_cwd = WORKSPACE
+    trusted = is_trusted(run_cwd)
+    perm_mode = resolve_trusted_permissions() if trusted else resolve_permissions()
+
+    tid = new_id(prompt)
+    task = {
+        "id": tid,
+        "prompt": prompt,
+        "status": "queued",
+        "created": now(),
+        "invoked_from": invoked,
+        "run_cwd": run_cwd,
+        "perm_mode": perm_mode,
+        "model": model or MODEL or load_config().get("model") or None,
+        "session_id": None,
+        "result": None,
+        "cost_usd": None,
+    }
+    save(task)
+    if wait:
+        run_task(tid, interactive=True)
+        t = load(tid)
+        print(f"[{t['status']}] {t.get('result') or ''}")
+        if t["status"] == "blocked":
+            print(f"\ndenied: {', '.join(d.get('tool_name', '?') for d in t.get('denials', []))}")
+            print(f"qt resume {tid}  # approve and continue")
+        sys.exit(0 if t["status"] == "done" else 1)
+    log = open(os.path.join(LOGS_DIR, tid + ".log"), "a")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_run", tid],
+        stdout=log, stderr=log, start_new_session=True, cwd=QT_DATA,
+    )
+    trust_note = f" (trusted dir, {perm_mode})" if trusted else ""
+    print(f"queued {tid}{trust_note}")
+
+
+def run_task(tid, interactive=False):
+    task = load(tid)
+    task["status"] = "running"
+    task["started"] = now()
+    save(task)
+
+    claude = find_claude()
+    if not claude:
+        task.update(status="failed", result="claude CLI not found on PATH", finished=now())
+        save(task)
+        notify("Quicktask failed", task["prompt"], "claude CLI not found")
+        return
+
+    prompt = task["prompt"] + (
+        f"\n\n(Context: task fired from directory {task['invoked_from']}. "
+        "Only relevant if the task references the current directory or repo.)"
+    )
+    cmd = [
+        claude, "-p", prompt,
+        "--output-format", "json",
+        "--permission-mode", task.get("perm_mode") or resolve_permissions(),
+    ]
+    if task.get("model"):
+        cmd += ["--model", task["model"]]
+
+    log_path = os.path.join(LOGS_DIR, tid + ".log")
+    run_cwd = task.get("run_cwd", WORKSPACE)
+    try:
+        proc = subprocess.run(
+            cmd, cwd=run_cwd, capture_output=True, text=True, timeout=TIMEOUT
+        )
+        stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
+    except subprocess.TimeoutExpired as e:
+        stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        with open(log_path, "a") as f:
+            f.write(stdout + f"\n--- timed out after {TIMEOUT}s ---\n")
+        task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
+        save(task)
+        notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}")
+        return
+
+    with open(log_path, "a") as f:
+        f.write(stdout)
+        if stderr:
+            f.write("\n--- stderr ---\n" + stderr)
+
+    data = {}
+    for line in reversed(stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                data = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+
+    result = (data.get("result") or "").strip()
+    denials = data.get("permission_denials") or []
+    ok = rc == 0 and not data.get("is_error", False)
+    if denials:
+        status = "blocked"
+    elif ok:
+        status = "done"
+    else:
+        status = "failed"
+    task.update(
+        status=status,
+        result=result or (stderr.strip()[-300:] if not ok else ""),
+        session_id=data.get("session_id"),
+        cost_usd=data.get("total_cost_usd"),
+        denials=[
+            {"tool_name": d.get("tool_name"), "tool_input": d.get("tool_input")}
+            for d in denials
+        ],
+        finished=now(),
+    )
+    save(task)
+
+    if status == "blocked":
+        if not interactive:
+            notify_blocked(task, denials)
+        return
+    icon = "✓" if status == "done" else "✗"
+    cost = f" · ${task['cost_usd']:.2f}" if task.get("cost_usd") else ""
+    notify(
+        f"Quicktask {icon}{cost}",
+        task["prompt"],
+        result.splitlines()[0] if result else status,
+    )
+
+
+# --- commands -----------------------------------------------------------
+
+def age(iso):
+    delta = datetime.datetime.now() - datetime.datetime.fromisoformat(iso)
+    s = int(delta.total_seconds())
+    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= div:
+            return f"{s // div}{unit}"
+    return f"{s}s"
+
+
+def cmd_list(n=15):
+    bootstrap()
+    files = sorted(
+        (f for f in os.listdir(TASKS_DIR) if f.endswith(".json")), reverse=True
+    )[:n]
+    if not files:
+        print('no quicktasks yet · qt "do a thing"')
+        return
+    glyph = {"done": "✓", "failed": "✗", "timeout": "⏱", "running": "…",
+             "queued": "·", "blocked": "⊘"}
+    for f in files:
+        with open(os.path.join(TASKS_DIR, f)) as fh:
+            t = json.load(fh)
+        p = t["prompt"].replace("\n", " ")[:56]
+        r = (t.get("result") or "").replace("\n", " ")[:60]
+        print(f"{glyph.get(t['status'], '?')} {age(t['created']):>4} {t['id']:<32} {p:<58} {r}")
+
+
+def cmd_log(tid):
+    t = load(tid)
+    print(json.dumps({k: v for k, v in t.items() if k != "result"}, indent=2))
+    print("\n--- result ---\n" + (t.get("result") or "(none)"))
+    log = os.path.join(LOGS_DIR, tid + ".log")
+    if os.path.exists(log):
+        print(f"\nraw log: {log}")
+
+
+def cmd_resume(tid):
+    t = load(tid)
+    sid = t.get("session_id")
+    if not sid:
+        sys.exit(f"no session id recorded for {tid} (status: {t['status']})")
+    os.chdir(t.get("run_cwd", WORKSPACE))
+    claude = find_claude()
+    os.execvp(claude, [claude, "--resume", sid])
+
+
+def cmd_trust(path=None):
+    cfg = load_config()
+    dirs = cfg.get("trusted_dirs", [])
+    if path is None:
+        if dirs:
+            for d in dirs:
+                print(d)
+        else:
+            print("no trusted dirs · qt trust <dir> to add one (tasks run in place there)")
+        return
+    p = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isdir(p):
+        sys.exit(f"not a directory: {p}")
+    if p in [os.path.realpath(os.path.expanduser(d)) for d in dirs]:
+        print(f"already trusted: {p}")
+        return
+    dirs.append(p)
+    cfg["trusted_dirs"] = dirs
+    save_config(cfg)
+    print(f"trusted: {p}\ntasks fired here now run in place ({resolve_trusted_permissions()} permissions)")
+
+
+def cmd_untrust(path):
+    cfg = load_config()
+    p = os.path.realpath(os.path.expanduser(path))
+    dirs = [d for d in cfg.get("trusted_dirs", [])
+            if os.path.realpath(os.path.expanduser(d)) != p]
+    if len(dirs) == len(cfg.get("trusted_dirs", [])):
+        sys.exit(f"was not trusted: {p}")
+    cfg["trusted_dirs"] = dirs
+    save_config(cfg)
+    print(f"untrusted: {p}")
+
+
+def cmd_setup():
+    bootstrap()
+    cfg = load_config()
+    candidates = detect_terminals()
+    cur = cfg.get("terminal", candidates[0])
+
+    print("Preferred terminal (blocked tasks resume there):")
+    for i, c in enumerate(candidates, 1):
+        mark = "  ← current" if c == cur else ""
+        print(f"  {i}. {c}{mark}")
+    print("  or paste a custom command template containing {script}")
+    choice = input(f"choice [{cur}]: ").strip()
+    if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+        cfg["terminal"] = candidates[int(choice) - 1]
+    elif choice in candidates or "{script}" in choice:
+        cfg["terminal"] = choice
+    elif choice:
+        print(f"  unrecognized, keeping {cur}")
+        cfg["terminal"] = cur
+    else:
+        cfg["terminal"] = cur
+    save_config(cfg)  # so a test launch below picks up the chosen terminal
+
+    if input("test launch now? [y/N]: ").strip().lower() in ("y", "yes"):
+        print('  opening... look for "qt: terminal launch works. You can close this."')
+        launch_test_terminal()
+
+    dirs = cfg.get("trusted_dirs", [])
+    print('\nTrusted dirs: tasks there run in the dir itself with "auto" permissions')
+    print("(a model approves safe tool calls, denies risky ones); everywhere else")
+    print('runs in the sandbox workspace and may come back "blocked" for approval.')
+    if os.path.isdir(os.path.expanduser("~/code")) and os.path.expanduser("~/code") not in dirs:
+        print("  example candidate: ~/code")
+    print(f"  current: {', '.join(dirs) or 'none'}")
+    add = input("add dirs (space-separated, ~ ok, empty to skip): ").strip()
+    if add:
+        for d in shlex.split(add):
+            p = os.path.realpath(os.path.expanduser(d))
+            if not os.path.isdir(p):
+                print(f"  skipped (not a dir): {p}")
+            elif p in dirs:
+                print(f"  already trusted: {p}")
+            else:
+                dirs.append(p)
+                print(f"  trusted: {p}")
+        cfg["trusted_dirs"] = dirs
+
+    cur_perm = cfg.get("permissions", "acceptEdits")
+    print(f"\nPermissions for everything outside a trusted dir (current: {cur_perm}):")
+    print("  1. keep current")
+    print("  2. acceptEdits · headless denies anything outside your allowlist")
+    print("  3. auto · a classifier approves safe calls and denies risky ones,")
+    print("     far fewer blocked tasks; needs a Sonnet 4.6+/Opus 4.6+/Fable-class")
+    print("     session model or it silently falls back to denying everything")
+    perm_choice = input("choice [1]: ").strip()
+    if perm_choice == "2":
+        cfg["permissions"] = "acceptEdits"
+    elif perm_choice == "3":
+        cfg["permissions"] = "auto"
+
+    tn = find_notifier()
+    print(f"\nNotifications: " + (
+        f"terminal-notifier (app-style, click-to-resume) · {tn}" if tn
+        else "osascript fallback · `brew install terminal-notifier` for app-style + click-to-resume"
+    ))
+    save_config(cfg)
+    print(f"\nsaved → {CONFIG_PATH}")
+    print(f"terminal={cfg['terminal']} · permissions={cfg.get('permissions', 'acceptEdits')} "
+          f"· trusted={len(cfg.get('trusted_dirs', []))} dir(s)")
+    print("\nnext: qt doctor")
+    print("Raycast script commands: Settings → Extensions → + → Add Script Directory → raycast/")
+    print("  (Quick Task · Quick Task List · Quick Task Resume)")
+    print("Raycast extension (interactive ledger): cd raycast-ext && npm install && npm run dev")
+
+
+def cmd_test_echo():
+    """Target of the terminal-launch self-test; never resumes a session."""
+    print("qt: terminal launch works. You can close this.")
+
+
+def cmd_doctor():
+    """Read-only environment health check. Exits nonzero on a hard failure
+    (qt cannot run tasks at all); soft issues are marked "!" with a remedy
+    and don't affect the exit code."""
+    try:
+        bootstrap()  # doctor still needs the data dir to exist to check it
+    except OSError:
+        pass  # reported below as an unwritable data dir instead of a crash
+    hard_fail = False
+
+    def report(status, label, detail="", remedy=None):
+        nonlocal hard_fail
+        marker = {"ok": "ok", "warn": "!", "fail": "FAIL"}[status]
+        if status == "fail":
+            hard_fail = True
+        print(f"{marker:<4} {label:<22} {detail}".rstrip())
+        if remedy:
+            print(f"       -> {remedy}")
+
+    claude = find_claude()
+    if claude:
+        ver = "?"
+        try:
+            r = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10)
+            out = (r.stdout or r.stderr or "").strip()
+            ver = out.splitlines()[0] if out else "?"
+        except Exception:
+            pass
+        report("ok", "claude CLI", f"{claude} ({ver})")
+    else:
+        report("fail", "claude CLI", "not found on PATH",
+                "install: https://docs.claude.com/en/docs/claude-code")
+
+    writable = os.path.isdir(QT_DATA) and os.access(QT_DATA, os.W_OK)
+    report("ok" if writable else "fail", "data dir", QT_DATA,
+            None if writable else "check permissions on this directory")
+
+    cfg = load_config()
+    if os.path.exists(CONFIG_PATH):
+        summary = (f"terminal={cfg.get('terminal', 'Terminal')} · "
+                   f"permissions={cfg.get('permissions', 'acceptEdits')} · "
+                   f"model={cfg.get('model') or 'inherit'} · "
+                   f"trusted={len(cfg.get('trusted_dirs', []))} dir(s) · "
+                   f"notifier={cfg.get('notifier', 'osascript')}")
+        report("ok", "config", summary)
+    else:
+        report("warn", "config", "none yet", "run: qt setup")
+
+    term = cfg.get("terminal", "Terminal")
+    if term == "cmux":
+        cmux = find_cmux()
+        if not cmux:
+            report("warn", "terminal (cmux)", "binary not found",
+                    "install cmux, or qt setup to pick a different terminal")
+        elif _cmux_ready(cmux):
+            report("ok", "terminal (cmux)", f"{cmux}, socket responding")
+        else:
+            report("ok", "terminal (cmux)",
+                    f"{cmux}, app not running now (resume auto-starts it)")
+    elif term in ("Ghostty", "iTerm"):
+        app_path = f"/Applications/{term}.app"
+        if os.path.isdir(app_path):
+            report("ok", f"terminal ({term})", app_path)
+        else:
+            report("warn", f"terminal ({term})", f"{app_path} not found",
+                    "install it, or qt setup to pick a different terminal")
+    elif term == "Terminal":
+        report("ok", "terminal (Terminal)", "built in")
+    else:
+        report("ok", "terminal (custom)", term)
+
+    tn = find_notifier()
+    if tn:
+        report("ok", "notifier", f"terminal-notifier · {tn}")
+    else:
+        report("ok", "notifier",
+                "osascript · upgrade: brew install terminal-notifier, then set in qt setup")
+
+    home_local_bin = os.path.expanduser("~/.local/bin")
+    on_path = home_local_bin in os.environ.get("PATH", "").split(os.pathsep)
+    report("ok" if on_path else "warn", "PATH", home_local_bin,
+            None if on_path else "add ~/.local/bin to PATH in your shell rc")
+
+    dirs = cfg.get("trusted_dirs", [])
+    if not dirs:
+        report("ok", "trusted dirs", "none (everything runs conservative)")
+    else:
+        for d in dirs:
+            gone = not os.path.isdir(os.path.realpath(os.path.expanduser(d)))
+            report("warn" if gone else "ok", "trusted dir",
+                    d + (" (no longer exists)" if gone else ""),
+                    "qt untrust " + d if gone else None)
+
+    print()
+    print("hard failures found; qt cannot run tasks" if hard_fail else "no hard failures")
+    if hard_fail:
+        sys.exit(1)
+
+
+def latest_blocked():
+    files = sorted(
+        (f for f in os.listdir(TASKS_DIR) if f.endswith(".json")), reverse=True
+    )
+    for f in files:
+        with open(os.path.join(TASKS_DIR, f)) as fh:
+            if json.load(fh).get("status") == "blocked":
+                return f[:-5]
+    sys.exit("no blocked tasks")
+
+
+def match_id(fragment):
+    """Allow qt log/resume with a unique id fragment."""
+    hits = [f[:-5] for f in os.listdir(TASKS_DIR) if fragment in f and f.endswith(".json")]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        sys.exit(f"no task matching '{fragment}'")
+    sys.exit(f"ambiguous: {', '.join(sorted(hits))}")
+
+
+HELP = """\
+qt · fire-and-forget quicktasks for Claude Code
+
+  qt "do a thing"        queue a task, return immediately, notify on finish
+  qt -w "do a thing"     run in the foreground and print the result
+  qt --in <dir> "..."    run the task in <dir> (in place if trusted)
+  qt -m <model> "..."    override the model for this task
+  qt list [n]            recent tasks (default 15)
+  qt log <id>            full record + raw log path (id fragments ok)
+  qt resume <id>         reopen a task as an interactive session
+  qt setup               pick terminal, trusted dirs, permission mode
+  qt doctor              read-only environment health check
+  qt trust [dir]         list trusted dirs, or add one (tasks run in place)
+  qt untrust <dir>       remove a trusted dir
+
+Runs fired from inside a trusted dir run there with "auto" permissions
+(config "trusted_permissions" overrides, e.g. "bypassPermissions").
+Everything else runs conservatively; a denied tool call marks the task
+"blocked" (⊘) and raises a notification. Resume it via the Raycast
+"Quick Task Resume" command (opens your preferred terminal on that
+session) or qt resume <id>.
+
+config (env): QT_DATA (~/.quicktasks) · QT_TIMEOUT (1800s) · QT_MODEL
+(inherit) · QT_PERMISSIONS (acceptEdits by default)
+"""
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("help", "-h", "--help"):
+        print(HELP)
+        return
+    cmd = args[0]
+    if cmd == "list":
+        cmd_list(int(args[1]) if len(args) > 1 else 15)
+    elif cmd == "log" and len(args) > 1:
+        bootstrap()
+        cmd_log(match_id(args[1]))
+    elif cmd == "resume" and len(args) > 1:
+        bootstrap()
+        cmd_resume(match_id(args[1]))
+    elif cmd == "setup":
+        cmd_setup()
+    elif cmd == "doctor":
+        cmd_doctor()
+    elif cmd == "trust":
+        cmd_trust(args[1] if len(args) > 1 else None)
+    elif cmd == "untrust" and len(args) > 1:
+        cmd_untrust(args[1])
+    elif cmd == "_run" and len(args) > 1:
+        run_task(args[1])
+    elif cmd == "_resume-launch":
+        bootstrap()
+        launch_resume_terminal(match_id(args[1]) if len(args) > 1 else latest_blocked())
+    elif cmd == "_test-echo":
+        cmd_test_echo()
+    else:
+        wait = False
+        in_dir = None
+        model = None
+        while args and args[0] in ("-w", "--wait", "--in", "-m", "--model"):
+            if args[0] in ("-w", "--wait"):
+                wait = True
+                args = args[1:]
+            elif args[0] in ("-m", "--model"):
+                if len(args) < 2:
+                    sys.exit("-m needs a model name")
+                model = args[1]
+                args = args[2:]
+            else:
+                if len(args) < 2:
+                    sys.exit("--in needs a directory")
+                in_dir = args[1]
+                args = args[2:]
+        if not args:
+            sys.exit("nothing to do; qt help")
+        queue(" ".join(args), wait=wait, in_dir=in_dir, model=model)
+
+
+if __name__ == "__main__":
+    main()
