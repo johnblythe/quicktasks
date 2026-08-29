@@ -52,6 +52,7 @@ Shortcuts runs a bare shell, hence the absolute path; `qt` locates `claude` on i
 | `qt resume <id>` | reopen a task as an interactive session |
 | `qt setup` | pick terminal, trusted dirs, permission mode |
 | `qt doctor` | read-only environment health check |
+| `qt install-handler` | register `quicktask://` links (clickable Slack resume) |
 | `qt trust [dir]` / `qt untrust <dir>` | manage trusted dirs |
 
 ## How it works
@@ -68,6 +69,10 @@ Two tiers, both explicit:
 `auto` mode is the useful middle ground, and the default for trusted dirs: Claude Code's classifier (a Sonnet 5 model, independent of your session model) approves safe tool calls and denies risky ones, so far fewer tasks come back blocked than under `acceptEdits`. Setting `"permissions": "auto"` applies the same everywhere else. Caveat: auto mode requires a session model that supports it (Sonnet 4.6+/Opus 4.6+/Fable 5). Unsupported models like Haiku silently downgrade to Manual, which in headless means everything non-allowlisted is denied; don't pair `-m haiku` with auto and expect it to work.
 
 A denied run is marked **blocked** (`⊘` in `qt list`), records the exact denied tool call, and raises a notification naming what was denied. Resume it without touching a terminal: Raycast → **Quick Task Resume** (script command; empty argument targets the latest blocked task) or **Resume in Terminal** (extension, on any task with a session id) opens your preferred terminal on that exact session; approve the denied action there and the task picks up where it stopped. With cmux configured, that's a new workspace named after the task, and if the cmux app isn't already running, qt starts it and waits up to about 10 seconds for its socket before retrying, so you don't need cmux open in advance. Any fallback away from your configured terminal (cmux unreachable, Ghostty missing, a custom template that fails) opens Terminal.app instead and raises a notification saying so, so a wrong-terminal resume is never silent. `qt resume <id>` does the same from a shell. Tasks stay resumable forever; missing a notification never loses anything.
+
+### Resume links in Slack
+
+Tasks that post to Slack end their messages with a resume line: the plain `qt resume <id>` command plus a `quicktask://resume/<id>` link. Run `qt install-handler` once to make that link clickable: it registers a small macOS URL handler (an applet in `~/.quicktasks/`, delete it to uninstall) that opens the task's session in your preferred terminal. Slack asks for confirmation on the first click of the scheme. Link ids are validated to letters, digits, and hyphens before anything reaches a shell.
 
 Notifications use osascript (shows as Script Editor), which displays reliably without setup. terminal-notifier support exists behind `"notifier": "terminal-notifier"` in config, which makes blocked notifications directly clickable, but on modern macOS its notifications are silently dropped until you authorize the app in System Settings → Notifications; only opt in if you've done that and verified it displays.
 
