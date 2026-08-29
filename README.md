@@ -52,7 +52,7 @@ Shortcuts runs a bare shell, hence the absolute path; `qt` locates `claude` on i
 | `qt resume <id>` | reopen a task as an interactive session |
 | `qt setup` | pick terminal, trusted dirs, permission mode |
 | `qt doctor` | read-only environment health check |
-| `qt install-handler` | register `quicktask://` links (clickable Slack resume) |
+| `qt install-handler` / `qt uninstall-handler` | register or remove `quicktask://` links (clickable Slack resume) |
 | `qt trust [dir]` / `qt untrust <dir>` | manage trusted dirs |
 
 ## How it works
@@ -72,7 +72,7 @@ A denied run is marked **blocked** (`⊘` in `qt list`), records the exact denie
 
 ### Resume links in Slack
 
-Tasks that post to Slack end their messages with a resume line: the plain `qt resume <id>` command plus a `quicktask://resume/<id>` link. Run `qt install-handler` once to make that link clickable: it registers a small macOS URL handler (an applet in `~/.quicktasks/`, delete it to uninstall) that opens the task's session in your preferred terminal. Slack asks for confirmation on the first click of the scheme. Link ids are validated to letters, digits, and hyphens before anything reaches a shell.
+Tasks that post to Slack end their messages with a resume line: the plain `qt resume <id>` command plus a `quicktask://resume/<id>` link. Run `qt install-handler` once to make that link clickable: it registers a small macOS URL handler (an applet in your qt data dir, with your qt path and any `QT_DATA` override baked in) that opens the task's session in your preferred terminal, with no Dock icon. `qt uninstall-handler` removes the app and its scheme registration. Slack asks for confirmation on the first click of the scheme. Link ids are validated to lowercase letters, digits, and hyphens before anything reaches a shell.
 
 Notifications use osascript (shows as Script Editor), which displays reliably without setup. terminal-notifier support exists behind `"notifier": "terminal-notifier"` in config, which makes blocked notifications directly clickable, but on modern macOS its notifications are silently dropped until you authorize the app in System Settings → Notifications; only opt in if you've done that and verified it displays.
 
