@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- Task ids now carry the year (`yymmdd-hhmmss-slug`) and get a numeric suffix on same-second collisions, so a same-second queue can no longer overwrite an existing task and filename order survives New Year.
+
 ### Added
 - Slack resume footer: tasks are told their own id and instructed to end any Slack message they post with `qt resume <id>` plus a `quicktask://resume/<id>` link.
 - `qt install-handler` / `qt uninstall-handler`: register or remove a macOS `quicktask://` URL handler (applet in the qt data dir, qt path and `QT_DATA` baked in, no Dock icon) so resume links in Slack open the session in the preferred terminal. Link ids are validated to lowercase letters, digits, and hyphens before any shell call; install reports codesign and LaunchServices registration status honestly and stages rebuilds so a failure cannot destroy a working handler.

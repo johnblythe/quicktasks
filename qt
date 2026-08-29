@@ -361,10 +361,16 @@ def now():
 
 
 def new_id(prompt):
-    stamp = datetime.datetime.now().strftime("%m%d-%H%M%S")
+    stamp = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
     words = re.sub(r"[^a-z0-9 ]", "", prompt.lower()).split()[:3]
     slug = "-".join(words)[:24].strip("-")
-    return f"{stamp}-{slug}" if slug else stamp
+    base = f"{stamp}-{slug}" if slug else stamp
+    tid = base
+    n = 1
+    while os.path.exists(task_path(tid)):
+        n += 1
+        tid = f"{base}-{n}"
+    return tid
 
 
 # --- queue / run --------------------------------------------------------
