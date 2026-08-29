@@ -31,6 +31,7 @@ Permissions model:
 import datetime
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -414,6 +415,21 @@ def queue(prompt, wait=False, in_dir=None, model=None):
     print(f"queued {tid}{trust_note}")
 
 
+def task_prompt(task):
+    """Compose the prompt for the claude run: the task text, the fired-from
+    context, and a per-task Slack resume footer (the id only exists per
+    task, so the prompt carries it rather than the workspace CLAUDE.md)."""
+    tid = task["id"]
+    return task["prompt"] + (
+        f"\n\n(Context: task fired from directory {task['invoked_from']}. "
+        "Only relevant if the task references the current directory or repo.)"
+        f"\n\n(Your quicktask id is {tid}. If you post any Slack message as part "
+        "of this task, end that message with this exact final line:\n"
+        f"↩ resume: `qt resume {tid}` · <quicktask://resume/{tid}|open in terminal>\n"
+        "Slack messages only; do not add this line to your final result text.)"
+    )
+
+
 def run_task(tid, interactive=False):
     task = load(tid)
     task["status"] = "running"
@@ -427,10 +443,7 @@ def run_task(tid, interactive=False):
         notify("Quicktask failed", task["prompt"], "claude CLI not found")
         return
 
-    prompt = task["prompt"] + (
-        f"\n\n(Context: task fired from directory {task['invoked_from']}. "
-        "Only relevant if the task references the current directory or repo.)"
-    )
+    prompt = task_prompt(task)
     cmd = [
         claude, "-p", prompt,
         "--output-format", "json",
@@ -550,6 +563,8 @@ def cmd_resume(tid):
         sys.exit(f"no session id recorded for {tid} (status: {t['status']})")
     os.chdir(t.get("run_cwd", WORKSPACE))
     claude = find_claude()
+    if not claude:
+        sys.exit("claude CLI not found on PATH")
     os.execvp(claude, [claude, "--resume", sid])
 
 
@@ -660,11 +675,142 @@ def cmd_setup():
     print("Raycast script commands: Settings → Extensions → + → Add Script Directory → raycast/")
     print("  (Quick Task · Quick Task List · Quick Task Resume)")
     print("Raycast extension (interactive ledger): cd raycast-ext && npm install && npm run dev")
+    print("Optional: qt install-handler makes the resume links tasks put in Slack clickable")
 
 
 def cmd_test_echo():
     """Target of the terminal-launch self-test; never resumes a session."""
     print("qt: terminal launch works. You can close this.")
+
+
+# AppleScript for the quicktask:// URL handler. Validation is strict on
+# purpose: anyone can put a quicktask:// link in a Slack message, so the id
+# must be lowercase letters, digits, or hyphens (the characters we generate)
+# before it goes anywhere near a shell, and it is still shell-quoted after
+# that. The qt path and any QT_DATA override are baked in at install time:
+# `do shell script` runs a bare sh with none of the user's shell rc.
+HANDLER_APPLESCRIPT = """\
+on open location theURL
+	set prefix to "quicktask://resume/"
+	if theURL does not start with prefix then
+		display notification "unrecognized link" with title "quicktask"
+		return
+	end if
+	if (length of theURL) is less than or equal to (length of prefix) then
+		display notification "empty resume link" with title "quicktask"
+		return
+	end if
+	set tid to text ((length of prefix) + 1) thru -1 of theURL
+	set allowed to "abcdefghijklmnopqrstuvwxyz0123456789-"
+	considering case
+		repeat with c in characters of tid
+			if allowed does not contain (c as text) then
+				display notification "bad resume link" with title "quicktask"
+				return
+			end if
+		end repeat
+	end considering
+	try
+		do shell script "__SHELL_CMD__" & quoted form of tid
+	on error errMsg
+		display notification errMsg with title "quicktask resume failed"
+	end try
+end open location
+"""
+
+
+def handler_applescript(qt_bin):
+    cmd = ""
+    if QT_DATA != os.path.expanduser("~/.quicktasks"):
+        cmd += "export QT_DATA=" + shlex.quote(QT_DATA) + "; "
+    cmd += shlex.quote(qt_bin) + " _resume-launch "
+    esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
+    return HANDLER_APPLESCRIPT.replace("__SHELL_CMD__", esc)
+
+
+def _run_step(argv, timeout):
+    """Install-step runner: a missing binary or a hang counts as a plain
+    failure, never a traceback."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stderr or "").strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        return 1, str(e)
+
+LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+              "LaunchServices.framework/Support/lsregister")
+
+
+def handler_app_path():
+    return os.path.join(QT_DATA, "QuicktaskResume.app")
+
+
+def cmd_install_handler():
+    """Build and register the quicktask:// URL handler so resume links in
+    Slack open the session in the preferred terminal. Lives in QT_DATA;
+    remove with qt uninstall-handler."""
+    try:
+        bootstrap()
+    except OSError as e:
+        sys.exit(f"data dir not writable: {e}")
+    qt_bin = os.path.abspath(__file__)
+    if not os.access(qt_bin, os.X_OK):
+        sys.exit(f"qt is not executable at {qt_bin}")
+    app = handler_app_path()
+    # build into a staging bundle and swap only on success, so a failed
+    # rebuild cannot destroy a working install (the name must end in .app
+    # or osacompile emits a script file instead of a bundle)
+    staging = os.path.join(QT_DATA, "QuicktaskResume.new.app")
+    src = os.path.join(TMP_DIR, "quicktask-handler.applescript")
+    os.makedirs(TMP_DIR, exist_ok=True)
+    with open(src, "w") as f:
+        f.write(handler_applescript(qt_bin))
+    if os.path.isdir(staging):
+        shutil.rmtree(staging)
+    rc, err = _run_step(["osacompile", "-o", staging, src], 60)
+    if rc != 0:
+        sys.exit("osacompile failed: " + (err or "unknown error"))
+
+    plist_path = os.path.join(staging, "Contents", "Info.plist")
+    with open(plist_path, "rb") as f:
+        info = plistlib.load(f)
+    info["CFBundleIdentifier"] = "com.quicktasks.resume-handler"
+    info["CFBundleURLTypes"] = [{
+        "CFBundleURLName": "com.quicktasks.resume",
+        "CFBundleURLSchemes": ["quicktask"],
+    }]
+    info["LSUIElement"] = True  # no Dock icon or focus steal on link clicks
+    with open(plist_path, "wb") as f:
+        plistlib.dump(info, f)
+
+    # the plist edit invalidates the applet's signature; re-sign ad-hoc
+    sign_rc, sign_err = _run_step(["codesign", "--force", "--sign", "-", staging], 30)
+
+    if os.path.isdir(app):
+        shutil.rmtree(app)
+    os.replace(staging, app)
+
+    registered = _run_step([LSREGISTER, "-f", app], 30)[0] == 0
+    if not registered:
+        registered = _run_step(["open", "-g", app], 30)[0] == 0
+
+    print(f"handler: {app}")
+    print("codesign: " + ("ok" if sign_rc == 0 else
+          f"FAILED ({sign_err}); macOS may refuse to launch the handler"))
+    print("registered: " + ("ok · scheme quicktask://" if registered else "FAILED"))
+    if not registered:
+        sys.exit("LaunchServices registration failed; rerun qt install-handler")
+    print('test: open "quicktask://resume/<some-task-id>"')
+    print("Slack shows a confirmation dialog on the first click.")
+
+
+def cmd_uninstall_handler():
+    app = handler_app_path()
+    if not os.path.isdir(app):
+        sys.exit("no handler installed")
+    _run_step([LSREGISTER, "-u", app], 30)
+    shutil.rmtree(app)
+    print(f"removed {app} and its quicktask:// registration")
 
 
 def cmd_doctor():
@@ -760,6 +906,26 @@ def cmd_doctor():
                     d + (" (no longer exists)" if gone else ""),
                     "qt untrust " + d if gone else None)
 
+    app = handler_app_path()
+    if not os.path.isdir(app):
+        report("warn", "resume link handler", "not installed",
+               "qt install-handler enables clickable Slack resume links")
+    else:
+        try:
+            with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+                schemes = [s for t in plistlib.load(f).get("CFBundleURLTypes", [])
+                           for s in t.get("CFBundleURLSchemes", [])]
+        except (OSError, plistlib.InvalidFileException):
+            schemes = []
+        signed = _run_step(["codesign", "--verify", app], 15)[0] == 0
+        if "quicktask" in schemes and signed:
+            report("ok", "resume link handler", "installed (quicktask://)")
+        else:
+            report("warn", "resume link handler",
+                   "present but " + ("unsigned" if "quicktask" in schemes
+                                     else "scheme not registered in bundle"),
+                   "qt install-handler to rebuild")
+
     print()
     print("hard failures found; qt cannot run tasks" if hard_fail else "no hard failures")
     if hard_fail:
@@ -778,8 +944,13 @@ def latest_blocked():
 
 
 def match_id(fragment):
-    """Allow qt log/resume with a unique id fragment."""
-    hits = [f[:-5] for f in os.listdir(TASKS_DIR) if fragment in f and f.endswith(".json")]
+    """Allow qt log/resume with a unique id fragment. An exact id always
+    wins, so a task's own published link resolves even when another id
+    contains it as a substring."""
+    names = [f[:-5] for f in os.listdir(TASKS_DIR) if f.endswith(".json")]
+    if fragment in names:
+        return fragment
+    hits = [n for n in names if fragment in n]
     if len(hits) == 1:
         return hits[0]
     if not hits:
@@ -799,6 +970,8 @@ qt · fire-and-forget quicktasks for Claude Code
   qt resume <id>         reopen a task as an interactive session
   qt setup               pick terminal, trusted dirs, permission mode
   qt doctor              read-only environment health check
+  qt install-handler     register quicktask:// links (clickable Slack resume)
+  qt uninstall-handler   remove the quicktask:// handler and registration
   qt trust [dir]         list trusted dirs, or add one (tasks run in place)
   qt untrust <dir>       remove a trusted dir
 
@@ -821,7 +994,11 @@ def main():
         return
     cmd = args[0]
     if cmd == "list":
-        cmd_list(int(args[1]) if len(args) > 1 else 15)
+        try:
+            n = int(args[1]) if len(args) > 1 else 15
+        except ValueError:
+            sys.exit(f"usage: qt list [count], got '{args[1]}'")
+        cmd_list(n)
     elif cmd == "log" and len(args) > 1:
         bootstrap()
         cmd_log(match_id(args[1]))
@@ -832,6 +1009,10 @@ def main():
         cmd_setup()
     elif cmd == "doctor":
         cmd_doctor()
+    elif cmd == "install-handler":
+        cmd_install_handler()
+    elif cmd == "uninstall-handler":
+        cmd_uninstall_handler()
     elif cmd == "trust":
         cmd_trust(args[1] if len(args) > 1 else None)
     elif cmd == "untrust" and len(args) > 1:
@@ -843,6 +1024,10 @@ def main():
         launch_resume_terminal(match_id(args[1]) if len(args) > 1 else latest_blocked())
     elif cmd == "_test-echo":
         cmd_test_echo()
+    elif cmd in ("log", "resume", "untrust"):
+        # without this arm a bare `qt resume` would fall through to the
+        # catch-all and queue a paid task with "resume" as the prompt
+        sys.exit(f"usage: qt {cmd} <id>")
     else:
         wait = False
         in_dir = None
