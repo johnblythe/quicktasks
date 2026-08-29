@@ -729,7 +729,10 @@ def handler_applescript(qt_bin):
     cmd = ""
     if QT_DATA != os.path.expanduser("~/.quicktasks"):
         cmd += "export QT_DATA=" + shlex.quote(QT_DATA) + "; "
-    cmd += shlex.quote(qt_bin) + " _resume-launch "
+    # bake the interpreter too: `do shell script` runs with a minimal PATH,
+    # so the shebang's `env python3` may not resolve there
+    cmd += (shlex.quote(sys.executable) + " " + shlex.quote(qt_bin)
+            + " _resume-launch ")
     esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
     return HANDLER_APPLESCRIPT.replace("__SHELL_CMD__", esc)
 
