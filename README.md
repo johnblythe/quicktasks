@@ -89,7 +89,7 @@ Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (secon
 
 ### Hub mode
 
-`qt hub <dir>` points qt at a checkout of The Pass (a separate ledger app; `dir` must contain its `seed.py`); `qt hub off` clears it; `qt hub status` shows the current setting. Unset (the default) is a strict no-op: nothing changes. Set it and every finished task also seeds an item into that ledger (`seed.py`, so a re-run never duplicates) and writes a `jobs/qt-<id>-<timestamp>/job.json` + `output/RESULT.md`, so it shows up in the ledger's Verify queue: done tasks land as `done`, failed/timeout/blocked tasks land as `failed` with an error explaining why and a `qt resume <id>` hint. `QT_HUB` overrides the config value. This never blocks or fails the task itself; a hub-feed problem is logged to the task's log file at most.
+`qt hub <dir>` points qt at a checkout of The Pass (a separate ledger app; `dir` must contain its `seed.py`); `qt hub off` clears it; `qt hub status` shows the current setting. Unset (the default) is a strict no-op: nothing changes. Set it and every finished task also seeds an item into that ledger (`seed.py`, so a re-run never duplicates) and writes a `jobs/qt-<id>-<timestamp>/job.json` + `output/RESULT.md`, so it shows up in the ledger's Verify queue: done tasks land as `done`, blocked tasks land as `blocked`, and failed/timeout tasks land as `failed`, each with an error explaining why and a `qt resume <id>` hint. `QT_HUB` overrides the config value. This never blocks or fails the task itself; a hub-feed problem is logged to the task's log file at most.
 
 ## Troubleshooting
 

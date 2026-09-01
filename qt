@@ -489,9 +489,9 @@ def _seed_hub_item(hub_dir, item):
 
 def _hub_job_record(task, item_id, rc):
     """Map a finished qt task onto a hub jobs/<slug>/job.json record, plus
-    the RESULT.md body that goes with it. The hub only has done/failed; qt's
-    timeout and blocked statuses both become failed with an explanatory
-    error and a resume hint."""
+    the RESULT.md body that goes with it. The hub understands done/failed/
+    blocked directly; only qt's timeout status has no hub equivalent, so it
+    becomes failed with an explanatory error and a resume hint."""
     status = task["status"]
     resume_hint = f"qt resume {task['id']}"
     job = {
@@ -515,7 +515,7 @@ def _hub_job_record(task, item_id, rc):
     elif status == "blocked":
         denials = task.get("denials") or []
         names = ", ".join(sorted({d.get("tool_name") or "?" for d in denials})) or "a tool call"
-        job["status"] = "failed"
+        job["status"] = "blocked"
         job["error"] = f"blocked: {len(denials)} permission denials; resume: {resume_hint}"
         job["denials"] = denials
         body = f"Blocked on {names}.\n\n↩ resume: `{resume_hint}`"

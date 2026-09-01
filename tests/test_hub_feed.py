@@ -178,7 +178,7 @@ class HubFeedEndToEndTests(unittest.TestCase):
         item_id = f"qt-{task['id']}"
 
         job, result_md = self._the_job(item_id)
-        self.assertEqual(job["status"], "failed")  # the hub only knows done/failed
+        self.assertEqual(job["status"], "blocked")  # the hub understands blocked directly
         resume_hint = f"qt resume {task['id']}"
         self.assertEqual(job["error"], f"blocked: 1 permission denials; resume: {resume_hint}")
         self.assertEqual(job["denials"], [
