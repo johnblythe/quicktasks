@@ -55,6 +55,7 @@ MODEL = os.environ.get("QT_MODEL", "")
 # (Sonnet 4.6+/Opus 4.6+/Fable 5); unsupported models (e.g. Haiku) silently
 # downgrade to Manual, which in headless denies everything non-allowlisted.
 PERMISSIONS_ENV = os.environ.get("QT_PERMISSIONS")
+HUB_DIR_ENV = os.environ.get("QT_HUB")
 
 
 def resolve_permissions():
@@ -63,6 +64,13 @@ def resolve_permissions():
 
 def resolve_trusted_permissions():
     return load_config().get("trusted_permissions") or "auto"
+
+
+def resolve_hub_dir():
+    """QT_HUB env overrides config.json's "hub_dir"; unset means the hub
+    feed is off and run_task() behaves exactly as it always has."""
+    d = HUB_DIR_ENV or load_config().get("hub_dir")
+    return os.path.realpath(os.path.expanduser(d)) if d else None
 
 WORKSPACE_CLAUDE_MD = """\
 # Quicktask runner
@@ -436,6 +444,122 @@ def task_prompt(task):
     )
 
 
+# --- hub feed -------------------------------------------------------------
+# Stage 1 of hub mode: mirror finished tasks into The Pass's ledger so they
+# surface in its Verify queue. Off unless hub_dir/QT_HUB is set; see
+# resolve_hub_dir() above and _feed_hub() below.
+
+def _hub_title(prompt):
+    t = prompt.replace("\n", " ").strip()
+    return t[:59] + "…" if len(t) > 60 else t
+
+
+def _hub_item(task):
+    return {
+        "id": f"qt-{task['id']}",
+        "title": _hub_title(task["prompt"]),
+        "quote": task["prompt"],
+        "source": "qt",
+        "state": "today",
+        "date": (task.get("created") or now())[:10],
+    }
+
+
+def _seed_hub_item(hub_dir, item):
+    """Insert `item` via the hub's own seed.py, which is the idempotent
+    merge point: a re-fed id is reported and skipped, never overwritten."""
+    seed_script = os.path.join(hub_dir, "seed.py")
+    if not os.path.isfile(seed_script):
+        raise RuntimeError(f"seed.py not found: {seed_script}")
+    os.makedirs(TMP_DIR, exist_ok=True)
+    frag_path = os.path.join(TMP_DIR, f"hub-item-{item['id']}.json")
+    with open(frag_path, "w") as f:
+        json.dump(item, f)
+    try:
+        subprocess.run(
+            [sys.executable, seed_script, frag_path],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+    finally:
+        try:
+            os.remove(frag_path)
+        except OSError:
+            pass
+
+
+def _hub_job_record(task, item_id, rc):
+    """Map a finished qt task onto a hub jobs/<slug>/job.json record, plus
+    the RESULT.md body that goes with it. The hub only has done/failed; qt's
+    timeout and blocked statuses both become failed with an explanatory
+    error and a resume hint."""
+    status = task["status"]
+    resume_hint = f"qt resume {task['id']}"
+    job = {
+        "item_id": item_id,
+        "title": _hub_title(task["prompt"]),
+        "started": task.get("started") or task.get("created") or now(),
+        "finished": task.get("finished") or now(),
+        "home_state": "today",
+        "session_id": task.get("session_id"),
+    }
+    if rc is not None:
+        job["rc"] = rc
+
+    if status == "done":
+        job["status"] = "done"
+        body = task.get("result") or "(no result text)"
+    elif status == "timeout":
+        job["status"] = "failed"
+        job["error"] = "timeout"
+        body = f"Timed out.\n\n↩ resume: `{resume_hint}`"
+    elif status == "blocked":
+        denials = task.get("denials") or []
+        names = ", ".join(sorted({d.get("tool_name") or "?" for d in denials})) or "a tool call"
+        job["status"] = "failed"
+        job["error"] = f"blocked: {len(denials)} permission denials; resume: {resume_hint}"
+        job["denials"] = denials
+        body = f"Blocked on {names}.\n\n↩ resume: `{resume_hint}`"
+    else:  # "failed": claude missing, nonzero rc, is_error, or anything unexpected
+        job["status"] = "failed"
+        if task.get("result"):
+            job["error"] = task["result"]
+        body = task.get("result") or f"Failed.\n\n↩ resume: `{resume_hint}`"
+    return job, body
+
+
+def _write_hub_job(hub_dir, task, rc):
+    item_id = f"qt-{task['id']}"
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    jobdir = os.path.join(hub_dir, "jobs", f"{item_id}-{ts}")
+    os.makedirs(os.path.join(jobdir, "output"), exist_ok=True)
+    job, body = _hub_job_record(task, item_id, rc)
+    job_path = os.path.join(jobdir, "job.json")
+    tmp = job_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(job, f, indent=2)
+    os.replace(tmp, job_path)
+    with open(os.path.join(jobdir, "output", "RESULT.md"), "w") as f:
+        f.write(body.rstrip() + "\n")
+
+
+def _feed_hub(task, rc=None):
+    """Mirror a finished task into The Pass's ledger so it surfaces in the
+    Verify queue, when hub_dir is configured. Best-effort: this must never
+    break a task, so every failure is caught and logged, never raised."""
+    hub_dir = resolve_hub_dir()
+    if not hub_dir:
+        return
+    try:
+        _seed_hub_item(hub_dir, _hub_item(task))
+        _write_hub_job(hub_dir, task, rc)
+    except Exception as e:
+        try:
+            with open(os.path.join(LOGS_DIR, task["id"] + ".log"), "a") as f:
+                f.write(f"\n--- hub feed failed: {e} ---\n")
+        except OSError:
+            pass
+
+
 def run_task(tid, interactive=False):
     task = load(tid)
     task["status"] = "running"
@@ -446,6 +570,7 @@ def run_task(tid, interactive=False):
     if not claude:
         task.update(status="failed", result="claude CLI not found on PATH", finished=now())
         save(task)
+        _feed_hub(task)
         notify("Quicktask failed", task["prompt"], "claude CLI not found")
         return
 
@@ -471,6 +596,7 @@ def run_task(tid, interactive=False):
             f.write(stdout + f"\n--- timed out after {TIMEOUT}s ---\n")
         task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
         save(task)
+        _feed_hub(task)
         notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}")
         return
 
@@ -510,6 +636,7 @@ def run_task(tid, interactive=False):
         finished=now(),
     )
     save(task)
+    _feed_hub(task, rc=rc)
 
     if status == "blocked":
         if not interactive:
@@ -606,6 +733,32 @@ def cmd_untrust(path):
     cfg["trusted_dirs"] = dirs
     save_config(cfg)
     print(f"untrusted: {p}")
+
+
+def cmd_hub(arg=None):
+    cfg = load_config()
+    if arg is None or arg == "status":
+        d = resolve_hub_dir()
+        if HUB_DIR_ENV:
+            print(f"{d} (from QT_HUB)")
+        elif d:
+            print(d)
+        else:
+            print("off · qt hub <dir> to feed finished tasks into a Pass ledger")
+        return
+    if arg == "off":
+        cfg.pop("hub_dir", None)
+        save_config(cfg)
+        print("hub feed off")
+        return
+    p = os.path.realpath(os.path.expanduser(arg))
+    if not os.path.isdir(p):
+        sys.exit(f"not a directory: {p}")
+    if not os.path.isfile(os.path.join(p, "seed.py")):
+        sys.exit(f"not a hub dir (no seed.py): {p}")
+    cfg["hub_dir"] = p
+    save_config(cfg)
+    print(f"hub feed on: {p}\nfinished tasks now land in its Verify queue")
 
 
 def cmd_setup():
@@ -915,6 +1068,16 @@ def cmd_doctor():
                     d + (" (no longer exists)" if gone else ""),
                     "qt untrust " + d if gone else None)
 
+    hub_dir = resolve_hub_dir()
+    if not hub_dir:
+        report("ok", "hub feed", "off · qt hub <dir> to feed finished tasks into a Pass ledger")
+    elif not os.path.isdir(hub_dir):
+        report("warn", "hub feed", f"{hub_dir} (no longer exists)", "qt hub off, or qt hub <dir> to repoint it")
+    elif not os.path.isfile(os.path.join(hub_dir, "seed.py")):
+        report("warn", "hub feed", f"{hub_dir} (no seed.py)", "check hub_dir points at a Pass checkout")
+    else:
+        report("ok", "hub feed", hub_dir)
+
     app = handler_app_path()
     if not os.path.isdir(app):
         report("warn", "resume link handler", "not installed",
@@ -983,6 +1146,7 @@ qt · fire-and-forget quicktasks for Claude Code
   qt uninstall-handler   remove the quicktask:// handler and registration
   qt trust [dir]         list trusted dirs, or add one (tasks run in place)
   qt untrust <dir>       remove a trusted dir
+  qt hub <dir>|off|status   feed finished tasks into a Pass ledger, or check
 
 Runs fired from inside a trusted dir run there with "auto" permissions
 (config "trusted_permissions" overrides, e.g. "bypassPermissions").
@@ -991,8 +1155,12 @@ Everything else runs conservatively; a denied tool call marks the task
 "Quick Task Resume" command (opens your preferred terminal on that
 session) or qt resume <id>.
 
+When hub_dir is set, every finished task is also seeded into that Pass
+checkout's ledger and given a jobs/ record, so it shows up in its Verify
+queue. Off by default; zero effect on anything until you set it.
+
 config (env): QT_DATA (~/.quicktasks) · QT_TIMEOUT (1800s) · QT_MODEL
-(inherit) · QT_PERMISSIONS (acceptEdits by default)
+(inherit) · QT_PERMISSIONS (acceptEdits by default) · QT_HUB (unset = off)
 """
 
 
@@ -1026,6 +1194,8 @@ def main():
         cmd_trust(args[1] if len(args) > 1 else None)
     elif cmd == "untrust" and len(args) > 1:
         cmd_untrust(args[1])
+    elif cmd == "hub":
+        cmd_hub(args[1] if len(args) > 1 else None)
     elif cmd == "_run" and len(args) > 1:
         run_task(args[1])
     elif cmd == "_resume-launch":
