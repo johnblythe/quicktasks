@@ -33,6 +33,24 @@ sys.stdout.write(os.environ.get("FAKE_CLAUDE_JSON", "{}") + "\\n")
 sys.exit(int(os.environ.get("FAKE_CLAUDE_RC", "0")))
 """
 
+# Every run_task() reaches notify(), which shells out to terminal-notifier
+# or osascript to raise a real desktop notification. Both go through PATH
+# lookup with no fixed path, so a no-op shim of each in the same fake-bin
+# dir as fake claude intercepts them before they ever touch the real
+# binary -- these tests should never pop a notification on the machine
+# running them. Logs its argv (if told where) so a test can assert it was
+# actually reached, rather than passing by accident because nothing calls
+# notify() at all.
+FAKE_NOTIFIER_SHIM = """\
+#!/usr/bin/env python3
+import os, sys
+log = os.environ.get("FAKE_NOTIFY_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(repr(sys.argv[1:]) + "\\n")
+sys.exit(0)
+"""
+
 
 def _load_qt_module():
     """Import qt as a module (rather than running it) for the pure helper
@@ -76,11 +94,21 @@ class HubFeedEndToEndTests(unittest.TestCase):
         self.assertNotIn("/T/", str(claude_path))
         self.bin_dir = bin_dir
 
+        # No-op osascript + terminal-notifier: notify() must never reach the
+        # real ones, so these tests don't pop a notification on whatever
+        # machine runs them.
+        for name in ("osascript", "terminal-notifier"):
+            shim = bin_dir / name
+            shim.write_text(FAKE_NOTIFIER_SHIM)
+            shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        self.notify_log = root / "notify.log"
+
     def _run_qt(self, prompt, fake_json, fake_rc=0, extra_env=None):
         env = dict(os.environ)
         env["QT_DATA"] = str(self.qt_data)
         env["QT_HUB"] = str(self.hub_dir)
         env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
+        env["FAKE_NOTIFY_LOG"] = str(self.notify_log)
         env["FAKE_CLAUDE_JSON"] = json.dumps(fake_json)
         env["FAKE_CLAUDE_RC"] = str(fake_rc)
         env.pop("QT_PERMISSIONS", None)
@@ -140,6 +168,11 @@ class HubFeedEndToEndTests(unittest.TestCase):
         self.assertIn("finished", job)
         self.assertEqual(result_md.strip(), "All done, nothing else needed.")
 
+        # notify() really did fire, and hit the shim rather than the real
+        # osascript/terminal-notifier: proof the notification-suppression
+        # fixture is doing something, not just silently unneeded.
+        self.assertTrue(self.notify_log.is_file(), "notify() never reached the fake osascript shim")
+
     def test_failed_task_feeds_hub(self):
         prompt = "do something that breaks"
         proc = self._run_qt(prompt, {
@@ -196,6 +229,7 @@ class HubFeedEndToEndTests(unittest.TestCase):
         env_no_hub["PATH"] = f"{self.bin_dir}:{env_no_hub.get('PATH', '')}"
         env_no_hub["FAKE_CLAUDE_JSON"] = json.dumps({"result": "fine", "session_id": "s"})
         env_no_hub["FAKE_CLAUDE_RC"] = "0"
+        env_no_hub["FAKE_NOTIFY_LOG"] = str(self.notify_log)
         env_no_hub.pop("QT_PERMISSIONS", None)
 
         proc = subprocess.run(
