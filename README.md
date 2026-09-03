@@ -54,6 +54,7 @@ Shortcuts runs a bare shell, hence the absolute path; `qt` locates `claude` on i
 | `qt doctor` | read-only environment health check |
 | `qt install-handler` / `qt uninstall-handler` | register or remove `quicktask://` links (clickable Slack resume) |
 | `qt trust [dir]` / `qt untrust <dir>` | manage trusted dirs |
+| `qt hub <dir>` / `qt hub off` / `qt hub status` | feed finished tasks into a Pass ledger, or check |
 
 ## How it works
 
@@ -84,7 +85,11 @@ Note: your global allowlist is inherited by headless runs, and sandbox-safe read
 
 Model resolution per task: `-m` flag > `QT_MODEL` env > config `"model"` > your CLI default.
 
-Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (seconds, default 1800), `QT_MODEL`, `QT_PERMISSIONS`.
+Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (seconds, default 1800), `QT_MODEL`, `QT_PERMISSIONS`, `QT_HUB` (see below).
+
+### Hub mode
+
+`qt hub <dir>` points qt at a checkout of The Pass (a separate ledger app; `dir` must contain its `seed.py`); `qt hub off` clears it; `qt hub status` shows the current setting. Unset (the default) is a strict no-op: nothing changes. Set it and every finished task also seeds an item into that ledger (`seed.py`, so a re-run never duplicates) and writes a `jobs/qt-<id>-<timestamp>/job.json` + `output/RESULT.md`, so it shows up in the ledger's Verify queue: done tasks land as `done`, blocked tasks land as `blocked`, and failed/timeout tasks land as `failed`, each with an error explaining why and a `qt resume <id>` hint. `QT_HUB` overrides the config value. This never blocks or fails the task itself; a hub-feed problem is logged to the task's log file at most.
 
 ## Troubleshooting
 
