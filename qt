@@ -533,13 +533,15 @@ def _write_hub_job(hub_dir, task, rc):
     jobdir = os.path.join(hub_dir, "jobs", f"{item_id}-{ts}")
     os.makedirs(os.path.join(jobdir, "output"), exist_ok=True)
     job, body = _hub_job_record(task, item_id, rc)
+    # RESULT.md lands before job.json claims a terminal status; a reader
+    # scanning jobs/ must never see "done" with the result still missing.
+    with open(os.path.join(jobdir, "output", "RESULT.md"), "w") as f:
+        f.write(body.rstrip() + "\n")
     job_path = os.path.join(jobdir, "job.json")
     tmp = job_path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(job, f, indent=2)
     os.replace(tmp, job_path)
-    with open(os.path.join(jobdir, "output", "RESULT.md"), "w") as f:
-        f.write(body.rstrip() + "\n")
 
 
 def _feed_hub(task, rc=None):
