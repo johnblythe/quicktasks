@@ -19,6 +19,22 @@ enum StatusPalette {
         }
     }
 
+    /// Needs-you rows are coloured by *why* they need John, not by the job
+    /// status underneath: a finished job awaiting a verdict is not green.
+    static func color(for reason: NeedsReason) -> NSColor {
+        switch reason {
+        case .verify: return NSColor.systemTeal
+        case .gate: return NSColor.systemPurple
+        case .blocked: return NSColor.systemOrange
+        case .failed: return NSColor.systemRed
+        }
+    }
+
+    static func color(for record: TaskRecord) -> NSColor {
+        if let reason = record.reason { return color(for: reason) }
+        return color(for: record.status)
+    }
+
     static func color(for aggregate: Aggregate) -> NSColor {
         switch aggregate {
         case .running: return NSColor.systemBlue

@@ -13,7 +13,7 @@ import SwiftUI
 import AppKit
 
 enum Snapshot {
-    static func run(path: String, width: CGFloat = 320) -> Int32 {
+    static func run(path: String, width: CGFloat = MenuView.panelWidth) -> Int32 {
         let app = NSApplication.shared
         // Accessory, so rendering never puts an icon in the Dock or steals focus.
         app.setActivationPolicy(.accessory)
@@ -42,9 +42,19 @@ enum Snapshot {
         window.orderBack(nil)
         hosting.layoutSubtreeIfNeeded()
 
-        // Let SwiftUI finish layout and let onAppear's refresh land.
-        RunLoop.main.run(until: Date().addingTimeInterval(1.5))
+        // Let SwiftUI finish layout, and let the first Pass poll land: the
+        // synchronous load in init() is only the file model, so measuring
+        // once would render the widget as it looks before it has heard from
+        // The Pass.
+        RunLoop.main.run(until: Date().addingTimeInterval(2))
         hosting.layoutSubtreeIfNeeded()
+        // Re-measure, because rows arriving from the poll changed the height.
+        let settled = max(hosting.fittingSize.height, 140)
+        if abs(settled - hosting.frame.height) > 0.5 {
+            hosting.frame = NSRect(x: 0, y: 0, width: width, height: settled)
+            window.setContentSize(NSSize(width: width, height: settled))
+            hosting.layoutSubtreeIfNeeded()
+        }
 
         guard let rep = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
             FileHandle.standardError.write(Data("could not allocate a bitmap\n".utf8))
@@ -61,7 +71,7 @@ enum Snapshot {
             FileHandle.standardError.write(Data("could not write \(path): \(error)\n".utf8))
             return 1
         }
-        print("wrote \(path) (\(Int(width))x\(Int(height)))")
+        print("wrote \(path) (\(Int(hosting.bounds.width))x\(Int(hosting.bounds.height)))")
         return 0
     }
 }

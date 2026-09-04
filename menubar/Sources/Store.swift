@@ -25,9 +25,15 @@ import Foundation
 
 struct StoreConfig {
     let tasksDir: URL
+    /// The hub checkout itself, for the files that are not under jobs/ --
+    /// decisions.json, which has to be preserved across a one-row POST /save.
+    let hubDir: URL?
     /// nil when the hub feed is off, matching qt's resolve_hub_dir(): QT_HUB
     /// overrides config.json's "hub_dir", and unset means off.
     let hubJobsDir: URL?
+    /// Base URL of The Pass, or nil when the HTTP feed is switched off with
+    /// QT_PASS_URL="" and only the file ledgers should be read.
+    let passURL: URL?
     let limit: Int
 
     static func resolve(env: [String: String] = ProcessInfo.processInfo.environment,
@@ -45,9 +51,12 @@ struct StoreConfig {
                 hub = expand(dir)
             }
         }
+        let hubURL = hub.map { URL(fileURLWithPath: $0) }
         return StoreConfig(
             tasksDir: qtData.appendingPathComponent("tasks"),
-            hubJobsDir: hub.map { URL(fileURLWithPath: $0).appendingPathComponent("jobs") },
+            hubDir: hubURL,
+            hubJobsDir: hubURL?.appendingPathComponent("jobs"),
+            passURL: PassEndpoint.resolve(env: env),
             limit: limit)
     }
 
@@ -87,18 +96,19 @@ enum Store {
             }
         }
 
-        let ordered = MenuModel.build(records: Array(byID.values), now: now,
-                                      warning: problems.isEmpty ? nil : problems.joined(separator: " · "))
-        // Trim after ordering so the newest and the active rows survive.
-        return MenuModel(records: Array(ordered.records.prefix(config.limit)),
-                         aggregate: ordered.aggregate,
-                         refreshedAt: ordered.refreshedAt,
-                         warning: ordered.warning)
+        // Trim after ordering so the newest and the acting rows survive.
+        return MenuModel.build(
+            records: Array(byID.values),
+            now: now,
+            warning: problems.isEmpty ? nil : problems.joined(separator: " · "),
+            source: .files,
+            passURL: config.passURL?.absoluteString ?? PassEndpoint.defaultURL
+        ).trimmed(to: config.limit)
     }
 
     /// Terminal states outrank in-flight ones: a run that has a finished
     /// timestamp is later news than one that does not.
-    private static func rank(_ r: TaskRecord) -> Int {
+    static func rank(_ r: TaskRecord) -> Int {
         if r.finished != nil { return 2 }
         if r.status.isActive { return 1 }
         return 0
@@ -150,6 +160,10 @@ enum Store {
             let title = (obj["title"] as? String) ?? slug
             out.append(TaskRecord(
                 id: resumeID(jobSlug: slug, itemID: itemID),
+                // Carried even though the file feed cannot post a decision:
+                // it is the id every Pass route is keyed by, and the file
+                // already knows it.
+                itemID: itemID.isEmpty ? nil : itemID,
                 title: titleFrom(title),
                 status: TaskStatus(raw: obj["status"] as? String),
                 origin: itemID.hasPrefix("qt-") ? .quicktask : .pass,

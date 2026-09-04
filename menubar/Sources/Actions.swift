@@ -1,16 +1,17 @@
-// Actions.swift -- the three things the widget can do: fire, resume, open.
+// Actions.swift -- everything the widget can do: fire a task, capture to The
+// Pass, resume a run, open a report, open the Pass, and post a verdict.
 //
 // A menu-bar app launched by launchd or as a login item inherits almost no
 // PATH, so every binary is resolved explicitly rather than trusted to be
-// findable. Nothing here reaches the network; the only URL opened is the
-// loopback address The Pass already serves on.
+// findable. The only network calls are the loopback ones in PassClient; this
+// file shells out and opens URLs.
 
 import Foundation
 import AppKit
 
 enum Actions {
     /// The Pass, as served by hub/serve.py.
-    static let passURL = URL(string: "http://127.0.0.1:8811/")!
+    static let passURL = URL(string: PassEndpoint.defaultURL + "/")!
 
     /// Locates the `qt` script. install.sh symlinks it to ~/.local/bin/qt,
     /// which is the first place checked; QT_BIN overrides for a dev checkout.
@@ -100,7 +101,67 @@ enum Actions {
         return .success(())
     }
 
-    static func openPass() {
-        NSWorkspace.shared.open(passURL)
+    /// Reopens a run, preferring the resume URL The Pass handed over so the
+    /// widget follows the server's idea of the slug rather than deriving it.
+    @discardableResult
+    static func resume(record: TaskRecord) -> Result<Void, Problem> {
+        if let raw = record.resumeURL, !raw.isEmpty, let url = URL(string: raw) {
+            if NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+                NSWorkspace.shared.open(url)
+                return .success(())
+            }
+            // No handler registered: fall through to the qt path with the slug
+            // out of the URL, which is the same id `qt resume` takes.
+            if let slug = PassStatus.resumeSlug(raw), !slug.isEmpty {
+                return resume(id: slug)
+            }
+        }
+        return resume(id: record.id)
+    }
+
+    // MARK: - The Pass
+
+    static func openPass(_ base: String = PassEndpoint.defaultURL) {
+        NSWorkspace.shared.open(URL(string: base) ?? passURL)
+    }
+
+    /// Joins /status.json's root-relative `report` path onto its `pass_url`.
+    /// The report is served over http because a file:// link is dead from an
+    /// http:// page, and serve.py sandboxes the response.
+    static func reportURL(base: String, report: String) -> URL? {
+        guard !report.isEmpty else { return nil }
+        guard let root = URL(string: base) else { return nil }
+        if let absolute = URL(string: report), absolute.scheme != nil { return absolute }
+        return URL(string: report, relativeTo: root)?.absoluteURL
+    }
+
+    @discardableResult
+    static func openReport(base: String, report: String?) -> Result<Void, Problem> {
+        guard let report, let url = reportURL(base: base, report: report) else {
+            return .failure("no report on this row")
+        }
+        NSWorkspace.shared.open(url)
+        return .success(())
+    }
+
+    /// Sends the quick-fire text to The Pass as a gate item instead of running
+    /// it. Returns the id the Pass assigned, for the flash message.
+    static func capture(text: String, base: URL) -> Result<String, Problem> {
+        PassClient(base: base).capture(text: text)
+    }
+
+    /// Posts one verdict for a verify row, in the same shape the review page's
+    /// Save button posts. Any decision already sitting unreconciled in
+    /// hub/decisions.json rides along, because serve.py overwrites that file
+    /// wholesale and a one-row post would otherwise drop John's saved review.
+    static func decide(record: TaskRecord,
+                       action: String,
+                       comment: String = "",
+                       base: URL,
+                       hubDir: URL?) -> Result<Void, Problem> {
+        PassClient(base: base).decide(record: record,
+                                      action: action,
+                                      comment: comment,
+                                      pending: PassPayload.pendingDecisions(hubDir: hubDir))
     }
 }

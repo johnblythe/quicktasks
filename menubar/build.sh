@@ -49,6 +49,11 @@ swiftc -O -parse-as-library \
   -o "$APP/Contents/MacOS/$APP_NAME" \
   "$SELF_DIR"/Sources/*.swift
 
+# The LaunchAgent template ships inside the bundle so the dropdown's
+# "Start at login" toggle writes the same plist this script does, from the same
+# source, rather than keeping a second copy of it in Swift.
+cp "$SELF_DIR/com.quicktasks.menubar.plist" "$APP/Contents/Resources/"
+
 cat >"$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
