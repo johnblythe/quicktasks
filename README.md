@@ -18,8 +18,33 @@ qt "pull the confluence draft at <url> into my writing den ideas folder"
    - **Extension** (interactive ledger, needs Node 22+): `cd raycast-ext && npm install && npm run dev`, then Ctrl-C once Raycast has picked it up; it stays installed as a local dev extension. **New Quick Task** fires a task with an optional run dir. **Quick Tasks** is a native list of recent tasks: search, a status filter, blocked tasks pinned in their own section, and per-row actions to resume in your terminal, view the log, copy the resume command or session id or task id, open the log file, re-run, or delete.
 
    Suggested hotkeys either way: ⌥Q on the fire command (Quick Task, or New Quick Task), ⌥⇧Q on the browse command (Quick Task List, or Quick Tasks).
+5. Menu-bar widget (optional, no Raycast needed): `cd menubar && ./build.sh --agent`. See [Menu-bar widget](#menu-bar-widget) below.
 
-Requires: `claude` CLI, python3, macOS. The Raycast extension additionally needs Node 22+.
+Requires: `claude` CLI, python3, macOS. The Raycast extension additionally needs Node 22+. The menu-bar widget additionally needs the Command Line Tools (`xcode-select --install`).
+
+## Menu-bar widget
+
+A native status-menu app so `qt` is usable with no Raycast and no terminal. The
+menu-bar icon is a coloured dot for aggregate state; the dropdown has a
+quick-fire text field, one row per recent run with a status dot and one-click
+resume, and a refreshed-at footer.
+
+```bash
+cd menubar
+./build.sh --run      # build, install to ~/.quicktasks, launch now
+./build.sh --agent    # ...and start it at every login
+```
+
+It reads both ledgers, `~/.quicktasks/tasks/` and the hub's `jobs/`, so an
+in-flight job fired from The Pass shows up alongside your quicktasks. Blocked
+and failed runs pin to the top of the list. Clicking a row opens
+`quicktask://resume/<id>`, the same handler Slack resume links use, so it
+honours your `qt setup` terminal choice. Nothing but local files and
+`127.0.0.1`.
+
+Full documentation, including the CLI (`--dump-model`, `--snapshot`) and why
+this is a Swift app rather than a SwiftBar plugin or a `rumps` script, is in
+[`menubar/README.md`](menubar/README.md).
 
 ## No Raycast? Hotkey via macOS Shortcuts
 

@@ -78,7 +78,14 @@ class HubFeedEndToEndTests(unittest.TestCase):
         self.qt_data = root / "qtdata"
         self.hub_dir = root / "hub"
         (self.hub_dir).mkdir()
-        (self.hub_dir / "seed.py").write_text((HUB_REPO / "seed.py").read_text())
+        # seed.py plus the local modules it imports. items_io arrived when the
+        # hub moved items.json behind a cross-process lock and an atomic
+        # write; without it seed.py dies at import and the feed silently seeds
+        # nothing, which reads here as "the item never landed".
+        for name in ("seed.py", "items_io.py"):
+            source = HUB_REPO / name
+            if source.is_file():
+                (self.hub_dir / name).write_text(source.read_text())
         (self.hub_dir / "items.json").write_text(json.dumps({"items": []}))
 
         # A fake `claude` on PATH. Its resolved path must not contain "/T/"

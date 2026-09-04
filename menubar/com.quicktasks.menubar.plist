@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the Quicktask menu-bar widget.
+
+  __EXECUTABLE__ is substituted for the real path by `./build.sh --agent`,
+  which then installs this into ~/Library/LaunchAgents and bootstraps it.
+  Install it by hand only if you want to change something here first.
+
+  KeepAlive is deliberately false: the dropdown's power button is a real quit,
+  and a KeepAlive agent would relaunch the widget seconds after John closed it.
+  RunAtLoad brings it back at the next login, which is the intended lifetime.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.quicktasks.menubar</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__EXECUTABLE__</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <false/>
+
+  <!-- Only ever reads local files and opens 127.0.0.1; nothing to throttle. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/quicktask-menubar.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/quicktask-menubar.log</string>
+</dict>
+</plist>
