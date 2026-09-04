@@ -542,18 +542,52 @@ def _write_hub_job(hub_dir, task, rc):
     with open(tmp, "w") as f:
         json.dump(job, f, indent=2)
     os.replace(tmp, job_path)
+    return jobdir
+
+
+def _notify_hub_job(hub_dir, jobdir):
+    """Ask the hub to post a Slack finish notice for this job via its own
+    notice.py, which owns the policy (when to post, how to format) and is
+    itself best-effort. A missing notice.py is a silent no-op, same as a
+    hub not wired up for it at all -- qt doesn't decide notification
+    policy, it just invokes it. No --thread: a qt task has no preceding
+    fire message to thread under."""
+    notice_script = os.path.join(hub_dir, "notice.py")
+    if not os.path.isfile(notice_script):
+        return
+    # A short timeout: this sits between task completion and the local
+    # osascript notify() at the end of the finish path, so a hung notice.py
+    # would delay the thing John actually sees first. Slack sends are
+    # sub-second; 10s is already generous.
+    subprocess.run(
+        [sys.executable, notice_script, jobdir],
+        capture_output=True, text=True, timeout=10, check=True,
+    )
 
 
 def _feed_hub(task, rc=None):
     """Mirror a finished task into The Pass's ledger so it surfaces in the
-    Verify queue, when hub_dir is configured. Best-effort: this must never
-    break a task, so every failure is caught and logged, never raised."""
+    Verify queue, and ask the hub to raise a Slack finish notice, when
+    hub_dir is configured. Best-effort: this must never break a task, so
+    every failure is caught and logged, never raised."""
     hub_dir = resolve_hub_dir()
     if not hub_dir:
         return
     try:
         _seed_hub_item(hub_dir, _hub_item(task))
-        _write_hub_job(hub_dir, task, rc)
+        jobdir = _write_hub_job(hub_dir, task, rc)
+        try:
+            # By this point the record is already on disk (seed + job.json
+            # + RESULT.md); only the Slack notice can still fail, so it
+            # gets its own message rather than "hub feed failed" pointing a
+            # future debugger at the wrong subsystem.
+            _notify_hub_job(hub_dir, jobdir)
+        except Exception as e:
+            try:
+                with open(os.path.join(LOGS_DIR, task["id"] + ".log"), "a") as f:
+                    f.write(f"\n--- hub notice failed: {e} ---\n")
+            except OSError:
+                pass
     except Exception as e:
         try:
             with open(os.path.join(LOGS_DIR, task["id"] + ".log"), "a") as f:

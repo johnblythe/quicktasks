@@ -51,6 +51,23 @@ if log:
 sys.exit(0)
 """
 
+# notice.py itself lives in the hub repo, not here, and its real behavior
+# (Slack policy, formatting, network calls) is out of scope for qt's tests.
+# qt only owns the subprocess boundary: that it gets invoked with the right
+# jobdir, that a missing script is a silent no-op, and that a failing one
+# gets logged rather than breaking the task. This stub stands in for the
+# real notice.py at that boundary -- it logs the jobdir it was called with
+# and exits with a configurable code, never touching Slack or the network.
+FAKE_NOTICE_PY = """\
+#!/usr/bin/env python3
+import os, sys
+log = os.environ.get("FAKE_NOTICE_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(repr(sys.argv[1:]) + "\\n")
+sys.exit(int(os.environ.get("FAKE_NOTICE_RC", "0")))
+"""
+
 
 def _load_qt_module():
     """Import qt as a module (rather than running it) for the pure helper
@@ -109,6 +126,14 @@ class HubFeedEndToEndTests(unittest.TestCase):
             shim.write_text(FAKE_NOTIFIER_SHIM)
             shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         self.notify_log = root / "notify.log"
+
+    def _install_fake_notice(self):
+        """Drop the stub notice.py (see FAKE_NOTICE_PY above) into the
+        throwaway hub dir, standing in for the hub's real one."""
+        notice_path = self.hub_dir / "notice.py"
+        notice_path.write_text(FAKE_NOTICE_PY)
+        notice_path.chmod(notice_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return notice_path
 
     def _run_qt(self, prompt, fake_json, fake_rc=0, extra_env=None):
         env = dict(os.environ)
@@ -250,6 +275,95 @@ class HubFeedEndToEndTests(unittest.TestCase):
         items = json.loads((self.hub_dir / "items.json").read_text())["items"]
         self.assertEqual(items, [])
 
+    def test_notice_invoked_with_jobdir_when_configured(self):
+        """After a job lands in hub_dir/jobs/, qt shells out to the hub's
+        notice.py with exactly that jobdir as its one argument -- no
+        --thread, since a qt task has no preceding fire message to thread
+        under."""
+        self._install_fake_notice()
+        notice_log = Path(self.tmp.name) / "notice.log"
+        proc = self._run_qt(
+            "a task that finishes cleanly",
+            {"result": "All done.", "session_id": "sess-notice", "total_cost_usd": 0.01},
+            extra_env={"FAKE_NOTICE_LOG": str(notice_log)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        task = self._the_task()
+        item_id = f"qt-{task['id']}"
+        jobdirs = list((self.hub_dir / "jobs").glob(f"{item_id}-*"))
+        self.assertEqual(len(jobdirs), 1, f"expected one jobdir, got {jobdirs}")
+        jobdir = jobdirs[0]
+
+        self.assertTrue(notice_log.is_file(), "notice.py was never invoked")
+        self.assertEqual(notice_log.read_text().strip(), repr([str(jobdir)]))
+
+    def test_notice_skipped_silently_when_notice_py_absent(self):
+        """A hub dir with no notice.py (older hub, or one not yet wired for
+        Slack) must not raise or log anything -- the same silent no-op the
+        rest of qt uses for a hub that isn't installed for a given step."""
+        proc = self._run_qt(
+            "a task with no notice.py in the hub",
+            {"result": "Fine.", "session_id": "sess-no-notice"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        task = self._the_task()
+        self.assertEqual(task["status"], "done")
+        self.assertFalse((self.hub_dir / "notice.py").exists())
+
+        log_path = self.qt_data / "logs" / f"{task['id']}.log"
+        log_text = log_path.read_text() if log_path.is_file() else ""
+        self.assertNotIn("hub feed failed", log_text)
+        self.assertNotIn("hub notice failed", log_text)
+
+    def test_notice_failure_is_logged_and_does_not_break_task(self):
+        """A notice.py that exits non-zero must be caught, logged to the
+        task's log file under its own "hub notice failed" message (the
+        record is already on disk by then -- "hub feed failed" would point
+        a future debugger at the wrong subsystem), never raised, and the
+        job it already wrote stays intact."""
+        self._install_fake_notice()
+        proc = self._run_qt(
+            "a task whose notice fails",
+            {"result": "All done.", "session_id": "sess-notice-fail"},
+            extra_env={"FAKE_NOTICE_RC": "3"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)  # the task itself still succeeds
+
+        task = self._the_task()
+        self.assertEqual(task["status"], "done")
+        item_id = f"qt-{task['id']}"
+        job, result_md = self._the_job(item_id)
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(result_md.strip(), "All done.")
+
+        log_path = self.qt_data / "logs" / f"{task['id']}.log"
+        log_text = log_path.read_text()
+        self.assertIn("hub notice failed", log_text)
+        self.assertNotIn("hub feed failed", log_text)
+
+    def test_notice_skipped_silently_when_hub_dir_unset(self):
+        """QT_HUB unset means the whole hub feed -- notice.py included --
+        never runs, even with a real notice.py sitting in self.hub_dir."""
+        self._install_fake_notice()
+        notice_log = Path(self.tmp.name) / "notice-unset.log"
+        env = dict(os.environ)
+        env["QT_DATA"] = str(self.qt_data)
+        env.pop("QT_HUB", None)
+        env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
+        env["FAKE_NOTIFY_LOG"] = str(self.notify_log)
+        env["FAKE_NOTICE_LOG"] = str(notice_log)
+        env["FAKE_CLAUDE_JSON"] = json.dumps({"result": "fine", "session_id": "s"})
+        env["FAKE_CLAUDE_RC"] = "0"
+        env.pop("QT_PERMISSIONS", None)
+
+        proc = subprocess.run(
+            [sys.executable, str(QT_SCRIPT), "-w", "a task with hub unset"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(notice_log.exists(), "notice.py must not run when QT_HUB is unset")
+
 
 class HubMappingUnitTests(unittest.TestCase):
     """Cheaper to check directly than to force through a real timed-out
@@ -291,6 +405,24 @@ class HubMappingUnitTests(unittest.TestCase):
         title = self.qt._hub_title(long_prompt)
         self.assertEqual(len(title), 60)
         self.assertTrue(title.endswith("…"))
+
+    def test_write_hub_job_returns_the_jobdir_it_created(self):
+        """_feed_hub needs this path to hand to notice.py; check it matches
+        the jobdir _write_hub_job actually wrote job.json/RESULT.md into."""
+        task = {
+            "id": "250101-000000-test",
+            "prompt": "a task",
+            "status": "done",
+            "result": "ok",
+            "started": "2025-01-01T00:00:00",
+            "finished": "2025-01-01T00:00:05",
+            "session_id": "sess-x",
+        }
+        with tempfile.TemporaryDirectory() as hub_dir:
+            jobdir = self.qt._write_hub_job(hub_dir, task, rc=0)
+            self.assertTrue(jobdir.startswith(os.path.join(hub_dir, "jobs", "qt-250101-000000-test-")))
+            self.assertTrue(os.path.isfile(os.path.join(jobdir, "job.json")))
+            self.assertTrue(os.path.isfile(os.path.join(jobdir, "output", "RESULT.md")))
 
 
 if __name__ == "__main__":
