@@ -22,13 +22,14 @@ run are all one click from here.
   ● look thru atlas and see…   Running 0:41 ↗
 ⌄ Needs you                            4
   ● Draft Q3 roadmap rev…  Verify · 49m ▤ ✓ ↺ ✕ ↗
-  ● Prep the vendor renewal…      Needs go
+  ● Prep the vendor renewal…  Needs go · 7d ▶
   ● Shepherd app for Gonfalon    Blocked · 2h ↗
-  ● Dossier: Agent Platform…      Failed · 4h
+  ● Dossier: Agent Platform…    Failed · 4h ✓ ↺ ✕
 ⌄ Done today                           2
   ● Secure hiring approval…        Done · 1h ▤ ↗
 › Earlier                              1
 ─────────────────────────────────────────
+Recent runs only · the Pass has 412 jobs
 Refreshed 11:55 AM  ● Pass        ▤ ↻ ⏻
 Start at login  (  )
 ```
@@ -107,6 +108,7 @@ result.
 | Icon | Shown when | Does |
 | --- | --- | --- |
 | ▤ | the job wrote a report | Opens `pass_url` + `report` in the browser |
+| ▶ | `/status.json` says `can_run` | Posts `{"id": …}` to `POST /run` |
 | ✓ ↺ ✕ | the item's `state` is `verify` | Posts `accept` / `redo` / `reject` |
 | ↗ | there is a session to reopen | Opens `quicktask://resume/<slug>` |
 
@@ -116,14 +118,53 @@ distinction matters for a job that died in the verify lane: The Pass reports it
 as `state: "verify"` with `reason: "failed"`, so the row reads "Failed" and a
 verdict is still the action it needs.
 
-Clicking the **title** opens The Pass. It opens the root, not the item: The
-Pass has no per-item deep link today (`serve.py` strips the query string before
-routing and the page never reads `location.hash`).
+**Run it** fires the item's own kickoff prompt as a headless job, which is the
+action a gate row exists to be given. Whether it is offered at all is The
+Pass's call, not the widget's: `/status.json` sends `can_run` per row, computed
+by the same rule the review page's `canRun()` applies (a non-empty prompt, and
+a lane that is not already `running` or `verify`), so the two cannot drift. The
+prompt itself never travels -- `POST /run` takes the item id and the server
+reads the prompt out of its own ledger. A file-feed row never offers it: the
+ledgers do not carry the prompt or the lane.
+
+A 409 is an answer, not a fault. The Pass refuses a fire when the item is
+already running or when all three job slots are busy, and the widget says so in
+the header ("Already running", "Job slots full, not fired") rather than
+surfacing an HTTP status.
+
+Clicking the **title** opens the item in The Pass, using the
+`item_url_template` the payload carries (`…/?item={item_id}`) with the id
+substituted as a query value. On a v1 payload, or on a freshly fired quicktask
+The Pass has not heard about yet, it falls back to the Pass root -- landing on
+the page beats a dead click.
 
 **Redo** expands an inline field for the note, because a redo without one is
-not much of an instruction. **Reject** asks first -- it is the one action that
-throws a finished job's work away -- and swaps the verdict icons for a confirm
-pair rather than opening a dialog, which a menu-bar panel handles badly.
+not much of an instruction. **Reject** and **Run it** both ask first, and swap
+the row's icons for a confirm pair rather than opening a dialog, which a
+menu-bar panel handles badly. They ask for different reasons: reject throws a
+finished job's work away, and Run it spends one of three job slots and a
+model's time.
+
+**Keyboard**, deliberately minimal:
+
+| Key | Does |
+| --- | --- |
+| ↓ / ↑ | Moves a highlight through the visible rows. The ends do not wrap. |
+| ⏎ | Takes the highlighted row's primary action: resume if there is a session, else the item's deep link. |
+| ⎋ | Clears the quick-fire field, then the highlight. |
+
+The quick-fire field owns the arrows and return while it has focus, which is
+what keeps "type, press return, task fired" working. The first arrow key the
+panel sees drops that focus, so the keys land on the list from then on. Return
+is never a verdict and never a fire: both of those ask first, and a keystroke
+that spends a job slot is not one to discover by accident. A highlight whose row
+has left the feed is dropped rather than moved, because the row under the cursor
+changing identity between polls is how you act on the wrong thing.
+
+**Tooltips** carry what the row has no width for: the item id, its lane, the
+permission-denial count, the output count, and the error text from a run that
+died. That is the same set the file-feed rows have always shown, now fed by
+`/status.json`'s own `error` and `denials` in Pass mode.
 
 A verdict posts the same body the review page's Save button posts, and any
 decision already sitting unreconciled in `hub/decisions.json` rides along with
@@ -136,6 +177,12 @@ coarse relative age (`2h`).
 
 **The footer** shows when the model was last read, which feed it came from,
 then buttons for The Pass, a manual refresh, and quit, plus the login switch.
+Its Pass dot's tooltip names the resolved base URL and how it was found, since
+"the Pass is not answering" reads very differently depending on whether the
+widget guessed port 8811 or read a live URL off disk. When The Pass reports
+`counts.truncated` -- it caps `jobs` at 200 -- a line above says so with the
+real total, because a widget quietly showing a slice of the history is the kind
+of thing you only notice when it matters.
 
 **The dot**:
 
@@ -157,35 +204,70 @@ most likely to change in the next few seconds.
 
 Two feeds, in this order.
 
-**The Pass, over HTTP.** `GET /status.json` every 5 seconds:
+**The Pass, over HTTP.** `GET /status.json` every 5 seconds, v2:
 
 ```json
-{"generated_at": "...", "pass_url": "http://127.0.0.1:8811",
+{"generated_at": "...", "pass_url": "http://127.0.0.1:8811/",
+ "item_url_template": "http://127.0.0.1:8811/?item={item_id}",
  "groups":    [{"key": "gate", "label": "Needs your go", "count": 2, "undone": 1}],
- "counts":    {"running": 2, "verify": 1, "gate": 1, "blocked": 1, "failed": 1},
+ "counts":    {"running": 2, "verify": 1, "gate": 1, "blocked": 1, "failed": 1,
+               "done_today": 4, "total_jobs": 412, "truncated": true},
  "jobs":      [{"item_id": "...", "title": "...", "state": "...", "status": "...",
                 "started": "...", "elapsed_s": 252, "failed": false,
                 "blocked": false, "session_id": "...", "resume_url": "...",
-                "report": "/job/<item_id>/output/report.html", "outputs": [...]}],
+                "report": "/job/<item_id>/output/report.html", "outputs": [...],
+                "finished": "..." , "error": null, "denials": 0,
+                "can_run": false}],
  "needs_you": [{"item_id": "...", "title": "...", "state": "...",
-                "reason": "verify|gate|blocked|failed"}]}
+                "reason": "verify|gate|blocked|failed", "resume_url": "...",
+                "report": "...", "session_id": "...", "started": "...",
+                "can_run": true}]}
 ```
 
-`needs_you` carries no `resume_url` and no `report`, so its rows are joined onto
-`jobs` by `item_id` to pick up their affordances. A gate item has no job at all,
-which is why the reason has to be able to stand in as the row's status text on
-its own. `jobs` carries no `finished`, so a terminal row's end time is
-reconstructed from `started + elapsed_s`, which only has to be accurate enough
-to sort the row and place it in today versus earlier.
+v2 made `needs_you` self-sufficient: it carries its own `resume_url`, `report`,
+`session_id`, `started`, and `can_run`. That matters most when a row's job has
+been capped out of `jobs` -- the row still resumes and still has its report --
+and it means a gate item, which has no job at all, finally arrives with a real
+timestamp (its own ledger date) instead of borrowing `generated_at` for
+ordering. The join onto `jobs` by `item_id` is still done and still earns its
+keep: `elapsed_s`, `outputs`, `error`, and `denials` live only on the job side.
+Each field is taken from the `needs_you` entry first and from the job second, so
+a stale `jobs` entry cannot rename a row or move it between lanes.
 
-Inside a `jobs` entry only `item_id` is dependable. The real payload omits
-`title`, `started`, `elapsed_s`, `failed`, `blocked`, and `session_id` from jobs
-that have nothing to say about them, so every field is read leniently: a missing
-title falls back to the item id, and a missing `started` falls back to
-`generated_at` for *ordering only*, so the row still sorts and still counts as
-today. It never becomes the row's age or its stopwatch: "Needs go - 2s" on an
-item held for a week would be a lie, and one that resets on every poll.
+**Done today is decided by `finished`.** Every terminal job now sends one, so
+the day a row belongs to is the day it actually ended, not the day
+`started + elapsed_s` lands on. That old reconstruction is still there as the
+fallback for a v1 payload, and a row with no `finished` and no `started` still
+falls back to `generated_at` for *ordering only*: the row sorts and counts as
+today without being given an age it does not have. "Needs go - 2s" on an item
+held for a week would be a lie, and one that resets on every poll.
+
+Everything v2 added is read as optional, so a v1 payload still parses: no
+`finished`, no `can_run` (the Run-it button stays off), no
+`item_url_template` (titles open the Pass root), and `denials` read as either
+the new count or the old array. Titles are now always sent, but an empty one
+still falls back to the item id -- a blank row is worse than an ugly one.
 Timestamps arrive as UTC with six fractional digits and a `+00:00` offset.
+
+**Finding The Pass.** It walks `PORT..PORT+9` looking for a free port, so where
+it is listening is not something the widget can assume. Three sources, in order:
+
+| Order | Source | Notes |
+| --- | --- | --- |
+| 1 | `QT_PASS_URL` | Taken as given. Empty pins the widget to the file ledgers. |
+| 2 | `<hub>/.pass-url` | Written by `serve.py` on bind, removed on a graceful shutdown. |
+| 3 | `http://127.0.0.1:8811` | The default port. |
+
+Discovery re-runs on every poll rather than only at launch, so a Pass that
+restarts on another port is followed without relaunching the widget. Only the
+configured hub's `.pass-url` is read (`~/code/hub`'s when no hub is
+configured), so the widget never discovers a Pass belonging to a checkout it
+was not pointed at. A discovered URL has to be `http` on `127.0.0.1` or
+`localhost`: this is a file read without anyone asking, so it does not get to
+choose the host. A malformed, empty, or non-loopback file is reported in the
+footer tooltip and then ignored, so a file caught mid-write cannot take the feed
+down with it. An absent file is not a problem at all -- it is the normal state
+when The Pass is down.
 
 Even in Pass mode the qt ledger is still read and merged. A task fired with `qt`
 (or with this widget's quick-fire) does not reach The Pass until it finishes,
@@ -241,28 +323,40 @@ The app is also a small CLI, which is how the tests drive it:
 ```bash
 QuicktaskStatus --dump-model                     # the computed menu model, as JSON
 QuicktaskStatus --dump-model --limit 500         # all rows, not just visible ones
+QuicktaskStatus --dump-endpoint                  # where the Pass was found, and how
 QuicktaskStatus --dump-capture "call dan"        # the POST /capture body
+QuicktaskStatus --dump-run <id>                  # the POST /run body
 QuicktaskStatus --dump-decision <id> accept      # the POST /save body
 QuicktaskStatus --dump-decision <id> redo "note"
+QuicktaskStatus --dump-keys down,down,up         # where the keyboard highlight lands
+QuicktaskStatus --post-run <id>                  # really fire an item through POST /run
 QuicktaskStatus --snapshot out.png               # render the dropdown to a PNG
 QuicktaskStatus --help
 ```
 
 `--dump-model` runs the real feed selection, merge, and ordering code and prints
 the result: both a test seam and a read-only way to inspect live state without
-opening the menu. The two `--dump-*` payload flags print request bodies without
-sending them, because payload construction is the part of an HTTP client most
-worth pinning down and the part least worth a live server to check. `--snapshot`
-renders the real view against the real feeds using the view's own `cacheDisplay`,
-so it needs no Screen Recording permission and works over SSH.
+opening the menu. The three `--dump-*` payload flags print request bodies
+without sending them, because payload construction is the part of an HTTP client
+most worth pinning down and the part least worth a live server to check.
+`--dump-endpoint` prints the resolved base URL, which of the three sources it
+came from, and why a `.pass-url` was ignored if it was -- and makes no request,
+so discovery is testable without depending on what is really listening.
+`--dump-keys` walks the highlight over the visible rows (default collapse, as a
+freshly opened menu would show them) and prints where it lands and what return
+would do there. `--post-run` is the one seam that really posts: it fires an item
+through `POST /run` against whatever `QT_PASS_URL` points at, and exits non-zero
+with the widget's own wording for a 409. `--snapshot` renders the real view
+against the real feeds using the view's own `cacheDisplay`, so it needs no
+Screen Recording permission and works over SSH.
 
 Environment:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `QT_DATA` | `~/.quicktasks` | quicktasks data dir |
-| `QT_HUB` | `config.json`'s `hub_dir` | hub checkout; empty means the hub feed is off |
-| `QT_PASS_URL` | `http://127.0.0.1:8811` | The Pass's base URL; empty pins the widget to the file ledgers |
+| `QT_HUB` | `config.json`'s `hub_dir` | hub checkout; empty means the hub feed is off. Also where `.pass-url` is read from |
+| `QT_PASS_URL` | `<hub>/.pass-url`, else `http://127.0.0.1:8811` | The Pass's base URL; empty pins the widget to the file ledgers |
 | `QT_BIN` | `~/.local/bin/qt` and friends | path to the `qt` script |
 | `QT_MENUBAR_FIRE_DIR` | `$HOME` | working directory for quick-fired tasks |
 | `QT_MENUBAR_AGENT_PLIST` | `~/Library/LaunchAgents/…` | LaunchAgent path the login switch reads and writes |
@@ -277,32 +371,43 @@ the remembered UI state without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-96 tests in `tests/test_menubar_model.py`. They build the app and drive the
+155 tests in `tests/test_menubar_model.py`. They build the app and drive the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
-Coverage: `/status.json` parsing and the `needs_you` join, needs-you ordering,
-gate rows with no job, report URL construction, the job booleans outranking the
-status string, fallback to the files when The Pass is unreachable or answers
-garbage or answers something that is not a status payload, the Pass/ledger
-merge in both directions, capture and decisions payload construction including
-the carry-forward of unreconciled decisions and the capture length limit,
-section membership and collapse defaults, aggregate precedence, resume
-affordances, both file dedup directions, staleness resolution, hub-feed-off,
-limit trimming, malformed input, and one read-only pass over the machine's
-actual ledgers asserting only invariants that hold for any real state.
+Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in
+both directions, needs-you ordering, gate rows with no job, Done today decided
+by `finished` (and the v1 reconstruction it falls back to), report URL
+construction, the deep link's substitution and its two fallbacks, the job
+booleans outranking the status string, `can_run` and the `POST /run` body, the
+409 wordings and the 400 that is not dressed up as one, Pass discovery in all
+three orders including a malformed, empty, non-loopback, or non-http
+`.pass-url`, the keyboard highlight's walk and its clamped ends, fallback to
+the files when The Pass is unreachable or answers garbage or answers something
+that is not a status payload, the Pass/ledger merge in both directions, capture
+and decisions payload construction including the carry-forward of unreconciled
+decisions and the capture length limit, section membership and collapse
+defaults, aggregate precedence, resume affordances, both file dedup directions,
+staleness resolution, hub-feed-off, limit trimming, malformed input, and one
+read-only pass over the machine's actual ledgers asserting only invariants that
+hold for any real state.
 
-`TestRealStatusSample` holds a real `/status.json` body verbatim, as raw bytes
-rather than rebuilt from the test helpers, so the suite keeps checking the
-widget against what the server actually sends: absent keys, a trailing slash on
-`pass_url`, six-digit fractional UTC, zero-count groups, and a failed job in the
-verify lane.
+`TestRealStatusSample` and `TestStatusV2Sample` hold real `/status.json` bodies
+verbatim, as raw bytes rather than rebuilt from the test helpers, so the suite
+keeps checking the widget against what the server actually sends. The v1 sample
+pins the back-compatible reading of absent keys, a trailing slash on `pass_url`,
+six-digit fractional UTC, zero-count groups, and a failed job in the verify
+lane. The v2 sample pins every key the current server sends, in its order,
+including a `finished` deliberately different from `started + elapsed_s` so a
+parsed finish time cannot be confused with a reconstructed one.
 
 The Pass cases stand up a real loopback server on an ephemeral port rather than
 mocking one, because the thing most worth proving about that path is that the
 round trip works and that its absence is handled. Every file-feed case sets
 `QT_PASS_URL=""` so it stays deterministic on a machine where the real Pass
-happens to be up. Nothing in the suite writes a LaunchAgent, calls `launchctl`,
-posts to a real Pass, or touches the app's real preferences.
+happens to be up, and the discovery cases go through `--dump-endpoint`, which
+makes no request at all for the same reason. Nothing in the suite writes a
+LaunchAgent, calls `launchctl`, posts to a real Pass, or touches the app's real
+preferences.
 
 The module skips rather than fails when `swiftc` is unavailable.
 
@@ -310,17 +415,17 @@ The module skips rather than fails when `swiftc` is unavailable.
 
 | File | Purpose |
 | --- | --- |
-| `Sources/Model.swift` | Status and reason vocabulary, `TaskRecord`, sections, `MenuModel`, aggregate, ordering |
-| `Sources/PassStatus.swift` | Parsing `/status.json`; building the two POST bodies |
-| `Sources/PassClient.swift` | The only file that touches the network |
+| `Sources/Model.swift` | Status and reason vocabulary, `TaskRecord`, sections, `MenuModel`, aggregate, ordering, the keyboard highlight |
+| `Sources/PassStatus.swift` | Parsing `/status.json`; building the three POST bodies |
+| `Sources/PassClient.swift` | The only file that touches the network; Pass discovery |
 | `Sources/Feed.swift` | Feed selection and the Pass/ledger merge |
 | `Sources/Store.swift` | Reads and deduplicates the two file ledgers |
-| `Sources/Actions.swift` | Fire, capture, resume, open a report, post a verdict |
+| `Sources/Actions.swift` | Fire, capture, run, resume, open a report or an item, post a verdict |
 | `Sources/LoginItem.swift` | The "Start at login" switch |
 | `Sources/MenuView.swift` | The dropdown |
 | `Sources/MenuBarIcon.swift` | The menu-bar dot and count |
 | `Sources/App.swift` | Entry point, polling controller, `MenuBarExtra` scene |
-| `Sources/DumpModel.swift` | `--dump-model`, `--dump-capture`, `--dump-decision` |
+| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--post-run` |
 | `Sources/Snapshot.swift` | `--snapshot` |
 | `build.sh` | Compile, bundle, sign, install, optionally register the agent |
 | `com.quicktasks.menubar.plist` | LaunchAgent template, shared by `build.sh` and the toggle |

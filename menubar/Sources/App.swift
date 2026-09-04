@@ -21,7 +21,11 @@ final class StatusController: ObservableObject {
     /// a second click cannot post the same verdict twice.
     @Published private(set) var busy: Set<String> = []
 
-    let config: StoreConfig
+    /// Re-resolved on every poll, not just at launch: a Pass that restarted on
+    /// another port rewrites `.pass-url`, and the widget should follow it
+    /// without being relaunched. Two small file reads every five seconds, off
+    /// the main thread with the poll itself.
+    @Published private(set) var config: StoreConfig
     private let defaults: UserDefaults
     private var poll: Timer?
     private var ticker: Timer?
@@ -91,12 +95,16 @@ final class StatusController: ObservableObject {
     var hasLiveRows: Bool { model.records.contains { $0.status.isActive } }
 
     func refresh() {
-        let config = self.config
+        let limit = config.limit
         // Feed.load blocks on a loopback request, so it must never run on the
-        // main thread: a wedged Pass would freeze the open menu.
+        // main thread: a wedged Pass would freeze the open menu. The config is
+        // resolved out here too, so re-reading .pass-url costs the main thread
+        // nothing either.
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            let config = StoreConfig.resolve(limit: limit)
             let fresh = Feed.load(config: config)
             DispatchQueue.main.async {
+                self?.config = config
                 self?.model = fresh
                 self?.now = Date()
             }
@@ -178,9 +186,13 @@ enum Entry {
 
               (no arguments)          run the menu-bar app
               --dump-model            print the computed menu model as JSON and exit
+              --dump-endpoint         print where the Pass was found, and how; no request
               --dump-capture <text>   print the POST /capture body and exit
+              --dump-run <id>         print the POST /run body and exit
               --dump-decision <id> <accept|redo|reject> [comment]
                                       print the POST /save body and exit
+              --dump-keys <seq>       walk the keyboard highlight (e.g. down,down,up)
+              --post-run <id>         really POST /run for an item and print the outcome
               --snapshot <png>        render the dropdown to a PNG and exit
               --limit <n>             rows to include (default 12)
               --help                  this text
@@ -188,8 +200,9 @@ enum Entry {
             Environment:
               QT_DATA                 quicktasks data dir (default ~/.quicktasks)
               QT_HUB                  hub checkout; overrides config.json hub_dir
-              QT_PASS_URL             The Pass's base URL (default \(PassEndpoint.defaultURL));
-                                      empty pins the widget to the file ledgers
+              QT_PASS_URL             The Pass's base URL; overrides <hub>/.pass-url,
+                                      which overrides \(PassEndpoint.defaultURL).
+                                      Empty pins the widget to the file ledgers
               QT_BIN                  path to the qt script
               QT_MENUBAR_FIRE_DIR     cwd for quick-fired tasks (default $HOME)
               QT_MENUBAR_AGENT_PLIST  LaunchAgent plist (default ~/Library/LaunchAgents)
@@ -199,8 +212,18 @@ enum Entry {
         if args.contains("--dump-model") {
             exit(DumpModel.run(args: args))
         }
-        if args.contains("--dump-capture") || args.contains("--dump-decision") {
+        if args.contains("--dump-endpoint") {
+            exit(DumpModel.runEndpoint())
+        }
+        if args.contains("--dump-capture") || args.contains("--dump-decision")
+            || args.contains("--dump-run") {
             exit(DumpModel.runPayload(args: args))
+        }
+        if args.contains("--dump-keys") {
+            exit(DumpModel.runKeys(args: args))
+        }
+        if args.contains("--post-run") {
+            exit(DumpModel.runPost(args: args))
         }
         if let i = args.firstIndex(of: "--snapshot") {
             guard i + 1 < args.count else {

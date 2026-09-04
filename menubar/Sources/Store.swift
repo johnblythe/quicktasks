@@ -31,10 +31,15 @@ struct StoreConfig {
     /// nil when the hub feed is off, matching qt's resolve_hub_dir(): QT_HUB
     /// overrides config.json's "hub_dir", and unset means off.
     let hubJobsDir: URL?
-    /// Base URL of The Pass, or nil when the HTTP feed is switched off with
+    /// Where The Pass is, and how that was decided: QT_PASS_URL, the hub
+    /// checkout's `.pass-url` (which serve.py writes on bind), or the default
+    /// port. The url is nil when the HTTP feed is switched off with
     /// QT_PASS_URL="" and only the file ledgers should be read.
-    let passURL: URL?
+    let pass: PassEndpoint.Resolution
     let limit: Int
+
+    /// Base URL of The Pass, or nil when the HTTP feed is off.
+    var passURL: URL? { pass.url }
 
     static func resolve(env: [String: String] = ProcessInfo.processInfo.environment,
                         limit: Int = 12) -> StoreConfig {
@@ -56,7 +61,9 @@ struct StoreConfig {
             tasksDir: qtData.appendingPathComponent("tasks"),
             hubDir: hubURL,
             hubJobsDir: hubURL?.appendingPathComponent("jobs"),
-            passURL: PassEndpoint.resolve(env: env),
+            // The hub dir is resolved first on purpose: its `.pass-url` is
+            // where a Pass that had to move off 8811 says so.
+            pass: PassEndpoint.resolution(env: env, hubDir: hubURL),
             limit: limit)
     }
 

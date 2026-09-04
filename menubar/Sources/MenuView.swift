@@ -4,9 +4,17 @@
 // row per task, and a footer carrying refreshed-at, the feed's health, the
 // login toggle, and quit.
 //
-// Every action on a row is one click with no dialog, except reject, which asks
-// first: accept and redo are recoverable in the review page, and reject is the
-// one that throws a finished job's work away.
+// Every action on a row is one click with no dialog, except the two that ask
+// first: reject, which throws a finished job's work away, and Run it, which
+// spends a job slot and a model's time. Accept and redo are recoverable in the
+// review page, so they go straight through.
+//
+// Keyboard, deliberately minimal: up and down move a highlight through the
+// visible rows, return takes the highlighted row's primary action (resume when
+// there is a session, else the item's deep link), and escape clears the
+// quick-fire field. The first arrow key also drops focus out of that field --
+// while it has focus the field owns the arrows and return, which is what makes
+// typing and pressing return still fire a quick task.
 
 import SwiftUI
 import AppKit
@@ -15,6 +23,8 @@ struct MenuView: View {
     @ObservedObject var controller: StatusController
     @State private var draft: String = ""
     @State private var flash: String?
+    /// Row id the keyboard highlight sits on, nil when nothing is highlighted.
+    @State private var highlighted: String?
     @FocusState private var fieldFocused: Bool
 
     /// Wider than v1's 320: a verify row carries report, accept, redo, reject,
@@ -49,9 +59,11 @@ struct MenuView: View {
                                             now: controller.now,
                                             fetchedAt: controller.model.refreshedAt,
                                             busy: controller.busy.contains(record.id),
+                                            highlighted: highlighted == record.id,
                                             onResume: { resume(record) },
                                             onReport: { openReport(record) },
-                                            onTitle: { Actions.openPass(controller.model.passURL) },
+                                            onTitle: { openItem(record) },
+                                            onRun: { run(record) },
                                             onDecide: { action, comment in
                                                 decide(record, action: action, comment: comment)
                                             })
@@ -84,6 +96,63 @@ struct MenuView: View {
             NSApp.activate(ignoringOtherApps: true)
             fieldFocused = true
         }
+        .onKeyPress(.downArrow) { moveHighlight(1) }
+        .onKeyPress(.upArrow) { moveHighlight(-1) }
+        .onKeyPress(.return) { triggerHighlighted() }
+        .onKeyPress(.escape) { clearDraft() }
+        .onChange(of: controller.model.refreshedAt) { _, _ in
+            // A highlight whose row has left the feed is dropped rather than
+            // moved: the row under the cursor changing identity between polls
+            // is how you act on the wrong thing.
+            highlighted = KeyboardNav.survivor(ids: visibleIDs, current: highlighted)
+        }
+    }
+
+    // MARK: - keyboard
+
+    /// The rows the highlight can walk: display order, collapsed sections left
+    /// out, so it is the same list the eye is walking.
+    private var visibleIDs: [String] {
+        controller.model
+            .visibleRecords(collapsed: controller.collapsed, now: controller.now)
+            .map { $0.id }
+    }
+
+    private func moveHighlight(_ delta: Int) -> KeyPress.Result {
+        let ids = visibleIDs
+        guard !ids.isEmpty else { return .ignored }
+        // The arrows belong to the list once it is being navigated. Dropping
+        // the field's focus is what lets return act on the row rather than
+        // firing whatever is half-typed in the field.
+        fieldFocused = false
+        highlighted = KeyboardNav.move(ids: ids, from: highlighted, delta: delta)
+        return .handled
+    }
+
+    private func triggerHighlighted() -> KeyPress.Result {
+        guard let id = highlighted,
+              let record = controller.model.records.first(where: { $0.id == id }) else {
+            return .ignored
+        }
+        switch record.primaryAction {
+        case .resume: resume(record)
+        case .item: openItem(record)
+        }
+        return .handled
+    }
+
+    /// Escape empties the quick-fire field first, then clears the highlight, so
+    /// one key backs out of whichever thing is in progress.
+    private func clearDraft() -> KeyPress.Result {
+        if !draft.isEmpty {
+            draft = ""
+            return .handled
+        }
+        if highlighted != nil {
+            highlighted = nil
+            return .handled
+        }
+        return .ignored
     }
 
     private var emptyText: String {
@@ -147,15 +216,33 @@ struct MenuView: View {
     /// The Pass's own group counts. It sends every group it renders, including
     /// the empty ones, and "Today: 0 of 0 open" is noise in a tooltip.
     private var groupsTooltip: String {
-        let lines = controller.model.groups
+        var lines = controller.model.groups
             .filter { $0.count > 0 || $0.undone > 0 }
             .map { "\($0.label): \($0.undone) of \($0.count) open" }
+        // v2 counts finished-today off each job's own `finished` stamp, which
+        // is a truer number than the widget's own Done-today section: that one
+        // only holds the jobs still in the payload.
+        if let done = controller.model.counts["done_today"], done > 0 {
+            lines.append("Done today: \(done)")
+        }
         guard !lines.isEmpty else { return controller.model.aggregate.headline }
         return lines.joined(separator: "\n")
     }
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // The Pass caps jobs[] at 200. Said out loud, because a widget
+            // quietly showing a slice of the history is the kind of thing you
+            // only notice when it matters.
+            if controller.model.truncated {
+                Text("Recent runs only \u{00B7} the Pass has "
+                     + "\(controller.model.counts["total_jobs"] ?? 0) jobs")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help("/status.json caps jobs at 200 and sets counts.truncated. "
+                          + "Open the Pass for the full history.")
+            }
             HStack(spacing: 8) {
                 Text("Refreshed \(Self.clock.string(from: controller.model.refreshedAt))")
                     .font(.system(size: 11))
@@ -207,9 +294,28 @@ struct MenuView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
-        .help(controller.model.source == .pass
-              ? "Live from \(controller.model.passURL)/status.json"
-              : "Reading the ledgers off disk: \(controller.model.passError ?? "the Pass feed is off")")
+        .help(sourceTooltip)
+    }
+
+    /// Which feed is live, and where the widget is looking for The Pass. The
+    /// resolved URL is in here because "the Pass is not answering" reads very
+    /// differently depending on whether the widget guessed port 8811 or read a
+    /// live URL out of the hub's `.pass-url`.
+    private var sourceTooltip: String {
+        var lines: [String] = []
+        if controller.model.source == .pass {
+            let statusURL = URL(string: controller.model.passURL)?
+                .appendingPathComponent("status.json").absoluteString
+            lines.append("Live from \(statusURL ?? controller.model.passURL)")
+        } else {
+            lines.append("Reading the ledgers off disk: "
+                         + (controller.model.passError ?? "the Pass feed is off"))
+        }
+        lines.append("Looking at \(controller.config.pass.describe)")
+        if let problem = controller.config.pass.fileProblem {
+            lines.append("Ignored \(problem)")
+        }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - behaviour
@@ -251,6 +357,34 @@ struct MenuView: View {
         switch Actions.openReport(base: controller.model.passURL, report: record.report) {
         case .success: break
         case .failure(let problem): show(problem.message)
+        }
+    }
+
+    /// The title's click and return's default: the Pass's own deep link to the
+    /// item, falling back to the Pass root when the payload carried no template.
+    private func openItem(_ record: TaskRecord) {
+        switch Actions.openItem(template: controller.model.itemURLTemplate,
+                                base: controller.model.passURL,
+                                itemID: record.itemID ?? record.id) {
+        case .success: break
+        case .failure(let problem): show(problem.message)
+        }
+    }
+
+    /// Fires the item's own kickoff prompt through `POST /run`. A 409 comes
+    /// back as a short line in the header ("Already running", "Job slots
+    /// full") rather than an HTTP status, because it is an expected answer.
+    private func run(_ record: TaskRecord) {
+        let base = controller.passBase
+        controller.perform(key: record.id, {
+            Actions.run(record: record, base: base).map { slug in
+                slug.isEmpty ? "Fired" : "Fired \(slug)"
+            }
+        }) { outcome in
+            switch outcome {
+            case .success(let message): show(message)
+            case .failure(let problem): show(problem.message)
+            }
         }
     }
 
@@ -329,9 +463,12 @@ struct TaskRow: View {
     let now: Date
     let fetchedAt: Date
     let busy: Bool
+    /// Whether the keyboard highlight is on this row.
+    var highlighted: Bool = false
     let onResume: () -> Void
     let onReport: () -> Void
     let onTitle: () -> Void
+    let onRun: () -> Void
     let onDecide: (_ action: String, _ comment: String) -> Void
 
     @State private var hovering = false
@@ -339,6 +476,9 @@ struct TaskRow: View {
     /// confirm pair, so the destructive one cannot be hit by accident on a
     /// 352-point-wide row full of 10-point icons.
     @State private var confirmingReject = false
+    /// Run it asks the same way, for a different reason: it spends a job slot
+    /// and a model's time, and the Pass only has three slots.
+    @State private var confirmingRun = false
     @State private var noting = false
     @State private var note = ""
 
@@ -368,6 +508,18 @@ struct TaskRow: View {
                     RowButton(icon: "xmark", help: "Keep it") {
                         confirmingReject = false
                     }
+                } else if confirmingRun {
+                    Text("Run it?")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.blue)
+                    RowButton(icon: "checkmark", help: "Yes, fire it now",
+                              tint: AnyShapeStyle(.blue)) {
+                        confirmingRun = false
+                        onRun()
+                    }
+                    RowButton(icon: "xmark", help: "Leave it") {
+                        confirmingRun = false
+                    }
                 } else {
                     Text(detail)
                         .font(.system(size: 11))
@@ -387,7 +539,10 @@ struct TaskRow: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(hovering ? Color.primary.opacity(0.06) : .clear)
+            // The keyboard highlight reads stronger than hover, so a row the
+            // arrows landed on is findable without moving the mouse to it.
+            .background(highlighted ? Color.accentColor.opacity(0.18)
+                                    : (hovering ? Color.primary.opacity(0.06) : .clear))
             .onHover { hovering = $0 }
             .help(helpText)
 
@@ -420,6 +575,14 @@ struct TaskRow: View {
     private var actions: some View {
         if record.hasReport {
             RowButton(icon: "doc.richtext", help: "Open the report", action: onReport)
+        }
+        // Fire the item's own prompt. Only offered when The Pass says it would
+        // accept it: it has a prompt, and it is not already running or waiting
+        // on a verdict.
+        if record.canRun {
+            RowButton(icon: "play.circle",
+                      help: "Run it: fire this item's prompt as a job",
+                      tint: AnyShapeStyle(.blue)) { confirmingRun = true }
         }
         if record.canDecide {
             RowButton(icon: "checkmark.circle", help: "Approve") { onDecide("accept", "") }
@@ -458,12 +621,16 @@ struct TaskRow: View {
         if let item = record.itemID, item != record.id { parts.append("item: \(item)") }
         if let state = record.state, !state.isEmpty { parts.append("state: \(state)") }
         if record.origin == .pass { parts.append("from the Pass") }
+        // The two things a row carries that the row itself has no room for.
+        // Both come from the job side of /status.json, and both are the reason
+        // you would want this row rather than its neighbour.
         if record.denialCount > 0 { parts.append("\(record.denialCount) permission denial(s)") }
         if record.outputCount > 0 { parts.append("\(record.outputCount) output file(s)") }
         if let e = record.error, !e.isEmpty { parts.append(String(e.prefix(160))) }
         parts.append(record.canResume ? "click the arrow to resume in a terminal"
                                       : "no session to resume")
-        parts.append("click the title to open the Pass")
+        if record.canRun { parts.append("click play to fire its prompt as a job") }
+        parts.append("click the title to open it in the Pass")
         return parts.joined(separator: "\n")
     }
 }

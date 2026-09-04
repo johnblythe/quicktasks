@@ -125,6 +125,57 @@ enum Actions {
         NSWorkspace.shared.open(URL(string: base) ?? passURL)
     }
 
+    /// The Pass's deep link to one item, from `/status.json`'s
+    /// `item_url_template` (`http://127.0.0.1:<port>/?item={item_id}`) with the
+    /// id substituted. serve.py reads that query parameter and build() scrolls
+    /// the item into view, so the title now lands on the row rather than on the
+    /// top of the page.
+    ///
+    /// Falls back to the Pass root when there is no template (a v1 payload, or
+    /// the file feed) or no item id (a freshly fired quicktask The Pass has not
+    /// heard about yet), because opening the page is still better than a dead
+    /// click.
+    static func itemURL(template: String?, base: String, itemID: String?) -> URL? {
+        guard let template, !template.isEmpty,
+              let itemID, !itemID.isEmpty,
+              template.contains(idPlaceholder) else {
+            return URL(string: base) ?? passURL
+        }
+        // RFC 3986 unreserved only, not .urlQueryAllowed: the id goes in as a
+        // query *value*, so an "&" in it has to be escaped rather than end the
+        // parameter. Ids are normally slugs; captures are the ones that are not.
+        let unreserved = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "-._~"))
+        let encoded = itemID.addingPercentEncoding(
+            withAllowedCharacters: unreserved) ?? itemID
+        let filled = template.replacingOccurrences(of: idPlaceholder, with: encoded)
+        // A template that came back unusable is not worth a dead click either.
+        return URL(string: filled) ?? URL(string: base) ?? passURL
+    }
+
+    /// The token serve.py leaves in `item_url_template`.
+    static let idPlaceholder = "{item_id}"
+
+    @discardableResult
+    static func openItem(template: String?, base: String, itemID: String?) -> Result<Void, Problem> {
+        guard let url = itemURL(template: template, base: base, itemID: itemID) else {
+            return .failure("no link for this row")
+        }
+        NSWorkspace.shared.open(url)
+        return .success(())
+    }
+
+    /// Fires an item's own kickoff prompt as a headless job, through The Pass
+    /// rather than through qt: the prompt lives in the ledger, not in the
+    /// widget, and `POST /run` is the route that already knows how to spawn it
+    /// under the three-slot limit. Returns the job slug it started.
+    static func run(record: TaskRecord, base: URL) -> Result<String, Problem> {
+        guard let itemID = record.itemID, !itemID.isEmpty else {
+            return .failure("row has no Pass item id")
+        }
+        return PassClient(base: base).run(id: itemID)
+    }
+
     /// Joins /status.json's root-relative `report` path onto its `pass_url`.
     /// The report is served over http because a file:// link is dead from an
     /// http:// page, and serve.py sandboxes the response.

@@ -103,6 +103,13 @@ enum NeedsReason: String, Codable, CaseIterable {
     }
 }
 
+/// A row's primary action, which is what return triggers on the highlighted
+/// row and what clicking its title does.
+enum RowAction: String, Codable {
+    case resume  // quicktask://resume/<slug>
+    case item    // the Pass's own deep link to the item
+}
+
 /// Which ledger a record came from. Both writers mirror into each other's
 /// store when a run finishes, so this is about provenance, not location.
 enum Origin: String, Codable {
@@ -189,6 +196,12 @@ struct TaskRecord: Codable, Equatable {
     let outputCount: Int
     let error: String?
     let denialCount: Int
+    /// Whether The Pass will accept a `POST /run` for this item: it has a
+    /// prompt and is not already running or awaiting a verdict. Decided
+    /// server-side (`/status.json`'s `can_run`) so the widget's Run-it button
+    /// and the review page's own fire action cannot disagree. Always false for
+    /// a file-feed row: the ledgers do not carry the item's prompt.
+    let canRun: Bool
 
     init(id: String,
          itemID: String? = nil,
@@ -207,7 +220,8 @@ struct TaskRecord: Codable, Equatable {
          feedStamp: Date? = nil,
          outputCount: Int = 0,
          error: String? = nil,
-         denialCount: Int = 0) {
+         denialCount: Int = 0,
+         canRun: Bool = false) {
         self.id = id
         self.itemID = itemID
         self.title = title
@@ -226,6 +240,7 @@ struct TaskRecord: Codable, Equatable {
         self.outputCount = outputCount
         self.error = error
         self.denialCount = denialCount
+        self.canRun = canRun
     }
 
     /// Newest timestamp the row actually carries. Drives the age text, so it
@@ -257,6 +272,13 @@ struct TaskRecord: Codable, Equatable {
     }
 
     var hasReport: Bool { report?.isEmpty == false }
+
+    /// What return does on the highlighted row: reopen the session when there
+    /// is one, otherwise open the item in The Pass. Deliberately never a
+    /// verdict or a fire -- both of those ask first, and a keystroke that
+    /// throws work away or spawns a job is not a keyboard shortcut anyone
+    /// wants to discover by accident.
+    var primaryAction: RowAction { canResume ? .resume : .item }
 
     /// Right-hand status text. A Pass reason outranks the job status, because a
     /// finished job awaiting a verdict reads "Verify", not "Done". A blocked
@@ -352,6 +374,16 @@ struct MenuModel: Equatable {
     /// Why the Pass feed was not used, for the footer tooltip. nil when it was.
     let passError: String?
     let groups: [PassGroup]
+    /// `/status.json`'s `item_url_template`, for the title deep link. nil on a
+    /// v1 payload or the file feed, where the title opens the Pass root.
+    let itemURLTemplate: String?
+    /// `/status.json`'s `counts`, carried whole rather than cherry-picked so a
+    /// tally added upstream shows up in `--dump-model` without a code change.
+    let counts: [String: Int]
+    /// The Pass caps `jobs` at 200 and says so in `counts.truncated`. Surfaced
+    /// as a footer hint, because a widget quietly showing a slice of the
+    /// history is the kind of thing you only notice when it matters.
+    let truncated: Bool
 
     init(records: [TaskRecord],
          aggregate: Aggregate,
@@ -360,7 +392,10 @@ struct MenuModel: Equatable {
          source: FeedSource = .files,
          passURL: String = PassEndpoint.defaultURL,
          passError: String? = nil,
-         groups: [PassGroup] = []) {
+         groups: [PassGroup] = [],
+         itemURLTemplate: String? = nil,
+         counts: [String: Int] = [:],
+         truncated: Bool = false) {
         self.records = records
         self.aggregate = aggregate
         self.refreshedAt = refreshedAt
@@ -369,6 +404,9 @@ struct MenuModel: Equatable {
         self.passURL = passURL
         self.passError = passError
         self.groups = groups
+        self.itemURLTemplate = itemURLTemplate
+        self.counts = counts
+        self.truncated = truncated
     }
 
     static func build(records: [TaskRecord],
@@ -377,7 +415,10 @@ struct MenuModel: Equatable {
                       source: FeedSource = .files,
                       passURL: String = PassEndpoint.defaultURL,
                       passError: String? = nil,
-                      groups: [PassGroup] = []) -> MenuModel {
+                      groups: [PassGroup] = [],
+                      itemURLTemplate: String? = nil,
+                      counts: [String: Int] = [:],
+                      truncated: Bool = false) -> MenuModel {
         let ordered = records.sorted { lhs, rhs in
             // Sections first, then reason inside Needs-you, then
             // newest-activity. Attention rows have to pin above the merely
@@ -399,7 +440,10 @@ struct MenuModel: Equatable {
                          source: source,
                          passURL: passURL,
                          passError: passError,
-                         groups: groups)
+                         groups: groups,
+                         itemURLTemplate: itemURLTemplate,
+                         counts: counts,
+                         truncated: truncated)
     }
 
     /// Rows grouped for display, in section order, empty sections dropped.
@@ -415,6 +459,15 @@ struct MenuModel: Equatable {
             }
     }
 
+    /// Rows in the order the menu draws them, with the collapsed sections'
+    /// rows left out. This is the list the keyboard highlight walks, so it has
+    /// to be the same list the eye walks.
+    func visibleRecords(collapsed: Set<String>, now: Date? = nil) -> [TaskRecord] {
+        sections(now: now)
+            .filter { !collapsed.contains($0.section.rawValue) }
+            .flatMap { $0.records }
+    }
+
     /// Copy of the model with a shorter row list, preserving the aggregate.
     /// Trimming happens after ordering, so the newest and the acting rows live.
     func trimmed(to limit: Int) -> MenuModel {
@@ -425,7 +478,41 @@ struct MenuModel: Equatable {
                   source: source,
                   passURL: passURL,
                   passError: passError,
-                  groups: groups)
+                  groups: groups,
+                  itemURLTemplate: itemURLTemplate,
+                  counts: counts,
+                  truncated: truncated)
+    }
+}
+
+// MARK: - Keyboard highlight
+
+/// Where the up/down highlight lands. Pure, and separate from the view, so the
+/// whole of the keyboard's behaviour can be tested without a display.
+///
+/// Rules, deliberately few: down from nothing highlights the first row, up from
+/// nothing highlights the last, and the ends do not wrap -- a held arrow key
+/// stopping at the end of the list is easier to follow than one that teleports.
+/// A highlight on a row that has since left the feed is dropped rather than
+/// remapped, because the row under the cursor changing identity between polls
+/// is how you fire the wrong thing.
+enum KeyboardNav {
+    /// The id the highlight moves to. `delta` is +1 for down, -1 for up.
+    static func move(ids: [String], from current: String?, delta: Int) -> String? {
+        guard !ids.isEmpty else { return nil }
+        guard let current, let index = ids.firstIndex(of: current) else {
+            return delta < 0 ? ids.last : ids.first
+        }
+        let next = index + delta
+        guard next >= 0, next < ids.count else { return current }
+        return ids[next]
+    }
+
+    /// The highlight after a refresh: kept when its row is still visible,
+    /// dropped when it is not.
+    static func survivor(ids: [String], current: String?) -> String? {
+        guard let current, ids.contains(current) else { return nil }
+        return current
     }
 }
 

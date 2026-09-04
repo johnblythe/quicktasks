@@ -69,7 +69,10 @@ enum Feed {
             source: .pass,
             passURL: status.passURL,
             passError: nil,
-            groups: status.groups
+            groups: status.groups,
+            itemURLTemplate: status.itemURLTemplate,
+            counts: status.counts,
+            truncated: status.truncated
         ).trimmed(to: config.limit)
     }
 
@@ -102,7 +105,10 @@ enum Feed {
             feedStamp: pass.feedStamp ?? ledger.feedStamp,
             outputCount: pass.outputCount,
             error: nonEmpty(pass.error) ?? ledger.error,
-            denialCount: max(pass.denialCount, ledger.denialCount))
+            denialCount: max(pass.denialCount, ledger.denialCount),
+            // Only The Pass knows whether an item can be fired: the rule needs
+            // the item's prompt and its lane, neither of which is in a ledger.
+            canRun: pass.canRun)
     }
 
     private static func nonEmpty(_ s: String?) -> String? {

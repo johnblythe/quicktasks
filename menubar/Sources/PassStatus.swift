@@ -6,36 +6,53 @@
 // `--dump-capture`, and `--dump-decision`, which is only possible because
 // nothing in this file needs a network or a screen.
 //
-// The contract (hub/serve.py):
+// The contract (hub/serve.py, /status.json v2):
 //
-//   GET /status.json -> {"generated_at", "pass_url",
+//   GET /status.json -> {"generated_at", "pass_url", "item_url_template",
 //                        "groups":[{"key","label","count","undone"}],
-//                        "counts":{"running","verify","gate","blocked","failed"},
+//                        "counts":{"running","verify","gate","blocked","failed",
+//                                  "done_today","total_jobs","truncated"},
 //                        "jobs":[{"item_id","title","state","status","started",
 //                                 "elapsed_s","failed","blocked","session_id",
-//                                 "resume_url","report","outputs"}],
-//                        "needs_you":[{"item_id","title","state","reason"}]}
+//                                 "resume_url","report","outputs",
+//                                 "finished","error","denials","can_run"}],
+//                        "needs_you":[{"item_id","title","state","reason",
+//                                      "resume_url","report","session_id",
+//                                      "started","can_run"}]}
 //   POST /capture    <- {"text","source"}  -> {"ok":true,"id":"cap-..."}
+//   POST /run        <- {"id"}             -> {"ok":true,"job":"<slug>"}, or 409
 //   POST /save       <- {"saved_at","decisions":[{id,title,state,action,comment}]}
 //
-// `needs_you` carries no resume_url and no report, so its rows are joined onto
-// `jobs` by item_id to pick up their affordances. A gate item has no job at
-// all, which is why the reason has to be able to stand in as the row's status
-// text on its own.
+// v2 made `needs_you` self-sufficient: it now carries its own resume_url,
+// report, session_id, started, and can_run, so a gate item with no job at all
+// still arrives with a real timestamp (its ledger date) and a fireable flag.
+// The join onto `jobs` by item_id is still done, and still matters -- only the
+// job side carries elapsed_s, outputs, error, and the denial count -- so each
+// field is taken from the needs_you entry first and from the job second.
 //
-// Only `item_id` is actually dependable inside a jobs entry. The real payload
-// omits `title`, `started`, `elapsed_s`, `failed`, `blocked`, and `session_id`
-// from jobs that have nothing to say about them, so every field here is read
-// leniently and every derived value has a fallback. `generated_at` arrives as
-// UTC with six fractional digits and a `+00:00` offset.
+// Everything v2 added is read as optional. A v1 payload (no finished, no
+// denials, no can_run, no item_url_template) still parses: `finished` falls
+// back to started + elapsed_s, `denials` reads either an int or the old array,
+// the deep link falls back to pass_url, and a row with no `started` at all
+// falls back to `generated_at` for ordering only. Titles are now always sent,
+// but an empty one still falls back to the item id rather than rendering a
+// blank row. `generated_at` and `finished` arrive as UTC with six fractional
+// digits and a `+00:00` offset.
 
 import Foundation
 
 struct PassStatus: Equatable {
     let generatedAt: Date?
     let passURL: String
+    /// `http://127.0.0.1:<port>/?item={item_id}` -- the deep link a row title
+    /// opens, with `{item_id}` substituted. nil on a v1 payload, where the
+    /// title falls back to opening the Pass root.
+    let itemURLTemplate: String?
     let groups: [PassGroup]
     let counts: [String: Int]
+    /// counts.truncated: the Pass caps `jobs` at 200 and says so. Carried
+    /// separately from `counts` because it is a flag, not a tally.
+    let truncated: Bool
     let records: [TaskRecord]
 
     /// Parses a /status.json body. Returns .failure only when the payload is
@@ -54,6 +71,8 @@ struct PassStatus: Equatable {
         }
 
         let passURL = (obj["pass_url"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? fallbackURL
+        let itemURLTemplate = (obj["item_url_template"] as? String)
+            .flatMap { $0.isEmpty ? nil : $0 }
         // Parsed up front because it stands in for a missing `started`. The
         // real payload leaves `started` and `elapsed_s` off jobs that have no
         // meaningful ones, and a row with no timestamp at all would sort last
@@ -66,10 +85,14 @@ struct PassStatus: Equatable {
                              count: intValue(g["count"]) ?? 0,
                              undone: intValue(g["undone"]) ?? 0)
         }
+        let countsIn = obj["counts"] as? [String: Any] ?? [:]
         var counts: [String: Int] = [:]
-        for (k, v) in (obj["counts"] as? [String: Any] ?? [:]) {
+        // `truncated` is a JSON bool sitting in the same object as the tallies.
+        // Left out of the int dictionary so nothing reads it as "1 truncated".
+        for (k, v) in countsIn where k != "truncated" {
             if let n = intValue(v) { counts[k] = n }
         }
+        let truncated = boolValue(countsIn["truncated"]) ?? false
 
         // 1. Index the jobs by item id, so needs_you can borrow their fields.
         var jobs: [String: [String: Any]] = [:]
@@ -90,9 +113,8 @@ struct PassStatus: Equatable {
             let job = jobs[itemID]
             let reason = NeedsReason(rawValue: ((entry["reason"] as? String) ?? "").lowercased())
             records.append(record(itemID: itemID,
+                                  entry: entry,
                                   job: job,
-                                  title: (entry["title"] as? String) ?? job?["title"] as? String,
-                                  state: (entry["state"] as? String) ?? job?["state"] as? String,
                                   reason: reason ?? NeedsReason.from(
                                       status: jobStatus(job)) ?? .gate,
                                   generatedAt: generatedAt))
@@ -104,17 +126,18 @@ struct PassStatus: Equatable {
         for itemID in jobOrder where !claimed.contains(itemID) {
             let job = jobs[itemID]
             records.append(record(itemID: itemID,
+                                  entry: nil,
                                   job: job,
-                                  title: job?["title"] as? String,
-                                  state: job?["state"] as? String,
                                   reason: NeedsReason.from(status: jobStatus(job)),
                                   generatedAt: generatedAt))
         }
 
         return .success(PassStatus(generatedAt: generatedAt,
                                    passURL: passURL,
+                                   itemURLTemplate: itemURLTemplate,
                                    groups: groups,
                                    counts: counts,
+                                   truncated: truncated,
                                    records: records))
     }
 
@@ -129,45 +152,71 @@ struct PassStatus: Equatable {
         return TaskStatus(raw: job["status"] as? String)
     }
 
+    /// One row, built from a needs_you entry, its matching jobs entry, or both.
+    /// v2 sends most fields on both sides, so each one is taken from the
+    /// needs_you entry first (it is the row's own view of itself) and from the
+    /// job second (it is the only side that has elapsed_s, outputs, error, and
+    /// denials).
     private static func record(itemID: String,
+                               entry: [String: Any]?,
                                job: [String: Any]?,
-                               title: String?,
-                               state: String?,
                                reason: NeedsReason?,
                                generatedAt: Date?) -> TaskRecord {
         let status = jobStatus(job)
-        let resumeURL = (job?["resume_url"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        let started = Store.parseDate(job?["started"])
+        // A JSON null arrives as NSNull, which is present but says nothing --
+        // it has to read as absent, or an explicit null on the needs_you side
+        // would hide a real value on the job side.
+        func field(_ key: String) -> Any? {
+            if let value = entry?[key], !(value is NSNull) { return value }
+            if let value = job?[key], !(value is NSNull) { return value }
+            return nil
+        }
+        func text(_ key: String) -> String? {
+            (field(key) as? String).flatMap { $0.isEmpty ? nil : $0 }
+        }
+        let resumeURL = text("resume_url")
+        let started = Store.parseDate(field("started"))
         let elapsed = doubleValue(job?["elapsed_s"])
-        // The contract carries no `finished`, so a terminal row's end time is
-        // reconstructed from started + elapsed_s. It only has to be accurate
-        // enough to sort the row and to place it in today vs earlier.
-        var finished: Date?
-        if !status.isActive, status != .unknown, let start = started {
+        // v2 sends `finished` for every terminal job, which is what decides
+        // Done today. A v1 payload has none, so a terminal row's end time
+        // falls back to started + elapsed_s -- accurate enough to sort the row
+        // and to place it in today vs earlier, which is all it is used for.
+        var finished = Store.parseDate(job?["finished"])
+        if finished == nil, !status.isActive, status != .unknown, let start = started {
             finished = start.addingTimeInterval(elapsed ?? 0)
         }
         let outputs = (job?["outputs"] as? [Any])?.count ?? 0
+        // v2 sends a count; v1 sent the array itself.
+        let denials = intValue(job?["denials"])
+            ?? (job?["denials"] as? [Any])?.count ?? 0
         return TaskRecord(
             id: dedupKey(itemID: itemID, resumeURL: resumeURL),
             itemID: itemID,
-            title: Store.titleFrom(title ?? itemID),
+            // v2 always sends a title. An empty one still falls back to the id,
+            // because a blank row is worse than an ugly one.
+            title: Store.titleFrom(text("title") ?? itemID),
             status: status,
-            state: state,
+            state: text("state"),
             reason: reason,
             origin: itemID.hasPrefix("qt-") ? .quicktask : .pass,
             created: started,
             started: started,
             finished: finished,
-            sessionId: job?["session_id"] as? String,
+            sessionId: text("session_id"),
             resumeURL: resumeURL,
-            report: (job?["report"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            report: text("report"),
             elapsedAtFetch: elapsed,
             // Only when the row brought no clock of its own. A row reported
             // live belongs to today; it just cannot say how old it is.
             feedStamp: started == nil ? generatedAt : nil,
             outputCount: outputs,
-            error: job?["error"] as? String,
-            denialCount: (job?["denials"] as? [Any])?.count ?? 0)
+            error: text("error"),
+            denialCount: denials,
+            // Whether the Pass will accept a POST /run for this item: it has a
+            // prompt and is not already running or awaiting a verdict. Same
+            // rule the review page's own canRun() applies, computed server-side
+            // so the widget and the page cannot drift.
+            canRun: boolValue(field("can_run")) ?? false)
     }
 
     /// The id every feed agrees on, so a Pass row and a qt-ledger row for the
@@ -205,13 +254,39 @@ struct PassStatus: Equatable {
         if let s = any as? String { return Double(s) }
         return nil
     }
+
+    /// JSON true/false arrives as an NSNumber, and a hand-written payload or a
+    /// future writer could send the string form. Anything else reads as absent
+    /// rather than as false, so a caller's own default wins.
+    static func boolValue(_ any: Any?) -> Bool? {
+        if let b = any as? Bool { return b }
+        if let n = any as? NSNumber { return n.boolValue }
+        if let s = any as? String {
+            switch s.lowercased() {
+            case "true", "1", "yes": return true
+            case "false", "0", "no": return false
+            default: return nil
+            }
+        }
+        return nil
+    }
 }
 
 // MARK: - request bodies
 
-/// The two POST bodies, built as plain dictionaries so a test can compare them
-/// key by key without a live server.
+/// The three POST bodies, built as plain dictionaries so a test can compare
+/// them key by key without a live server.
 enum PassPayload {
+    /// POST /run. Fires the item's own kickoff prompt as a headless job, the
+    /// same thing the review page's fire action posts. One key, so the body is
+    /// trivial -- but it goes through the same seam as the other two, so a test
+    /// can pin it without a live server.
+    static func run(id: String) -> Result<[String: Any], Problem> {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .failure("no item id to run") }
+        return .success(["id": trimmed])
+    }
+
     /// The only actions the widget will ever post. serve.py validates nothing,
     /// so this is the only thing standing between a typo and a junk row in
     /// decisions.json.

@@ -7,10 +7,23 @@
 // real `qt` script as a subprocess. It is also the read-only way to inspect
 // live state without opening the menu.
 //
-// `--dump-capture` and `--dump-decision` print the two POST bodies without
-// sending them. Payload construction is the part of an HTTP client most worth
-// pinning down and the part least worth a live server to test, so it is a pure
-// function with its own seam.
+// `--dump-capture`, `--dump-decision`, and `--dump-run` print the three POST
+// bodies without sending them. Payload construction is the part of an HTTP
+// client most worth pinning down and the part least worth a live server to
+// test, so it is a pure function with its own seam.
+//
+// `--dump-endpoint` prints where the widget would look for The Pass and why,
+// making no request at all -- discovery has to be testable without pointing a
+// test at whatever is actually listening on 8811.
+//
+// `--dump-keys` walks the keyboard highlight over the visible rows, so the
+// whole of the keyboard's behaviour can be checked without a display.
+//
+// `--post-run` is the one seam that really posts: it fires an item through
+// `POST /run` against whatever QT_PASS_URL points at, which in the tests is a
+// loopback fixture server. It exists because a 409 (already running, or all
+// three job slots busy) is an expected answer that has to be shown in the
+// widget's own words, and that mapping is worth a real round trip.
 
 import Foundation
 
@@ -33,8 +46,12 @@ enum DumpModel {
             "hub_jobs_dir": config.hubJobsDir?.path ?? NSNull(),
             "source": model.source.rawValue,
             "pass_url": model.passURL,
+            "pass_url_source": config.pass.source.rawValue,
             "pass_reachable": model.source == .pass,
             "pass_error": model.passError ?? NSNull(),
+            "item_url_template": model.itemURLTemplate ?? NSNull(),
+            "counts": model.counts,
+            "truncated": model.truncated,
             "login_item": LoginItem.isEnabled(),
             "aggregate": aggregateJSON(model.aggregate),
             "headline": model.aggregate.headline,
@@ -55,6 +72,10 @@ enum DumpModel {
                     "ids": entry.records.map { $0.id },
                 ] as [String: Any]
             },
+            // What the keyboard highlight walks, as a freshly opened menu would
+            // show it: default collapse rather than whatever is remembered in
+            // UserDefaults, so the seam is deterministic.
+            "visible_ids": defaultVisibleIDs(model, now: now),
             "records": model.records.map { r in
                 [
                     "id": r.id,
@@ -79,9 +100,16 @@ enum DumpModel {
                     "feed_stamp": stamp(r.feedStamp),
                     "outputs": r.outputCount,
                     "denials": r.denialCount,
+                    "error": r.error ?? NSNull(),
                     "can_resume": r.canResume,
                     "wants_resume": r.wantsResume,
                     "can_decide": r.canDecide,
+                    "can_run": r.canRun,
+                    "primary_action": r.primaryAction.rawValue,
+                    "item_url": Actions.itemURL(template: model.itemURLTemplate,
+                                                base: model.passURL,
+                                                itemID: r.itemID ?? r.id)?
+                        .absoluteString ?? NSNull(),
                 ] as [String: Any]
             },
         ]
@@ -89,12 +117,104 @@ enum DumpModel {
         return emit(payload)
     }
 
-    /// `--dump-capture <text>` and
+    private static func defaultVisibleIDs(_ model: MenuModel, now: Date) -> [String] {
+        let collapsed = Set(Section.allCases.filter { $0.collapsedByDefault }.map { $0.rawValue })
+        return model.visibleRecords(collapsed: collapsed, now: now).map { $0.id }
+    }
+
+    /// `--dump-endpoint`: where the widget would look for The Pass, and how it
+    /// decided. Makes no request, so a test can assert the discovery order
+    /// without depending on what is listening.
+    static func runEndpoint() -> Int32 {
+        let config = StoreConfig.resolve()
+        let pass = config.pass
+        return emit([
+            "pass_url": pass.url?.absoluteString ?? NSNull(),
+            "source": pass.source.rawValue,
+            "file": pass.file?.path ?? NSNull(),
+            "file_url": pass.fileURL ?? NSNull(),
+            "file_problem": pass.fileProblem ?? NSNull(),
+            "hub_dir": config.hubDir?.path ?? NSNull(),
+            "describe": pass.describe,
+        ])
+    }
+
+    /// `--dump-keys down,down,up`: the highlight's landing place after a key
+    /// sequence, over the same visible rows a freshly opened menu would show.
+    /// Anything but `up`/`down` is refused rather than ignored, so a typo in a
+    /// test is not a silent pass.
+    static func runKeys(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--dump-keys"), i + 1 < args.count else {
+            return fail("--dump-keys needs a comma-separated key sequence")
+        }
+        let config = StoreConfig.resolve()
+        let now = Date()
+        let model = Feed.load(config: config, now: now)
+        let ids = defaultVisibleIDs(model, now: now)
+        var highlight: String?
+        var keys: [String] = []
+        for key in args[i + 1].split(separator: ",") {
+            let name = key.trimmingCharacters(in: .whitespaces).lowercased()
+            guard !name.isEmpty else { continue }
+            switch name {
+            case "down": highlight = KeyboardNav.move(ids: ids, from: highlight, delta: 1)
+            case "up": highlight = KeyboardNav.move(ids: ids, from: highlight, delta: -1)
+            case "escape": highlight = nil
+            default: return fail("unknown key: \(name) (down, up, escape)")
+            }
+            keys.append(name)
+        }
+        let row = model.records.first { $0.id == highlight }
+        return emit([
+            "keys": keys,
+            "visible_ids": ids,
+            "highlight": highlight ?? NSNull(),
+            "primary_action": row?.primaryAction.rawValue ?? NSNull(),
+            "primary_url": row.flatMap { r -> String? in
+                switch r.primaryAction {
+                case .resume: return r.resumeURL ?? "quicktask://resume/\(r.id)"
+                case .item: return Actions.itemURL(template: model.itemURLTemplate,
+                                                   base: model.passURL,
+                                                   itemID: r.itemID ?? r.id)?.absoluteString
+                }
+            } ?? NSNull(),
+        ])
+    }
+
+    /// `--post-run <item-id>`: the real POST, against whatever QT_PASS_URL
+    /// points at. Prints the outcome as JSON and exits non-zero when The Pass
+    /// refused, so the 409 wording is checkable end to end.
+    static func runPost(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--post-run"), i + 1 < args.count else {
+            return fail("--post-run needs an item id")
+        }
+        let config = StoreConfig.resolve()
+        guard let base = config.passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        switch PassClient(base: base).run(id: args[i + 1]) {
+        case .success(let slug):
+            return emit(["ok": true, "job": slug])
+        case .failure(let problem):
+            _ = emit(["ok": false, "error": problem.message])
+            return 1
+        }
+    }
+
+    /// `--dump-capture <text>`, `--dump-run <item-id>`, and
     /// `--dump-decision <item-id> <action> [comment]`.
     static func runPayload(args: [String]) -> Int32 {
         if let i = args.firstIndex(of: "--dump-capture") {
             guard i + 1 < args.count else { return fail("--dump-capture needs some text") }
             switch PassPayload.capture(text: args[i + 1]) {
+            case .failure(let problem): return fail(problem.message)
+            case .success(let body): return emit(body)
+            }
+        }
+
+        if let i = args.firstIndex(of: "--dump-run") {
+            guard i + 1 < args.count else { return fail("--dump-run needs an item id") }
+            switch PassPayload.run(id: args[i + 1]) {
             case .failure(let problem): return fail(problem.message)
             case .success(let body): return emit(body)
             }

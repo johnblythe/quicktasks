@@ -9,13 +9,18 @@ Feed/Store/MenuModel code the menu draws from and prints the result as JSON.
 That keeps the assertions on observable behaviour and means the tests cannot
 drift away from what the widget actually shows.
 
-Two more seams get the same treatment. `--dump-capture` and `--dump-decision`
-print the POST bodies the widget would send without sending them, because
-payload construction is the part of an HTTP client most worth pinning down and
-the part least worth a live server to check. And FixturePass stands up a real
+The other seams get the same treatment. `--dump-capture`, `--dump-run`, and
+`--dump-decision` print the POST bodies the widget would send without sending
+them, because payload construction is the part of an HTTP client most worth
+pinning down and the part least worth a live server to check. `--dump-endpoint`
+prints where the widget would look for The Pass without making a request, which
+is the only way to test discovery without depending on what is really listening
+on 8811. `--dump-keys` walks the keyboard highlight over the visible rows, so
+the keyboard is tested without a display. And FixturePass stands up a real
 loopback server on an ephemeral port, so the /status.json path is exercised end
 to end -- transport, parse, join, merge -- and so is the fallback when nothing
-answers.
+answers, and so is the one seam that really posts (`--post-run`, whose 409 is
+an expected answer rather than a fault).
 
 Every file-feed case sets QT_PASS_URL="" so it stays deterministic on a machine
 where the real Pass happens to be up on 8811.
@@ -148,6 +153,26 @@ class ModelCase(unittest.TestCase):
         self.assertEqual(proc.returncode, expect,
                          f"{args} exited {proc.returncode}: {proc.stderr}")
         return proc
+
+    def endpoint(self, extra_env=None):
+        """`--dump-endpoint` with QT_PASS_URL *absent*, so the rest of the
+        discovery order is actually reachable. Makes no request, which is the
+        point: a discovery test must not depend on what is really listening on
+        8811, and must never poll John's live Pass."""
+        env = dict(os.environ)
+        env.pop("QT_PASS_URL", None)
+        env["QT_DATA"] = str(self.qt_data)
+        env["QT_HUB"] = str(self.hub)
+        env["QT_MENUBAR_AGENT_PLIST"] = str(self.tmp / "agents" / "never-written.plist")
+        env.update(extra_env or {})
+        proc = subprocess.run([str(BINARY), "--dump-endpoint"], capture_output=True,
+                              text=True, timeout=60, env=env)
+        self.assertEqual(proc.returncode, 0, f"dump-endpoint failed: {proc.stderr}")
+        return json.loads(proc.stdout)
+
+    def write_pass_url(self, text):
+        """What serve.py drops at <hub>/.pass-url when it binds a port."""
+        (self.hub / ".pass-url").write_text(text)
 
     def ids(self, model):
         return [r["id"] for r in model["records"]]
@@ -501,18 +526,22 @@ def job(item_id, **fields):
 
 
 def need(item_id, reason, **fields):
-    """One /status.json needs_you[] entry. Deliberately thin: the contract
-    gives these no resume_url and no report, which is why the widget has to
-    join them onto jobs[] by item_id."""
-    return {
+    """One /status.json needs_you[] entry, in its v1 shape: no resume_url and
+    no report, which is why the widget joins these onto jobs[] by item_id.
+    v2 fields (resume_url, report, session_id, started, can_run) are passed
+    through when a caller wants them, so the same helper covers both."""
+    rec = {
         "item_id": item_id,
         "title": fields.pop("title", f"title for {item_id}"),
         "state": fields.pop("state", reason),
         "reason": reason,
     }
+    rec.update(fields)
+    return rec
 
 
-def status_fixture(jobs=(), needs=(), groups=None, counts=None, pass_url=None):
+def status_fixture(jobs=(), needs=(), groups=None, counts=None, pass_url=None,
+                   item_url_template=None):
     payload = {
         "generated_at": _iso(datetime.now()),
         "groups": groups if groups is not None else [
@@ -526,6 +555,8 @@ def status_fixture(jobs=(), needs=(), groups=None, counts=None, pass_url=None):
     }
     if pass_url is not None:
         payload["pass_url"] = pass_url
+    if item_url_template is not None:
+        payload["item_url_template"] = item_url_template
     return payload
 
 
@@ -557,9 +588,16 @@ class _Handler(BaseHTTPRequestHandler):
             parsed = None
         self.owner.posts.append({"path": self.path, "body": parsed,
                                  "headers": dict(self.headers)})
-        body = json.dumps(self.owner.post_body).encode()
+        # serve.py answers a refused POST with plain text, not JSON: /run's 409
+        # body is literally "already running" or "max concurrent jobs running".
+        if self.owner.post_text is not None:
+            body = self.owner.post_text.encode()
+            ctype = "text/plain; charset=utf-8"
+        else:
+            body = json.dumps(self.owner.post_body).encode()
+            ctype = "application/json"
         self.send_response(self.owner.post_code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -572,12 +610,13 @@ class FixturePass:
     trip works and that its absence is handled."""
 
     def __init__(self, payload=None, raw=None, status_code=200,
-                 post_body=None, post_code=200):
+                 post_body=None, post_code=200, post_text=None):
         self.payload = payload
         self.raw = raw
         self.status_code = status_code
         self.post_body = post_body if post_body is not None else {"ok": True, "id": "cap-1"}
         self.post_code = post_code
+        self.post_text = post_text
         self.gets = []
         self.posts = []
         self._srv = None
@@ -1173,6 +1212,18 @@ class TestRealStatusSample(PassCase):
         self.assertTrue(r["started"].startswith("2026-09-04T"))
         self.assertEqual(r["elapsed_s"], 41)
 
+    def test_a_v1_payload_offers_no_run_it_and_no_deep_link(self):
+        """Everything v2 added is optional, and its absence has to read as
+        "not available" rather than as a default that misfires."""
+        self.assertIsNone(self.m["item_url_template"])
+        self.assertFalse(self.m["truncated"])
+        for row in self.m["records"]:
+            self.assertFalse(row["can_run"], row["id"])
+            self.assertEqual(row["denials"], 0, row["id"])
+            self.assertIsNone(row["error"], row["id"])
+            # No template, so the title still opens the Pass root.
+            self.assertEqual(row["item_url"], self.m["pass_url"], row["id"])
+
     def test_a_finished_job_with_no_timestamps_lands_in_done_today(self):
         """A terminal job the Pass is reporting live, with nothing to date it
         by, belongs to today rather than behind the collapsed Earlier."""
@@ -1182,6 +1233,547 @@ class TestRealStatusSample(PassCase):
         base = self.serve(payload=payload)
         m = self.pass_model(base)
         self.assertEqual([s["key"] for s in m["sections"]], ["done_today"])
+
+
+# A real /status.json v2 body, verbatim in the shape hub/serve.py's
+# _status_payload() builds: every key it sends, in its order, including the ones
+# v2 added -- item_url_template, counts.done_today/total_jobs/truncated, and
+# per-job finished/error/denials/can_run, plus the affordances needs_you now
+# carries on its own (resume_url, report, session_id, started, can_run).
+#
+# done1's `finished` is deliberately *not* started + elapsed_s (15:20 + 480s
+# would be 15:28, and it says 15:31), so a test can tell a parsed finish time
+# apart from the reconstructed one v1 had to use.
+REAL_STATUS_V2_SAMPLE = """
+{"generated_at":"2026-09-04T15:39:33.984811+00:00","pass_url":"http://127.0.0.1:8811/","item_url_template":"http://127.0.0.1:8811/?item={item_id}","groups":[{"key":"gate","label":"Needs your go","count":1,"undone":1},{"key":"running","label":"Running","count":1,"undone":1},{"key":"verify","label":"Verify","count":2,"undone":2},{"key":"today","label":"Today","count":0,"undone":0}],"counts":{"running":1,"verify":2,"gate":1,"blocked":0,"failed":1,"total_jobs":3,"truncated":false,"done_today":2},"jobs":[{"item_id":"run1","title":"Running one","state":"running","status":"running","started":"2026-09-04T15:38:00+00:00","elapsed_s":93,"failed":false,"blocked":false,"session_id":"sess-abc","resume_url":"quicktask://resume/run1-20260904-153800-7ab83a","report":null,"outputs":[],"finished":null,"error":null,"denials":0,"can_run":false},{"item_id":"done1","title":"Done one","state":"verify","status":"done","started":"2026-09-04T15:20:00+00:00","elapsed_s":480,"failed":false,"blocked":false,"session_id":"","resume_url":null,"report":"/job/done1/output/report.html","outputs":["RESULT.md","report.html"],"finished":"2026-09-04T15:31:00+00:00","error":null,"denials":0,"can_run":false},{"item_id":"fail1","title":"Failed one","state":"verify","status":"failed","started":"2026-09-04T14:00:00+00:00","elapsed_s":61,"failed":true,"blocked":false,"session_id":"","resume_url":null,"report":null,"outputs":[],"finished":"2026-09-04T14:01:01+00:00","error":"boom: something failed","denials":2,"can_run":false}],"needs_you":[{"item_id":"done1","title":"Done one","state":"verify","reason":"verify","resume_url":null,"report":"/job/done1/output/report.html","session_id":"","started":"2026-09-04T15:20:00+00:00","can_run":false},{"item_id":"gate1","title":"Gate one","state":"gate","reason":"gate","resume_url":null,"report":null,"session_id":"","started":"2026-08-27","can_run":true},{"item_id":"fail1","title":"Failed one","state":"verify","reason":"failed","resume_url":null,"report":null,"session_id":"","started":"2026-09-04T14:00:00+00:00","can_run":false}]}
+""".strip()
+
+
+class TestStatusV2Sample(PassCase):
+    """The v2 payload, parsed field by field. No section or day assertions --
+    the sample's timestamps are fixed, so those live in TestDoneTodayByFinished
+    where they are generated relative to now."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.serve(raw=REAL_STATUS_V2_SAMPLE)
+        self.m = self.pass_model(self.base)
+
+    def test_the_v2_payload_parses(self):
+        self.assertEqual(self.m["source"], "pass")
+        self.assertIsNone(self.m["pass_error"])
+        self.assertEqual(self.m["count"], 4, self.ids(self.m))
+
+    def test_titles_come_from_the_payload_now(self):
+        """v2 always sends a title, on both lists. The id fallback stays for an
+        empty one, but it should no longer be what rows are named."""
+        titles = {r["item_id"]: r["title"] for r in self.m["records"]}
+        self.assertEqual(titles["done1"], "Done one")
+        self.assertEqual(titles["gate1"], "Gate one")
+        self.assertEqual(titles["fail1"], "Failed one")
+        self.assertEqual(titles["run1"], "Running one")
+
+    def test_an_empty_title_still_falls_back_to_the_id(self):
+        payload = json.loads(REAL_STATUS_V2_SAMPLE)
+        payload["needs_you"][1]["title"] = ""
+        base = self.serve(payload=payload)
+        self.assertEqual(self.by_id(self.pass_model(base), "gate1")["title"], "gate1")
+
+    def test_finished_is_read_rather_than_reconstructed(self):
+        """15:20 + 480s would be 15:28. The payload says 15:31, and that is the
+        number Done today has to be decided by."""
+        r = self.by_id(self.m, "done1")
+        self.assertTrue(r["finished"].startswith("2026-09-04T15:31"), r["finished"])
+
+    def test_a_running_job_has_no_finish_time(self):
+        # Identity is still the resume slug, not the item id.
+        self.assertIsNone(self.by_id(self.m, "run1-20260904-153800-7ab83a")["finished"])
+
+    def test_error_and_denial_count_come_through(self):
+        """Both feed the row's tooltip, and both are the reason you would want
+        this row rather than its neighbour."""
+        r = self.by_id(self.m, "fail1")
+        self.assertEqual(r["error"], "boom: something failed")
+        self.assertEqual(r["denials"], 2, "v2 sends a count, not the array")
+        self.assertEqual(r["outputs"], 0)
+        self.assertEqual(self.by_id(self.m, "done1")["outputs"], 2)
+
+    def test_a_v1_denials_array_still_counts(self):
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j-old", denials=[{"tool_name": "Bash"}, {"tool_name": "Write"}])]))
+        self.assertEqual(self.by_id(self.pass_model(base), "j-old")["denials"], 2)
+
+    def test_can_run_is_the_pass_s_own_verdict(self):
+        """The rule needs the item's prompt and its lane, so it is decided
+        server-side and the widget just reports it."""
+        by_item = {r["item_id"]: r for r in self.m["records"]}
+        self.assertTrue(by_item["gate1"]["can_run"], "a gate item with a prompt is fireable")
+        self.assertFalse(by_item["run1"]["can_run"], "already running")
+        self.assertFalse(by_item["done1"]["can_run"], "awaiting a verdict")
+        self.assertFalse(by_item["fail1"]["can_run"], "awaiting a verdict")
+
+    def test_a_gate_row_now_arrives_with_its_own_timestamp(self):
+        """v2's needs_you carries `started`, which for a gate item is the item's
+        own ledger date. So the row finally has a real age instead of borrowing
+        generated_at for ordering."""
+        r = self.by_id(self.m, "gate1")
+        self.assertIsNotNone(r["started"])
+        self.assertTrue(r["started"].startswith("2026-08-27"), r["started"])
+        self.assertIsNone(r["feed_stamp"], "it has a stamp of its own now")
+
+    def test_counts_and_truncated_come_through(self):
+        self.assertEqual(self.m["counts"], {
+            "running": 1, "verify": 2, "gate": 1, "blocked": 0, "failed": 1,
+            "total_jobs": 3, "done_today": 2,
+        })
+        self.assertFalse(self.m["truncated"])
+        self.assertNotIn("truncated", self.m["counts"],
+                         "truncated is a flag, not a tally; it must not read as 1")
+
+    def test_truncated_is_carried_as_a_flag(self):
+        payload = json.loads(REAL_STATUS_V2_SAMPLE)
+        payload["counts"]["truncated"] = True
+        payload["counts"]["total_jobs"] = 412
+        base = self.serve(payload=payload)
+        m = self.pass_model(base)
+        self.assertTrue(m["truncated"])
+        self.assertEqual(m["counts"]["total_jobs"], 412)
+
+    def test_needs_you_affordances_no_longer_need_the_job(self):
+        """v2 made needs_you self-sufficient, which matters exactly when the
+        job has been capped out of jobs[]: the row still resumes and still has
+        its report."""
+        base = self.serve(payload=status_fixture(
+            jobs=[],
+            needs=[need("ld188", "verify", state="verify",
+                        resume_url="quicktask://resume/ld188-20260904-101500-a1b2c3",
+                        report="/job/ld188/output/report.html",
+                        session_id="sess-ld188",
+                        started=_iso(datetime.now() - timedelta(minutes=20)),
+                        can_run=False)]))
+        r = self.by_id(self.pass_model(base), "ld188-20260904-101500-a1b2c3")
+        self.assertEqual(r["item_id"], "ld188")
+        self.assertTrue(r["can_resume"])
+        self.assertEqual(r["session_id"], "sess-ld188")
+        self.assertEqual(r["report"], "/job/ld188/output/report.html")
+        self.assertEqual(r["report_url"], base + "/job/ld188/output/report.html")
+        self.assertIsNotNone(r["started"])
+        self.assertTrue(r["can_decide"])
+
+    def test_the_needs_you_entry_wins_over_the_job(self):
+        """Both sides send most fields now. The row's own view of itself is the
+        one taken, so a stale jobs[] entry cannot rename or re-lane it."""
+        base = self.serve(payload=status_fixture(
+            jobs=[job("x", title="stale title", state="today", session_id="stale-sess")],
+            needs=[need("x", "verify", title="fresh title", state="verify",
+                        session_id="fresh-sess")]))
+        r = self.by_id(self.pass_model(base), "x")
+        self.assertEqual(r["title"], "fresh title")
+        self.assertEqual(r["state"], "verify")
+        self.assertEqual(r["session_id"], "fresh-sess")
+
+    def test_an_explicit_null_does_not_hide_the_job_s_value(self):
+        """A JSON null is present but says nothing, so it has to read as absent.
+        Otherwise a needs_you entry sending `"resume_url": null` would hide a
+        real session sitting on the job side."""
+        base = self.serve(payload=status_fixture(
+            jobs=[job("ld188", status="done", state="verify",
+                      report="/job/ld188/output/report.html",
+                      session_id="sess-ld188",
+                      resume_url="quicktask://resume/ld188-20260904-101500-a1b2c3")],
+            needs=[need("ld188", "verify", state="verify", resume_url=None,
+                        report=None, session_id=None, started=None)]))
+        r = self.by_id(self.pass_model(base), "ld188-20260904-101500-a1b2c3")
+        self.assertEqual(r["resume_url"],
+                         "quicktask://resume/ld188-20260904-101500-a1b2c3")
+        self.assertEqual(r["report"], "/job/ld188/output/report.html")
+        self.assertEqual(r["session_id"], "sess-ld188")
+        self.assertTrue(r["can_resume"])
+
+    def test_elapsed_and_outputs_still_come_from_the_job(self):
+        """The two fields only the job side has, so the join still earns its
+        keep even with needs_you self-sufficient."""
+        base = self.serve(payload=status_fixture(
+            jobs=[job("y", status="running", elapsed_s=252, outputs=["a.md", "b.md"])],
+            needs=[need("y", "blocked")]))
+        r = self.by_id(self.pass_model(base), "y")
+        self.assertEqual(r["elapsed_s"], 252)
+        self.assertEqual(r["outputs"], 2)
+
+
+class TestDoneTodayByFinished(PassCase):
+    """Which day a finished row belongs to is decided by `finished`, and only
+    falls back to the old started + elapsed_s reconstruction when the payload
+    carries none."""
+
+    def section_of(self, base, item_id):
+        return self.by_id(self.pass_model(base), item_id)["section"]
+
+    def test_a_job_that_finished_today_is_done_today(self):
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j", status="done", state="today",
+                      started=_iso(datetime.now() - timedelta(days=4)),
+                      elapsed_s=30,
+                      finished=_iso(datetime.now() - timedelta(minutes=10)))]))
+        self.assertEqual(self.section_of(base, "j"), "done_today",
+                         "started four days ago, finished ten minutes ago")
+
+    def test_a_job_that_finished_yesterday_is_earlier(self):
+        """And started + elapsed_s must not drag it into today: this one
+        started an hour ago by that arithmetic, and still finished yesterday."""
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j", status="done", state="today",
+                      started=_iso(datetime.now() - timedelta(hours=1)),
+                      elapsed_s=60,
+                      finished=_iso(datetime.now() - timedelta(days=1)))]))
+        self.assertEqual(self.section_of(base, "j"), "earlier")
+
+    def test_a_v1_payload_still_reconstructs_the_finish(self):
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j", status="done", state="today", elapsed_s=480,
+                      started=_iso(datetime.now() - timedelta(hours=2)))]))
+        r = self.by_id(self.pass_model(base), "j")
+        self.assertIsNotNone(r["finished"])
+        self.assertEqual(r["section"], "done_today")
+
+    def test_a_null_finish_on_a_running_job_stays_running(self):
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j", status="running", finished=None)]))
+        r = self.by_id(self.pass_model(base), "j")
+        self.assertIsNone(r["finished"])
+        self.assertEqual(r["section"], "running")
+
+    def test_finished_beats_the_feed_stamp_for_an_old_job(self):
+        """A row with no `started` used to fall back to generated_at and land
+        in today. With a real finish time it goes where it belongs."""
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j", status="done", state="today", started=None, elapsed_s=None,
+                      finished=_iso(datetime.now() - timedelta(days=3)))]))
+        self.assertEqual(self.section_of(base, "j"), "earlier")
+
+
+class TestRunIt(PassCase):
+    """POST /run: the body, the round trip, and the 409 that is an answer
+    rather than a fault."""
+
+    def test_the_run_body_is_just_the_item_id(self):
+        body = json.loads(self.run_binary("--dump-run", "ld188").stdout)
+        self.assertEqual(body, {"id": "ld188"})
+
+    def test_the_run_body_trims_and_refuses_empty(self):
+        body = json.loads(self.run_binary("--dump-run", "  ld188  ").stdout)
+        self.assertEqual(body, {"id": "ld188"})
+        self.run_binary("--dump-run", "   ", expect=1)
+
+    def test_running_an_item_posts_the_id_to_run(self):
+        base = self.serve(payload=status_fixture(
+            needs=[need("gate1", "gate", can_run=True)]),
+            post_body={"ok": True, "job": "gate1-20260904-120000-abc123"})
+        proc = self.run_binary("--post-run", "gate1", extra_env={"QT_PASS_URL": base})
+        self.assertEqual(json.loads(proc.stdout),
+                         {"ok": True, "job": "gate1-20260904-120000-abc123"})
+        posts = [p for p in self.server.posts if p["path"] == "/run"]
+        self.assertEqual(len(posts), 1, self.server.posts)
+        self.assertEqual(posts[0]["body"], {"id": "gate1"})
+        # Same hole the other posts come in by: serve.py lets a request with no
+        # Origin through, and a native app is what that is for.
+        self.assertNotIn("Origin", posts[0]["headers"])
+        self.assertEqual(posts[0]["headers"].get("Content-Type"), "application/json")
+
+    def test_a_409_reads_as_already_running(self):
+        base = self.serve(payload=status_fixture(), post_code=409,
+                          post_text="already running")
+        proc = self.run_binary("--post-run", "gate1", extra_env={"QT_PASS_URL": base},
+                               expect=1)
+        self.assertEqual(json.loads(proc.stdout),
+                         {"ok": False, "error": "Already running"})
+
+    def test_a_409_for_a_full_queue_says_so(self):
+        """serve.py sends "max concurrent jobs running" when all three slots
+        are busy. Not an HTTP status in the header, and not a stack of words
+        either -- it has to fit next to the dot."""
+        base = self.serve(payload=status_fixture(), post_code=409,
+                          post_text="max concurrent jobs running")
+        proc = self.run_binary("--post-run", "gate1", extra_env={"QT_PASS_URL": base},
+                               expect=1)
+        self.assertEqual(json.loads(proc.stdout)["error"], "Job slots full, not fired")
+
+    def test_an_unexpected_409_body_is_still_reported(self):
+        base = self.serve(payload=status_fixture(), post_code=409,
+                          post_text="something new upstream")
+        proc = self.run_binary("--post-run", "gate1", extra_env={"QT_PASS_URL": base},
+                               expect=1)
+        self.assertEqual(json.loads(proc.stdout)["error"],
+                         "Not fired: something new upstream")
+
+    def test_a_400_is_not_dressed_up_as_a_refusal(self):
+        """An unknown id or a promptless item is a 400, which is a fault on the
+        widget's side and should read like one."""
+        base = self.serve(payload=status_fixture(), post_code=400,
+                          post_text="unknown id")
+        proc = self.run_binary("--post-run", "nope", extra_env={"QT_PASS_URL": base},
+                               expect=1)
+        self.assertIn("400", json.loads(proc.stdout)["error"])
+
+    def test_an_unreachable_pass_is_not_a_silent_no_op(self):
+        proc = self.run_binary("--post-run", "gate1",
+                               extra_env={"QT_PASS_URL": "http://127.0.0.1:1"}, expect=1)
+        self.assertFalse(json.loads(proc.stdout)["ok"])
+
+    def test_running_needs_a_pass(self):
+        """QT_PASS_URL="" means the file ledgers only, and the file feed has no
+        route to fire anything."""
+        self.run_binary("--post-run", "gate1", extra_env={"QT_PASS_URL": ""}, expect=1)
+
+    def test_a_file_feed_row_never_offers_run_it(self):
+        """can_run needs the item's prompt and lane, and neither ledger has
+        them, so the button has to stay off in file mode."""
+        self.write_task("t-local", status="done")
+        m = self.model()
+        self.assertEqual(m["source"], "files")
+        self.assertFalse(any(r["can_run"] for r in m["records"]))
+
+
+class TestItemDeepLink(PassCase):
+    """Clicking a title opens the item, not the top of the page."""
+
+    def test_the_template_is_filled_with_the_item_id(self):
+        base = self.serve(payload=status_fixture(
+            jobs=[job("ld188", status="running")],
+            pass_url="http://127.0.0.1:8899/",
+            item_url_template="http://127.0.0.1:8899/?item={item_id}"))
+        m = self.pass_model(base)
+        self.assertEqual(m["item_url_template"], "http://127.0.0.1:8899/?item={item_id}")
+        self.assertEqual(self.by_id(m, "ld188")["item_url"],
+                         "http://127.0.0.1:8899/?item=ld188")
+
+    def test_the_link_uses_the_item_id_not_the_row_id(self):
+        """The row's identity is the resume slug; every Pass route is keyed by
+        the item id, and so is this."""
+        base = self.serve(payload=status_fixture(
+            jobs=[job("ld188", status="done", state="verify",
+                      resume_url="quicktask://resume/ld188-20260904-101500-a1b2c3")],
+            item_url_template="http://127.0.0.1:8811/?item={item_id}"))
+        r = self.by_id(self.pass_model(base), "ld188-20260904-101500-a1b2c3")
+        self.assertEqual(r["item_url"], "http://127.0.0.1:8811/?item=ld188")
+
+    def test_an_id_needing_encoding_is_encoded(self):
+        base = self.serve(payload=status_fixture(
+            needs=[need("cap 2026&09", "gate")],
+            item_url_template="http://127.0.0.1:8811/?item={item_id}"))
+        r = self.by_id(self.pass_model(base), "cap 2026&09")
+        self.assertEqual(r["item_url"], "http://127.0.0.1:8811/?item=cap%202026%2609",
+                         "the id is a query value, so an & in it has to be escaped")
+
+    def test_no_template_falls_back_to_the_pass_root(self):
+        """A v1 payload has no template, and an dead click would be worse than
+        landing on the page."""
+        base = self.serve(payload=status_fixture(jobs=[job("ld188")]))
+        m = self.pass_model(base)
+        self.assertIsNone(m["item_url_template"])
+        self.assertEqual(self.by_id(m, "ld188")["item_url"], base)
+
+    def test_a_template_without_the_placeholder_falls_back(self):
+        base = self.serve(payload=status_fixture(
+            jobs=[job("ld188")], pass_url="http://127.0.0.1:8899/",
+            item_url_template="http://127.0.0.1:8899/"))
+        self.assertEqual(self.by_id(self.pass_model(base), "ld188")["item_url"],
+                         "http://127.0.0.1:8899/")
+
+    def test_a_file_row_falls_back_to_the_pass_root(self):
+        self.write_task("t-local", status="done")
+        m = self.model()
+        self.assertIsNone(m["item_url_template"])
+        self.assertEqual(self.by_id(m, "t-local")["item_url"], m["pass_url"])
+
+
+class TestPassDiscovery(ModelCase):
+    """Where the widget looks for The Pass: QT_PASS_URL, then the hub
+    checkout's .pass-url, then port 8811. Driven through --dump-endpoint, which
+    makes no request -- so these cases never touch a live Pass."""
+
+    def test_the_env_override_wins(self):
+        self.write_pass_url("http://127.0.0.1:8877/\n")
+        e = self.endpoint(extra_env={"QT_PASS_URL": "http://127.0.0.1:9999"})
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:9999")
+        self.assertEqual(e["source"], "env")
+
+    def test_the_file_wins_over_the_default(self):
+        """serve.py walks 8811..8820 for a free port and writes where it landed,
+        which is the whole reason this file exists."""
+        self.write_pass_url("http://127.0.0.1:8813/\n")
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:8813/")
+        self.assertEqual(e["source"], "file")
+        self.assertEqual(e["file"], str(self.hub / ".pass-url"))
+        self.assertIsNone(e["file_problem"])
+
+    def test_surrounding_whitespace_is_trimmed(self):
+        self.write_pass_url("  http://localhost:8815/  \n\n")
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], "http://localhost:8815/")
+        self.assertEqual(e["source"], "file")
+
+    def test_no_file_means_the_default_port(self):
+        """The normal state when The Pass is down: it removes the file on a
+        graceful shutdown, and that is not an error."""
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:8811")
+        self.assertEqual(e["source"], "default")
+        self.assertIsNone(e["file_problem"])
+
+    def test_a_malformed_file_is_ignored_and_reported(self):
+        self.write_pass_url("not a url at all\n")
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:8811")
+        self.assertEqual(e["source"], "default")
+        self.assertIn("not a URL", e["file_problem"])
+
+    def test_an_empty_file_is_ignored(self):
+        """A file caught mid-write must not take the feed down with it."""
+        self.write_pass_url("\n")
+        e = self.endpoint()
+        self.assertEqual(e["source"], "default")
+        self.assertIn("empty", e["file_problem"])
+
+    def test_a_non_loopback_file_is_refused(self):
+        """This is a file the widget reads without being told to, so it does
+        not get to choose the host."""
+        self.write_pass_url("http://evil.example.com:8811/\n")
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:8811")
+        self.assertIn("loopback", e["file_problem"])
+
+    def test_a_non_http_file_is_refused(self):
+        self.write_pass_url("file:///Users/someone/code/hub\n")
+        e = self.endpoint()
+        self.assertEqual(e["source"], "default")
+        self.assertIn("not http", e["file_problem"])
+
+    def test_an_empty_env_override_switches_the_feed_off(self):
+        self.write_pass_url("http://127.0.0.1:8813/\n")
+        e = self.endpoint(extra_env={"QT_PASS_URL": ""})
+        self.assertIsNone(e["pass_url"])
+        self.assertEqual(e["source"], "off")
+
+    def test_the_file_is_read_from_the_configured_hub(self):
+        """Only the hub the widget is pointed at, so it never discovers a Pass
+        belonging to a checkout it was not asked about."""
+        other = self.tmp / "other-hub"
+        other.mkdir()
+        (other / ".pass-url").write_text("http://127.0.0.1:8888/\n")
+        e = self.endpoint(extra_env={"QT_HUB": str(other)})
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:8888/")
+        self.assertEqual(e["file"], str(other / ".pass-url"))
+
+    def test_the_discovered_url_is_actually_used(self):
+        """End to end: a .pass-url pointing at a live fixture server has to be
+        the thing the model comes from, with no QT_PASS_URL in sight."""
+        server = FixturePass(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        base = server.start()
+        self.addCleanup(server.stop)
+        self.write_pass_url(base + "\n")
+        env = dict(os.environ)
+        env.pop("QT_PASS_URL", None)
+        env["QT_DATA"] = str(self.qt_data)
+        env["QT_HUB"] = str(self.hub)
+        env["QT_MENUBAR_AGENT_PLIST"] = str(self.tmp / "agents" / "never-written.plist")
+        proc = subprocess.run([str(BINARY), "--dump-model", "--limit", "50"],
+                              capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        m = json.loads(proc.stdout)
+        self.assertEqual(m["source"], "pass")
+        self.assertEqual(m["pass_url_source"], "file")
+        self.assertEqual(self.ids(m), ["alpha"])
+
+
+class TestKeyboardHighlight(PassCase):
+    """up/down walk the visible rows, return takes the row's primary action,
+    escape clears. Driven through --dump-keys, which runs the same pure
+    KeyboardNav the view uses."""
+
+    def keys(self, base, sequence):
+        proc = self.run_binary("--dump-keys", sequence,
+                               extra_env={"QT_PASS_URL": base})
+        return json.loads(proc.stdout)
+
+    def three_rows(self):
+        return self.serve(payload=status_fixture(
+            jobs=[job("j-live", status="running",
+                      resume_url="quicktask://resume/j-live-20260904-120000-aaaaaa")],
+            needs=[need("g-gate", "gate", can_run=True),
+                   need("j-block", "blocked")],
+            item_url_template="http://127.0.0.1:8811/?item={item_id}"))
+
+    def test_visible_rows_are_the_rows_in_reading_order(self):
+        base = self.three_rows()
+        m = self.pass_model(base)
+        self.assertEqual(m["visible_ids"],
+                         ["j-live-20260904-120000-aaaaaa", "g-gate", "j-block"])
+
+    def test_a_collapsed_section_is_not_walked(self):
+        """Earlier starts collapsed, so its rows are not in the highlight's
+        path -- the highlight has to walk the list the eye is walking."""
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j-old", status="done", state="today",
+                      finished=_iso(datetime.now() - timedelta(days=3)),
+                      started=_iso(datetime.now() - timedelta(days=3)))],
+            needs=[need("g-gate", "gate")]))
+        m = self.pass_model(base)
+        self.assertEqual(self.by_id(m, "j-old")["section"], "earlier")
+        self.assertEqual(m["visible_ids"], ["g-gate"])
+
+    def test_down_from_nothing_highlights_the_first_row(self):
+        self.assertEqual(self.keys(self.three_rows(), "down")["highlight"],
+                         "j-live-20260904-120000-aaaaaa")
+
+    def test_up_from_nothing_highlights_the_last_row(self):
+        self.assertEqual(self.keys(self.three_rows(), "up")["highlight"], "j-block")
+
+    def test_the_highlight_walks_down_and_back_up(self):
+        base = self.three_rows()
+        self.assertEqual(self.keys(base, "down,down")["highlight"], "g-gate")
+        self.assertEqual(self.keys(base, "down,down,down")["highlight"], "j-block")
+        self.assertEqual(self.keys(base, "down,down,up")["highlight"],
+                         "j-live-20260904-120000-aaaaaa")
+
+    def test_the_ends_do_not_wrap(self):
+        """A held arrow stopping at the end of the list is easier to follow
+        than one that teleports to the other end."""
+        base = self.three_rows()
+        self.assertEqual(self.keys(base, "down,down,down,down,down")["highlight"],
+                         "j-block")
+        self.assertEqual(self.keys(base, "down,up,up,up")["highlight"],
+                         "j-live-20260904-120000-aaaaaa")
+
+    def test_escape_clears_the_highlight(self):
+        self.assertIsNone(self.keys(self.three_rows(), "down,down,escape")["highlight"])
+
+    def test_return_resumes_when_there_is_a_session(self):
+        k = self.keys(self.three_rows(), "down")
+        self.assertEqual(k["primary_action"], "resume")
+        self.assertEqual(k["primary_url"],
+                         "quicktask://resume/j-live-20260904-120000-aaaaaa")
+
+    def test_return_opens_the_item_when_there_is_no_session(self):
+        """Never a verdict and never a fire: both of those ask first, and a
+        keystroke that spends a job slot is not one to discover by accident."""
+        k = self.keys(self.three_rows(), "down,down")
+        self.assertEqual(k["highlight"], "g-gate")
+        self.assertEqual(k["primary_action"], "item")
+        self.assertEqual(k["primary_url"], "http://127.0.0.1:8811/?item=g-gate")
+
+    def test_nothing_to_walk_is_not_an_error(self):
+        base = self.serve(payload=status_fixture(jobs=[], needs=[]))
+        k = self.keys(base, "down,down,up")
+        self.assertEqual(k["visible_ids"], [])
+        self.assertIsNone(k["highlight"])
+
+    def test_an_unknown_key_is_refused_rather_than_ignored(self):
+        base = self.serve(payload=status_fixture(needs=[need("g", "gate")]))
+        proc = self.run_binary("--dump-keys", "down,left",
+                               extra_env={"QT_PASS_URL": base}, expect=1)
+        self.assertIn("left", proc.stderr)
 
 
 class TestCaptureLimits(ModelCase):
