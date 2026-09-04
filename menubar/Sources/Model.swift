@@ -181,6 +181,11 @@ struct TaskRecord: Codable, Equatable {
     /// Seconds elapsed as of the fetch, for in-flight rows whose `started`
     /// did not parse. The live ticker adds the drift since.
     let elapsedAtFetch: Double?
+    /// When the feed generated this view, set only for a row that carries no
+    /// timestamp of its own. It orders the row and places it in today, but it
+    /// never dates it: "Needs go - 2s" on an item held for a week would be a
+    /// lie, and one that resets on every poll.
+    let feedStamp: Date?
     let outputCount: Int
     let error: String?
     let denialCount: Int
@@ -199,6 +204,7 @@ struct TaskRecord: Codable, Equatable {
          resumeURL: String? = nil,
          report: String? = nil,
          elapsedAtFetch: Double? = nil,
+         feedStamp: Date? = nil,
          outputCount: Int = 0,
          error: String? = nil,
          denialCount: Int = 0) {
@@ -216,13 +222,20 @@ struct TaskRecord: Codable, Equatable {
         self.resumeURL = resumeURL
         self.report = report
         self.elapsedAtFetch = elapsedAtFetch
+        self.feedStamp = feedStamp
         self.outputCount = outputCount
         self.error = error
         self.denialCount = denialCount
     }
 
-    /// Newest timestamp on the record, used for ordering the dropdown.
+    /// Newest timestamp the row actually carries. Drives the age text, so it
+    /// must never include a stamp the feed supplied on the row's behalf.
     var activity: Date? { finished ?? started ?? created }
+
+    /// What orders the row and decides today vs earlier. Falls back to the
+    /// feed's own clock for a row with no timestamps, because sorting those
+    /// last and burying them in Earlier is worse than dating them roughly.
+    var sortStamp: Date? { activity ?? feedStamp }
 
     /// A run is only reopenable if something handed back a session to resume:
     /// a session id from either ledger, or a resume URL from The Pass.
@@ -231,9 +244,17 @@ struct TaskRecord: Codable, Equatable {
     /// The rows the ticket wants one click away from being reopened.
     var wantsResume: Bool { canResume && (reason != nil || status.isAttention) }
 
-    /// Verify rows are the only ones that carry accept / redo / reject, and
-    /// only when there is an item id to post a decision against.
-    var canDecide: Bool { reason == .verify && (itemID?.isEmpty == false) }
+    /// Whether this row takes accept / redo / reject.
+    ///
+    /// Keyed off the item's `state`, not its reason, because that is what the
+    /// review page keys its own action vocabulary off: template.html's ACTIONS
+    /// map gives `verify` exactly accept / redo / reject. The distinction is
+    /// load-bearing for a job that died in the verify lane, which The Pass
+    /// reports as `state: "verify"` with `reason: "failed"` -- the row reads
+    /// "Failed", and a verdict is still the action it needs.
+    var canDecide: Bool {
+        state?.lowercased() == "verify" && (itemID?.isEmpty == false)
+    }
 
     var hasReport: Bool { report?.isEmpty == false }
 
@@ -253,7 +274,7 @@ struct TaskRecord: Codable, Equatable {
         if effectiveReason != nil { return .needsYou }
         if status.isActive { return .running }
         if let end = finished, calendar.isDate(end, inSameDayAs: now) { return .doneToday }
-        if finished == nil, let seen = activity, calendar.isDate(seen, inSameDayAs: now) {
+        if finished == nil, let seen = sortStamp, calendar.isDate(seen, inSameDayAs: now) {
             return .doneToday
         }
         return .earlier
@@ -366,8 +387,8 @@ struct MenuModel: Equatable {
             if ls != rs { return ls < rs }
             let lr = lhs.effectiveReason?.rank ?? -1, rr = rhs.effectiveReason?.rank ?? -1
             if lr != rr { return lr < rr }
-            let l = lhs.activity ?? .distantPast
-            let r = rhs.activity ?? .distantPast
+            let l = lhs.sortStamp ?? .distantPast
+            let r = rhs.sortStamp ?? .distantPast
             if l != r { return l > r }
             return lhs.id < rhs.id
         }

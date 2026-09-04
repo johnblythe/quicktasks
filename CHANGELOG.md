@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- Menu-bar widget, corrections against a real `/status.json` body (LD-201): the verdict buttons now key off the item's `state` rather than its reason, so a job that died in the verify lane still offers accept / redo / reject instead of only reading "Failed"; a job with no `started` falls back to `generated_at` for ordering only, so rows the Pass reports without timestamps still sort and still count as today instead of dropping behind the collapsed Earlier section, while never being given an age they do not have; capture text over 4000 characters is refused in the widget's own words rather than sent for a 400; and empty Pass groups no longer pad the header tooltip. The real payload omits `title`, `started`, `elapsed_s`, `failed`, `blocked`, and `session_id` from jobs that have nothing to say about them, so it is now pinned as a verbatim regression fixture (96 widget tests, 103 in the repo).
 - Task ids now carry the year (`yymmdd-hhmmss-slug`) and get a numeric suffix on same-second collisions, so a same-second queue can no longer overwrite an existing task and filename order survives New Year.
 
 ### Added

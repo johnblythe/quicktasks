@@ -1076,5 +1076,126 @@ class TestSectionsFromFiles(ModelCase):
         return []
 
 
+# A real /status.json body, verbatim from the Pass's own fixture. Kept as raw
+# bytes rather than rebuilt from the helpers above, so it keeps checking the
+# widget against what the server actually sends: keys the contract lists but
+# the payload omits (`title`, `started`, `elapsed_s`, `session_id`), a trailing
+# slash on pass_url, UTC with six fractional digits, groups with zero counts,
+# and a failed job sitting in the verify lane.
+REAL_STATUS_SAMPLE = """
+{"generated_at":"2026-09-04T15:39:33.984811+00:00","pass_url":"http://127.0.0.1:8811/","groups":[{"key":"gate","label":"Needs your go","count":1,"undone":1},{"key":"running","label":"Running","count":1,"undone":1},{"key":"verify","label":"Verify","count":2,"undone":2},{"key":"today","label":"Today","count":0,"undone":0},{"key":"next","label":"Next","count":0,"undone":0}],"counts":{"running":1,"verify":2,"gate":1,"blocked":0,"failed":1},"jobs":[{"item_id":"run1","state":"running","status":"running","session_id":"sess-abc","resume_url":"quicktask://resume/run1-7ab83a9b","report":null,"outputs":[]},{"item_id":"done1","state":"verify","status":"done","failed":false,"blocked":false,"resume_url":null,"report":"/job/done1/output/report.html","outputs":["report.html"]},{"item_id":"fail1","state":"verify","status":"failed","failed":true,"blocked":false,"resume_url":null,"report":null,"outputs":[]}],"needs_you":[{"item_id":"done1","state":"verify","reason":"verify"},{"item_id":"gate1","state":"gate","reason":"gate"},{"item_id":"fail1","state":"verify","reason":"failed"}]}
+""".strip()
+
+
+class TestRealStatusSample(PassCase):
+    def setUp(self):
+        super().setUp()
+        self.base = self.serve(raw=REAL_STATUS_SAMPLE)
+        self.m = self.pass_model(self.base)
+
+    def test_the_real_payload_parses(self):
+        self.assertEqual(self.m["source"], "pass")
+        self.assertIsNone(self.m["pass_error"])
+        self.assertEqual(self.m["count"], 4)
+
+    def test_sections_and_needs_you_order(self):
+        self.assertEqual([(s["key"], s["ids"]) for s in self.m["sections"]],
+                         [("running", ["run1-7ab83a9b"]),
+                          ("needs_you", ["done1", "gate1", "fail1"])])
+
+    def test_the_resume_slug_is_the_row_id(self):
+        r = self.by_id(self.m, "run1-7ab83a9b")
+        self.assertEqual(r["item_id"], "run1")
+        self.assertTrue(r["can_resume"])
+
+    def test_report_url_survives_a_trailing_slash_on_pass_url(self):
+        self.assertEqual(self.m["pass_url"], "http://127.0.0.1:8811/")
+        self.assertEqual(self.by_id(self.m, "done1")["report_url"],
+                         "http://127.0.0.1:8811/job/done1/output/report.html")
+
+    def test_a_failed_job_in_the_verify_lane_still_takes_a_verdict(self):
+        """The review page keys its actions off `state`, so state verify with
+        reason failed reads "Failed" and still offers accept/redo/reject."""
+        r = self.by_id(self.m, "fail1")
+        self.assertEqual(r["state"], "verify")
+        self.assertEqual(r["reason"], "failed")
+        self.assertEqual(r["detail"], "Failed")
+        self.assertEqual(r["status"], "failed")
+        self.assertTrue(r["can_decide"])
+
+    def test_a_gate_row_takes_no_verdict(self):
+        r = self.by_id(self.m, "gate1")
+        self.assertEqual(r["state"], "gate")
+        self.assertEqual(r["detail"], "Needs go")
+        self.assertFalse(r["can_decide"])
+        self.assertFalse(r["can_resume"])
+
+    def test_a_missing_title_falls_back_to_the_item_id(self):
+        self.assertEqual(self.by_id(self.m, "done1")["title"], "done1")
+
+    def test_generated_at_orders_a_row_without_dating_it(self):
+        """Every job in the real payload omits `started`. generated_at stands
+        in so the row sorts and counts as today, but it must not become the
+        row's age: "Needs go - 2s" on an item held for a week would be a lie,
+        and one that resets on every poll."""
+        for row in self.m["records"]:
+            self.assertIsNotNone(row["feed_stamp"], row["id"])
+            self.assertTrue(row["feed_stamp"].startswith("2026-09-04T"), row["id"])
+            # No timestamp of its own, so no age text and no stopwatch.
+            self.assertIsNone(row["created"], row["id"])
+            self.assertIsNone(row["started"], row["id"])
+            self.assertIsNone(row["finished"], row["id"])
+            self.assertIsNone(row["elapsed_s"], row["id"])
+
+    def test_a_row_with_its_own_stamp_gets_no_feed_stamp(self):
+        payload = json.loads(REAL_STATUS_SAMPLE)
+        payload["jobs"][0]["started"] = "2026-09-04T15:00:00+00:00"
+        base = self.serve(payload=payload)
+        r = self.by_id(self.pass_model(base), "run1-7ab83a9b")
+        self.assertIsNotNone(r["started"])
+        self.assertIsNone(r["feed_stamp"])
+
+    def test_zero_count_groups_are_carried_through(self):
+        self.assertEqual([g["key"] for g in self.m["groups"]],
+                         ["gate", "running", "verify", "today", "next"])
+        self.assertEqual([g["count"] for g in self.m["groups"]],
+                         [1, 1, 2, 0, 0])
+
+    def test_utc_stamps_with_six_fractional_digits_parse(self):
+        """`2026-09-04T15:39:33.984811+00:00`. An ISO-8601 parser accepting
+        only three fractional digits would blank every timestamp."""
+        payload = json.loads(REAL_STATUS_SAMPLE)
+        payload["jobs"][0]["started"] = payload["generated_at"]
+        payload["jobs"][0]["elapsed_s"] = 41
+        base = self.serve(payload=payload)
+        r = self.by_id(self.pass_model(base), "run1-7ab83a9b")
+        self.assertIsNotNone(r["started"])
+        self.assertTrue(r["started"].startswith("2026-09-04T"))
+        self.assertEqual(r["elapsed_s"], 41)
+
+    def test_a_finished_job_with_no_timestamps_lands_in_done_today(self):
+        """A terminal job the Pass is reporting live, with nothing to date it
+        by, belongs to today rather than behind the collapsed Earlier."""
+        payload = json.loads(REAL_STATUS_SAMPLE)
+        payload["needs_you"] = []
+        payload["jobs"] = [j for j in payload["jobs"] if j["item_id"] == "done1"]
+        base = self.serve(payload=payload)
+        m = self.pass_model(base)
+        self.assertEqual([s["key"] for s in m["sections"]], ["done_today"])
+
+
+class TestCaptureLimits(ModelCase):
+    def test_capture_takes_text_up_to_the_limit(self):
+        proc = self.run_binary("--dump-capture", "x" * 4000)
+        self.assertEqual(len(json.loads(proc.stdout)["text"]), 4000)
+
+    def test_capture_refuses_text_over_the_limit(self):
+        """POST /capture answers 400 over 4000 characters, so the widget says
+        so in its own words rather than surfacing an HTTP status."""
+        proc = self.run_binary("--dump-capture", "x" * 4001, expect=1)
+        self.assertIn("4001", proc.stderr)
+        self.assertIn("4000", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

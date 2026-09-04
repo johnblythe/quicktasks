@@ -144,11 +144,14 @@ struct MenuView: View {
         .help(groupsTooltip)
     }
 
+    /// The Pass's own group counts. It sends every group it renders, including
+    /// the empty ones, and "Today: 0 of 0 open" is noise in a tooltip.
     private var groupsTooltip: String {
-        guard !controller.model.groups.isEmpty else { return controller.model.aggregate.headline }
-        return controller.model.groups
+        let lines = controller.model.groups
+            .filter { $0.count > 0 || $0.undone > 0 }
             .map { "\($0.label): \($0.undone) of \($0.count) open" }
-            .joined(separator: "\n")
+        guard !lines.isEmpty else { return controller.model.aggregate.headline }
+        return lines.joined(separator: "\n")
     }
 
     private var footer: some View {

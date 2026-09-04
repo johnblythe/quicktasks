@@ -90,7 +90,9 @@ remembered:
   permission mode instead of silently escalating. Point it somewhere else with
   `QT_MENUBAR_FIRE_DIR`.
 - **To Pass** posts to `POST /capture`, which files it as an item needing your
-  go rather than running it. The flash message names the id The Pass assigned.
+  go rather than running it. The flash message names the id The Pass assigned
+  (`cap-20260904-153933-7ab83a9`). Text over 4000 characters is refused here
+  rather than sent, since the route answers 400 for it.
 
 **Sections.** Running, Needs you, Done today, Earlier. Click a header to
 collapse it; the state is remembered in `UserDefaults`. Only Earlier starts
@@ -105,8 +107,14 @@ result.
 | Icon | Shown when | Does |
 | --- | --- | --- |
 | ▤ | the job wrote a report | Opens `pass_url` + `report` in the browser |
-| ✓ ↺ ✕ | the row is a verify row | Posts `accept` / `redo` / `reject` |
+| ✓ ↺ ✕ | the item's `state` is `verify` | Posts `accept` / `redo` / `reject` |
 | ↗ | there is a session to reopen | Opens `quicktask://resume/<slug>` |
+
+The verdict buttons key off the item's **state**, not its reason, matching
+`template.html`'s `ACTIONS` map, which gives `verify` exactly those three. The
+distinction matters for a job that died in the verify lane: The Pass reports it
+as `state: "verify"` with `reason: "failed"`, so the row reads "Failed" and a
+verdict is still the action it needs.
 
 Clicking the **title** opens The Pass. It opens the root, not the item: The
 Pass has no per-item deep link today (`serve.py` strips the query string before
@@ -169,6 +177,15 @@ which is why the reason has to be able to stand in as the row's status text on
 its own. `jobs` carries no `finished`, so a terminal row's end time is
 reconstructed from `started + elapsed_s`, which only has to be accurate enough
 to sort the row and place it in today versus earlier.
+
+Inside a `jobs` entry only `item_id` is dependable. The real payload omits
+`title`, `started`, `elapsed_s`, `failed`, `blocked`, and `session_id` from jobs
+that have nothing to say about them, so every field is read leniently: a missing
+title falls back to the item id, and a missing `started` falls back to
+`generated_at` for *ordering only*, so the row still sorts and still counts as
+today. It never becomes the row's age or its stopwatch: "Needs go - 2s" on an
+item held for a week would be a lie, and one that resets on every poll.
+Timestamps arrive as UTC with six fractional digits and a `+00:00` offset.
 
 Even in Pass mode the qt ledger is still read and merged. A task fired with `qt`
 (or with this widget's quick-fire) does not reach The Pass until it finishes,
@@ -260,7 +277,7 @@ the remembered UI state without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-82 tests in `tests/test_menubar_model.py`. They build the app and drive the
+96 tests in `tests/test_menubar_model.py`. They build the app and drive the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` parsing and the `needs_you` join, needs-you ordering,
@@ -268,11 +285,17 @@ gate rows with no job, report URL construction, the job booleans outranking the
 status string, fallback to the files when The Pass is unreachable or answers
 garbage or answers something that is not a status payload, the Pass/ledger
 merge in both directions, capture and decisions payload construction including
-the carry-forward of unreconciled decisions, section membership and collapse
-defaults, aggregate precedence, resume affordances, both file dedup directions,
-staleness resolution, hub-feed-off, limit trimming, malformed input, and one
-read-only pass over the machine's actual ledgers asserting only invariants that
-hold for any real state.
+the carry-forward of unreconciled decisions and the capture length limit,
+section membership and collapse defaults, aggregate precedence, resume
+affordances, both file dedup directions, staleness resolution, hub-feed-off,
+limit trimming, malformed input, and one read-only pass over the machine's
+actual ledgers asserting only invariants that hold for any real state.
+
+`TestRealStatusSample` holds a real `/status.json` body verbatim, as raw bytes
+rather than rebuilt from the test helpers, so the suite keeps checking the
+widget against what the server actually sends: absent keys, a trailing slash on
+`pass_url`, six-digit fractional UTC, zero-count groups, and a failed job in the
+verify lane.
 
 The Pass cases stand up a real loopback server on an ephemeral port rather than
 mocking one, because the thing most worth proving about that path is that the

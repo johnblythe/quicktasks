@@ -76,6 +76,7 @@ enum DumpModel {
                         Actions.reportURL(base: model.passURL, report: $0)?.absoluteString
                     } ?? NSNull(),
                     "elapsed_s": r.elapsedAtFetch ?? NSNull(),
+                    "feed_stamp": stamp(r.feedStamp),
                     "outputs": r.outputCount,
                     "denials": r.denialCount,
                     "can_resume": r.canResume,

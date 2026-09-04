@@ -22,6 +22,12 @@
 // `jobs` by item_id to pick up their affordances. A gate item has no job at
 // all, which is why the reason has to be able to stand in as the row's status
 // text on its own.
+//
+// Only `item_id` is actually dependable inside a jobs entry. The real payload
+// omits `title`, `started`, `elapsed_s`, `failed`, `blocked`, and `session_id`
+// from jobs that have nothing to say about them, so every field here is read
+// leniently and every derived value has a fallback. `generated_at` arrives as
+// UTC with six fractional digits and a `+00:00` offset.
 
 import Foundation
 
@@ -48,6 +54,11 @@ struct PassStatus: Equatable {
         }
 
         let passURL = (obj["pass_url"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? fallbackURL
+        // Parsed up front because it stands in for a missing `started`. The
+        // real payload leaves `started` and `elapsed_s` off jobs that have no
+        // meaningful ones, and a row with no timestamp at all would sort last
+        // inside its section and fall into Earlier rather than Done today.
+        let generatedAt = Store.parseDate(obj["generated_at"])
         let groups = (obj["groups"] as? [[String: Any]] ?? []).compactMap { g -> PassGroup? in
             guard let key = g["key"] as? String, !key.isEmpty else { return nil }
             return PassGroup(key: key,
@@ -83,7 +94,8 @@ struct PassStatus: Equatable {
                                   title: (entry["title"] as? String) ?? job?["title"] as? String,
                                   state: (entry["state"] as? String) ?? job?["state"] as? String,
                                   reason: reason ?? NeedsReason.from(
-                                      status: jobStatus(job)) ?? .gate))
+                                      status: jobStatus(job)) ?? .gate,
+                                  generatedAt: generatedAt))
         }
 
         // 3. Every remaining job. A job the Pass did not list under needs_you
@@ -95,10 +107,11 @@ struct PassStatus: Equatable {
                                   job: job,
                                   title: job?["title"] as? String,
                                   state: job?["state"] as? String,
-                                  reason: NeedsReason.from(status: jobStatus(job))))
+                                  reason: NeedsReason.from(status: jobStatus(job)),
+                                  generatedAt: generatedAt))
         }
 
-        return .success(PassStatus(generatedAt: Store.parseDate(obj["generated_at"]),
+        return .success(PassStatus(generatedAt: generatedAt,
                                    passURL: passURL,
                                    groups: groups,
                                    counts: counts,
@@ -120,7 +133,8 @@ struct PassStatus: Equatable {
                                job: [String: Any]?,
                                title: String?,
                                state: String?,
-                               reason: NeedsReason?) -> TaskRecord {
+                               reason: NeedsReason?,
+                               generatedAt: Date?) -> TaskRecord {
         let status = jobStatus(job)
         let resumeURL = (job?["resume_url"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let started = Store.parseDate(job?["started"])
@@ -148,6 +162,9 @@ struct PassStatus: Equatable {
             resumeURL: resumeURL,
             report: (job?["report"] as? String).flatMap { $0.isEmpty ? nil : $0 },
             elapsedAtFetch: elapsed,
+            // Only when the row brought no clock of its own. A row reported
+            // live belongs to today; it just cannot say how old it is.
+            feedStamp: started == nil ? generatedAt : nil,
             outputCount: outputs,
             error: job?["error"] as? String,
             denialCount: (job?["denials"] as? [Any])?.count ?? 0)
@@ -202,10 +219,18 @@ enum PassPayload {
 
     static let captureSource = "menubar"
 
+    /// What POST /capture rejects with a 400. Enforced here as well so the
+    /// widget can say what is wrong in its own words instead of surfacing an
+    /// HTTP status, and so a paste of a whole document never leaves the app.
+    static let captureLimit = 4000
+
     /// POST /capture. Creates a gate item ("needs your go") in The Pass.
     static func capture(text: String, source: String = captureSource) -> Result<[String: Any], Problem> {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .failure("nothing to capture") }
+        guard trimmed.count <= captureLimit else {
+            return .failure("too long to capture: \(trimmed.count) characters, limit is \(captureLimit)")
+        }
         return .success(["text": trimmed, "source": source])
     }
 

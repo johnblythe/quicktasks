@@ -99,6 +99,7 @@ enum Feed {
             resumeURL: pass.resumeURL,
             report: pass.report,
             elapsedAtFetch: pass.elapsedAtFetch,
+            feedStamp: pass.feedStamp ?? ledger.feedStamp,
             outputCount: pass.outputCount,
             error: nonEmpty(pass.error) ?? ledger.error,
             denialCount: max(pass.denialCount, ledger.denialCount))
