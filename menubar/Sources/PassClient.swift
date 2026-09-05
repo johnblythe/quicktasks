@@ -7,9 +7,12 @@
 // for 30 seconds is indistinguishable from a Pass that is down, so it may as
 // well give up in one and fall back to the files.
 //
-// No Origin header is set. serve.py's _origin_blocked() lets a request with no
-// Origin through (browsers always send one cross-origin; CLIs never do), which
-// is exactly the hole a native app is supposed to come in by.
+// No Origin header is set, with one exception: restart() sends the Pass's own
+// origin, because /restart is gated the same way and a native app has no
+// other loopback origin to offer that the gate would accept. Everywhere else,
+// serve.py's _origin_blocked() lets a request with no Origin through
+// (browsers always send one cross-origin; CLIs never do), which is exactly
+// the hole a native app is supposed to come in by.
 
 import Foundation
 
@@ -54,19 +57,25 @@ enum PassEndpoint {
         /// or was never set. Surfaced in the settings window next to the field,
         /// so a typed-in URL that is refused says so where it was typed.
         let settingProblem: String?
+        /// Set only when a probed `.pass-url` target did not answer and the
+        /// default port was used instead. nil the rest of the time, including
+        /// when probing never ran at all.
+        let fallback: String?
 
         init(url: URL?,
              source: Source,
              file: URL?,
              fileURL: String?,
              fileProblem: String?,
-             settingProblem: String? = nil) {
+             settingProblem: String? = nil,
+             fallback: String? = nil) {
             self.url = url
             self.source = source
             self.file = file
             self.fileURL = fileURL
             self.fileProblem = fileProblem
             self.settingProblem = settingProblem
+            self.fallback = fallback
         }
 
         /// One line for the footer tooltip: where the widget is looking, and why.
@@ -96,9 +105,13 @@ enum PassEndpoint {
     /// Only the configured hub's `.pass-url` is read -- `~/code/hub`'s when no
     /// hub is configured -- so the widget never discovers a Pass belonging to a
     /// checkout it was not pointed at.
+    /// `probe` gates a live reachability check on a `.file`-sourced result --
+    /// off by default, so most callers still make no request at all. See
+    /// `reachable(_:timeout:)`.
     static func resolution(env: [String: String] = ProcessInfo.processInfo.environment,
                            hubDir: URL? = nil,
-                           settings: Settings = .load()) -> Resolution {
+                           settings: Settings = .load(),
+                           probe: Bool = false) -> Resolution {
         let file = urlFile(hubDir: hubDir)
         if let raw = env["QT_PASS_URL"] {
             let trimmed = raw.trimmingCharacters(in: .whitespaces)
@@ -108,6 +121,8 @@ enum PassEndpoint {
             }
             // An explicit override is taken as given: it is how a test points
             // the widget at an ephemeral port and how a second Pass gets used.
+            // Never probed -- QT_PASS_URL is authoritative and does not fall
+            // back even to a dead port.
             return Resolution(url: URL(string: trimmed), source: .env, file: file,
                               fileURL: nil, fileProblem: nil)
         }
@@ -126,6 +141,17 @@ enum PassEndpoint {
         }
         switch read(file: file) {
         case .success(let url)?:
+            if probe, !reachable(url) {
+                // The file said something, but nothing answers there -- the
+                // Pass that wrote it is gone, and polling a dead port forever
+                // is worse than falling back to the port a fresh serve.py
+                // would have bound. The raw file contents are still kept in
+                // `fileURL` so Settings can show what was found.
+                return Resolution(url: URL(string: defaultURL), source: .standard, file: file,
+                                  fileURL: url.absoluteString, fileProblem: nil,
+                                  settingProblem: settingProblem,
+                                  fallback: "8811 (pass-url target unreachable)")
+            }
             return Resolution(url: url, source: .file, file: file,
                               fileURL: url.absoluteString, fileProblem: nil,
                               settingProblem: settingProblem)
@@ -144,8 +170,22 @@ enum PassEndpoint {
 
     static func resolve(env: [String: String] = ProcessInfo.processInfo.environment,
                         hubDir: URL? = nil,
-                        settings: Settings = .load()) -> URL? {
-        resolution(env: env, hubDir: hubDir, settings: settings).url
+                        settings: Settings = .load(),
+                        probe: Bool = false) -> URL? {
+        resolution(env: env, hubDir: hubDir, settings: settings, probe: probe).url
+    }
+
+    /// Whether a discovered `.pass-url` target is worth trusting: reuses
+    /// `status()` rather than a bespoke probe, since a target that answers
+    /// with something that is not Pass JSON is exactly as useless as one that
+    /// does not answer at all. Timeout is short -- this runs inline in
+    /// discovery, so it costs a poll or a `--dump-endpoint` call at most one
+    /// extra second, not the ~1.5s `PassClient.status()` allows a live feed.
+    static func reachable(_ url: URL, timeout: TimeInterval = 1.0) -> Bool {
+        switch PassClient(base: url, statusTimeout: timeout).status() {
+        case .success: return true
+        case .failure: return false
+        }
     }
 
     static func urlFile(hubDir: URL?) -> URL {
@@ -318,6 +358,87 @@ struct PassClient {
     enum DecideOutcome: String {
         case decided            // POST /decide took it
         case fellBackToSave = "save"   // no /decide on this Pass; POST /save did
+    }
+
+    // MARK: - restart
+
+    /// The exact request `restart()` sends, without sending it. `--dump-restart`
+    /// prints this so a test can pin the Origin header without a live Pass.
+    struct RestartRequest {
+        let method: String
+        let path: String
+        let headers: [String: String]
+    }
+
+    static func restartRequest(base: URL) -> RestartRequest {
+        RestartRequest(method: "POST", path: "restart",
+                       headers: ["Origin": originHeader(for: base)])
+    }
+
+    /// `scheme://host:port` for `base`, with no path -- the one Origin header
+    /// this file ever sends. /restart is gated the same way every other
+    /// state-changing POST is, but a native app asking a process to restart
+    /// itself is worth being deliberate about, and the value the gate accepts
+    /// is the Pass's own origin, not the absence this file otherwise relies on.
+    private static func originHeader(for base: URL) -> String {
+        guard let host = base.host else { return base.absoluteString }
+        let scheme = base.scheme ?? "http"
+        if let port = base.port { return "\(scheme)://\(host):\(port)" }
+        return "\(scheme)://\(host)"
+    }
+
+    /// What POST /restart answered. `supervised` is the whole reason to ask:
+    /// a launchd-managed Pass (KeepAlive) comes back on its own within
+    /// seconds; a hand-started one just stops.
+    struct RestartOutcome {
+        let supervised: Bool
+    }
+
+    /// Why POST /restart did not succeed. A dedicated type rather than a bare
+    /// `Problem`, because 404 and 403 each drive a different follow-up in
+    /// SettingsView (predates: leave the button enabled and say so; refused:
+    /// report the Origin block) and a caller should not have to sniff a
+    /// message string to tell them apart.
+    enum RestartFailure: Error {
+        case predates            // 404: this Pass has no /restart route yet
+        case refused(String)     // 403: the Origin gate said no
+        case other(Problem)
+
+        var problem: Problem {
+            switch self {
+            case .predates:
+                return "This Pass predates POST /restart; update the hub"
+            case .refused(let detail):
+                return "The Pass refused the restart (Origin blocked): \(detail)"
+            case .other(let p):
+                return p
+            }
+        }
+    }
+
+    /// POST /restart, no body. The process exits about half a second after
+    /// answering, so a `.success` here describes what is about to happen, not
+    /// what has already happened.
+    func restart() -> Result<RestartOutcome, RestartFailure> {
+        var request = URLRequest(url: base.appendingPathComponent("restart"))
+        request.httpMethod = "POST"
+        request.setValue(Self.originHeader(for: base), forHTTPHeaderField: "Origin")
+        request.timeoutInterval = actionTimeout
+        switch send(request, timeout: actionTimeout) {
+        case .success(let data):
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let supervised = (obj?["supervised"] as? Bool) ?? false
+            return .success(RestartOutcome(supervised: supervised))
+        case .failure(let failure):
+            switch failure.code {
+            case 404:
+                return .failure(.predates)
+            case 403:
+                return .failure(.refused(failure.detail.isEmpty ? "no reason given" : failure.detail))
+            default:
+                return .failure(.other(failure.problem))
+            }
+        }
     }
 
     // MARK: - transport

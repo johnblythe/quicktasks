@@ -119,7 +119,11 @@ final class StatusController: ObservableObject {
         // resolved out here too, so re-reading .pass-url and the settings costs
         // the main thread nothing either.
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let config = StoreConfig.resolve()
+            // Probed here, off the main thread: this is the path that lets
+            // the running widget self-heal from a stale `.pass-url` left
+            // behind by a Pass that has since died, rather than polling a
+            // dead port until the app is relaunched.
+            let config = StoreConfig.resolve(probeDiscovery: true)
             let fresh = Feed.load(config: config)
             DispatchQueue.main.async {
                 self?.config = config
@@ -236,6 +240,75 @@ final class StatusController: ObservableObject {
     var passBase: URL {
         URL(string: model.passURL) ?? config.passURL ?? Actions.passURL
     }
+
+    // MARK: - restart
+
+    /// The `busy` key while a restart is in flight, exposed so SettingsView
+    /// can disable the button and show a spinner for the same span
+    /// `restartPass` treats as busy.
+    static let restartBusyKey = "restart-pass"
+
+    /// A Restart Pass click's outcome, as told to the settings view. For a
+    /// launchd-supervised Pass, `then` fires twice: `.restarting` the moment
+    /// the POST answers, then `.backUp` or `.stillDown` once the bounded poll
+    /// settles. Every other outcome fires it exactly once.
+    enum RestartMessage {
+        case restarting
+        case backUp
+        case stillDown
+        case stopped
+        /// 404, 403, or any other failure -- already worded for display by
+        /// `PassClient.RestartFailure.problem`.
+        case problem(String)
+    }
+
+    /// POSTs /restart and, when the Pass is launchd-supervised, polls
+    /// /status.json for up to ~20s so the view can say "Pass is back" rather
+    /// than leaving "Restarting..." up forever. Runs off the main thread;
+    /// `report` is always called back on the main thread.
+    func restartPass(then report: @escaping (RestartMessage) -> Void) {
+        guard !busy.contains(Self.restartBusyKey) else { return }
+        busy.insert(Self.restartBusyKey)
+        let base = passBase
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            switch PassClient(base: base).restart() {
+            case .success(let outcome) where outcome.supervised:
+                DispatchQueue.main.async { report(.restarting) }
+                let backUp = Self.pollUntilBackUp(base: base)
+                DispatchQueue.main.async {
+                    self?.busy.remove(Self.restartBusyKey)
+                    report(backUp ? .backUp : .stillDown)
+                    if backUp { self?.refresh() }
+                }
+            case .success:
+                DispatchQueue.main.async {
+                    self?.busy.remove(Self.restartBusyKey)
+                    report(.stopped)
+                }
+            case .failure(let failure):
+                DispatchQueue.main.async {
+                    self?.busy.remove(Self.restartBusyKey)
+                    report(.problem(failure.problem.message))
+                }
+            }
+        }
+    }
+
+    /// Polls /status.json once a second for up to `budget` seconds, starting
+    /// after a one-second grace period for the old process to actually exit
+    /// -- POST /restart's 200 lands about half a second before that happens,
+    /// per the hub's own contract. Returns whether it answered in time.
+    private static func pollUntilBackUp(base: URL,
+                                        budget: TimeInterval = 20,
+                                        interval: TimeInterval = 1) -> Bool {
+        Thread.sleep(forTimeInterval: 1)
+        let deadline = Date().addingTimeInterval(budget)
+        while Date() < deadline {
+            if case .success = PassClient(base: base).status() { return true }
+            Thread.sleep(forTimeInterval: interval)
+        }
+        return false
+    }
 }
 
 struct QuicktaskStatusApp: App {
@@ -263,7 +336,8 @@ enum Entry {
 
               (no arguments)          run the menu-bar app
               --dump-model            print the computed menu model as JSON and exit
-              --dump-endpoint         print where the Pass was found, and how; no request
+              --dump-endpoint         print where the Pass was found, and how; probes a
+                                      discovered .pass-url and falls back if it is dead
               --dump-capture <text>   print the POST /capture body and exit
               --dump-run <id>         print the POST /run body and exit
               --dump-decision <id> <accept|redo|reject> [comment]
@@ -276,6 +350,8 @@ enum Entry {
               --post-run <id>         really POST /run for an item and print the outcome
               --post-decide <id> <action>
                                       really decide a suggestion; says which route took it
+              --dump-restart          print the POST /restart request (method, path, Origin)
+              --post-restart          really POST /restart and print the outcome
               --snapshot <png>        render the dropdown to a PNG and exit
               --snapshot-settings <png>
                                       render the settings window to a PNG and exit
@@ -323,6 +399,12 @@ enum Entry {
         }
         if args.contains("--post-decide") {
             exit(DumpModel.runPostDecide(args: args))
+        }
+        if args.contains("--dump-restart") {
+            exit(DumpModel.runDumpRestart())
+        }
+        if args.contains("--post-restart") {
+            exit(DumpModel.runPostRestart())
         }
         // Checked before --snapshot, which is a prefix of it.
         if let i = args.firstIndex(of: "--snapshot-settings") {

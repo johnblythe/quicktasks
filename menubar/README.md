@@ -184,6 +184,16 @@ widget guessed port 8811 or read a live URL off disk. When The Pass reports
 real total, because a widget quietly showing a slice of the history is the kind
 of thing you only notice when it matters.
 
+**Restart Pass**, in the settings window behind the footer's gear, POSTs
+`/restart` behind a confirm sheet ("Jobs in flight keep running; the page and
+this widget reconnect in a few seconds."). A launchd-supervised Pass
+(`KeepAlive`) comes back on its own within a bounded ~20s poll, and the sheet
+says so first ("Restarting… back in a few seconds") and then either "Pass is
+back" or that it is still not answering. A hand-started Pass just stops, and
+the sheet says how to start it again by hand. A Pass old enough to predate the
+route (404) leaves the button enabled and reports that rather than disabling
+it; an Origin the gate refused (403) reports the refusal.
+
 **The dot**:
 
 | Colour | Meaning |
@@ -269,6 +279,15 @@ footer tooltip and then ignored, so a file caught mid-write cannot take the feed
 down with it. An absent file is not a problem at all -- it is the normal state
 when The Pass is down.
 
+A `.pass-url` naming a target that does not answer is treated the same way: a
+single loopback `GET /status.json`, given about a second to respond, decides
+whether the file is trusted or a stale one is falling back to the default port
+instead. `QT_PASS_URL` skips this probe and is always taken as given, since it
+is how a test or an override pins down an address the widget should not
+second-guess. The footer tooltip and `--dump-endpoint` both still show the raw
+file contents alongside whichever address was actually used, so a fallback
+never looks identical to a live read.
+
 Even in Pass mode the qt ledger is still read and merged. A task fired with `qt`
 (or with this widget's quick-fire) does not reach The Pass until it finishes,
 and "I just fired that and it is not in the list" is where the widget would lose
@@ -330,6 +349,8 @@ QuicktaskStatus --dump-decision <id> accept      # the POST /save body
 QuicktaskStatus --dump-decision <id> redo "note"
 QuicktaskStatus --dump-keys down,down,up         # where the keyboard highlight lands
 QuicktaskStatus --post-run <id>                  # really fire an item through POST /run
+QuicktaskStatus --dump-restart                   # the POST /restart request: method, path, Origin
+QuicktaskStatus --post-restart                   # really POST /restart and print the outcome
 QuicktaskStatus --snapshot out.png               # render the dropdown to a PNG
 QuicktaskStatus --help
 ```
@@ -340,15 +361,22 @@ opening the menu. The three `--dump-*` payload flags print request bodies
 without sending them, because payload construction is the part of an HTTP client
 most worth pinning down and the part least worth a live server to check.
 `--dump-endpoint` prints the resolved base URL, which of the three sources it
-came from, and why a `.pass-url` was ignored if it was -- and makes no request,
-so discovery is testable without depending on what is really listening.
-`--dump-keys` walks the highlight over the visible rows (default collapse, as a
-freshly opened menu would show them) and prints where it lands and what return
-would do there. `--post-run` is the one seam that really posts: it fires an item
-through `POST /run` against whatever `QT_PASS_URL` points at, and exits non-zero
-with the widget's own wording for a 409. `--snapshot` renders the real view
-against the real feeds using the view's own `cacheDisplay`, so it needs no
-Screen Recording permission and works over SSH.
+came from, and why a `.pass-url` was ignored if it was. A result sourced from
+the file is probed with one loopback `GET /status.json` and reports the
+fallback if that target did not answer; every other source still makes no
+request, so most of discovery stays testable without depending on what is
+really listening. `--dump-keys` walks the highlight over the visible rows
+(default collapse, as a freshly opened menu would show them) and prints where
+it lands and what return would do there. `--post-run` is the one seam that
+really posts: it fires an item through `POST /run` against whatever
+`QT_PASS_URL` points at, and exits non-zero with the widget's own wording for a
+409. `--dump-restart` prints the `POST /restart` request -- method, path, and
+the `Origin` header the gate requires -- without sending it; `--post-restart`
+gives that same request the real-round-trip treatment `--post-run` gets, and
+prints whether the Pass reports itself supervised, stopped, too old for the
+route, or refused the Origin. `--snapshot` renders the real view against the
+real feeds using the view's own `cacheDisplay`, so it needs no Screen Recording
+permission and works over SSH.
 
 Environment:
 
@@ -371,7 +399,8 @@ the remembered UI state without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-155 tests in `tests/test_menubar_model.py`. They build the app and drive the
+190 tests in `tests/test_menubar_model.py` (202 across the whole suite). They
+build the app and drive the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in
@@ -381,7 +410,9 @@ construction, the deep link's substitution and its two fallbacks, the job
 booleans outranking the status string, `can_run` and the `POST /run` body, the
 409 wordings and the 400 that is not dressed up as one, Pass discovery in all
 three orders including a malformed, empty, non-loopback, or non-http
-`.pass-url`, the keyboard highlight's walk and its clamped ends, fallback to
+`.pass-url`, falling back to the default port when a discovered file names a
+target that does not answer, `POST /restart`'s supervised, unsupervised, 404,
+and 403 outcomes, the keyboard highlight's walk and its clamped ends, fallback to
 the files when The Pass is unreachable or answers garbage or answers something
 that is not a status payload, the Pass/ledger merge in both directions, capture
 and decisions payload construction including the carry-forward of unreconciled
@@ -404,8 +435,10 @@ The Pass cases stand up a real loopback server on an ephemeral port rather than
 mocking one, because the thing most worth proving about that path is that the
 round trip works and that its absence is handled. Every file-feed case sets
 `QT_PASS_URL=""` so it stays deterministic on a machine where the real Pass
-happens to be up, and the discovery cases go through `--dump-endpoint`, which
-makes no request at all for the same reason. Nothing in the suite writes a
+happens to be up, and most of the discovery cases go through `--dump-endpoint`
+in a way that still makes no request. The cases proving the fallback instead
+point `--dump-endpoint` at a real fixture or a deliberately closed port, so the
+probe itself is exercised rather than assumed. Nothing in the suite writes a
 LaunchAgent, calls `launchctl`, posts to a real Pass, or touches the app's real
 preferences.
 
@@ -425,7 +458,7 @@ The module skips rather than fails when `swiftc` is unavailable.
 | `Sources/MenuView.swift` | The dropdown |
 | `Sources/MenuBarIcon.swift` | The menu-bar dot and count |
 | `Sources/App.swift` | Entry point, polling controller, `MenuBarExtra` scene |
-| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--post-run` |
+| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--post-run`, `--dump-restart`, `--post-restart` |
 | `Sources/Snapshot.swift` | `--snapshot` |
 | `build.sh` | Compile, bundle, sign, install, optionally register the agent |
 | `com.quicktasks.menubar.plist` | LaunchAgent template, shared by `build.sh` and the toggle |

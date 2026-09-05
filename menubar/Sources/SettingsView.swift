@@ -12,11 +12,11 @@
 // only true for a moment. The toggles and steppers, which cannot be
 // half-finished, apply immediately.
 //
-// Restart Pass is drawn but disabled: POST /restart is LD-212 and does not
-// exist yet. It is here rather than left out because the button is the obvious
-// thing to reach for when the Pass is the grey dot in the footer, and a
-// disabled control with a tooltip saying which ticket will light it up answers
-// that question better than an absence does.
+// Restart Pass calls POST /restart (LD-201) behind a confirmation sheet, since
+// it is disruptive enough to a launchd-supervised Pass (and final for a
+// hand-started one) that a stray click should not be able to fire it. The
+// outcome text after a click comes from StatusController.RestartMessage,
+// which is worded once there rather than re-derived here.
 
 import SwiftUI
 import AppKit
@@ -32,6 +32,8 @@ struct SettingsView: View {
     /// leaving the field, so a partly-typed URL never reaches the feed.
     @State private var passURL: String = ""
     @State private var hubDir: String = ""
+    @State private var showRestartConfirm = false
+    @State private var restartMessage: StatusController.RestartMessage?
 
     var body: some View {
         ScrollView {
@@ -50,13 +52,41 @@ struct SettingsView: View {
                     }
                     note(passNote)
                     HStack(spacing: 8) {
-                        Button("Restart Pass") {}
-                            .disabled(true)
-                            .help("Waiting on POST /restart (LD-212). Until the Pass "
-                                  + "exposes it there is nothing for this to call.")
-                        Text("Not yet available")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
+                        Button("Restart Pass") { showRestartConfirm = true }
+                            .disabled(controller.busy.contains(StatusController.restartBusyKey))
+                        if controller.busy.contains(StatusController.restartBusyKey) {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                    .confirmationDialog("Restart The Pass?",
+                                        isPresented: $showRestartConfirm,
+                                        titleVisibility: .visible) {
+                        Button("Restart", role: .destructive) {
+                            controller.restartPass { message in restartMessage = message }
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("Jobs in flight keep running; the page and this widget "
+                             + "reconnect in a few seconds.")
+                    }
+                    if let restartMessage {
+                        switch restartMessage {
+                        case .restarting:
+                            note("Restarting… back in a few seconds")
+                        case .backUp:
+                            note("Pass is back")
+                        case .stillDown:
+                            problemLine("Still not answering after about 20 seconds. It "
+                                        + "may need starting by hand.")
+                        case .stopped:
+                            problemLine("Pass stopped (it was hand-started, so nothing "
+                                        + "restarts it). Start it again with launchctl "
+                                        + "kickstart -k gui/$UID/to.punchlist.serve after "
+                                        + "loading the agent, or python3 serve.py.")
+                        case .problem(let text):
+                            problemLine(text)
+                        }
                     }
                 }
 

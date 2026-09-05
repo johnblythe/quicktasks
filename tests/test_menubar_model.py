@@ -1609,10 +1609,15 @@ class TestItemDeepLink(PassCase):
         self.assertEqual(self.by_id(m, "t-local")["item_url"], m["pass_url"])
 
 
-class TestPassDiscovery(ModelCase):
+class TestPassDiscovery(PassCase):
     """Where the widget looks for The Pass: QT_PASS_URL, then the hub
-    checkout's .pass-url, then port 8811. Driven through --dump-endpoint, which
-    makes no request -- so these cases never touch a live Pass."""
+    checkout's .pass-url, then port 8811. Driven through --dump-endpoint.
+    Every case that never reaches a `.file`-sourced success (env, setting, no
+    file, a malformed or non-loopback file, the feed switched off) makes no
+    request. A case that does reach one now probes it with a single loopback
+    GET /status.json -- the same request a live poll makes -- so a
+    `.pass-url` naming a fixture that actually answers is used as-is, and one
+    naming a dead port falls back to 8811 instead of being trusted blindly."""
 
     def test_the_env_override_wins(self):
         self.write_pass_url("http://127.0.0.1:8877/\n")
@@ -1621,20 +1626,47 @@ class TestPassDiscovery(ModelCase):
         self.assertEqual(e["source"], "env")
 
     def test_the_file_wins_over_the_default(self):
-        """serve.py walks 8811..8820 for a free port and writes where it landed,
-        which is the whole reason this file exists."""
-        self.write_pass_url("http://127.0.0.1:8813/\n")
+        """A .pass-url naming a Pass that actually answers is used as-is --
+        this is the whole reason the file exists."""
+        base = self.serve(payload=status_fixture())
+        self.write_pass_url(base + "/\n")
         e = self.endpoint()
-        self.assertEqual(e["pass_url"], "http://127.0.0.1:8813/")
+        self.assertEqual(e["pass_url"], base + "/")
         self.assertEqual(e["source"], "file")
         self.assertEqual(e["file"], str(self.hub / ".pass-url"))
         self.assertIsNone(e["file_problem"])
+        self.assertIsNone(e["fallback"])
 
     def test_surrounding_whitespace_is_trimmed(self):
-        self.write_pass_url("  http://localhost:8815/  \n\n")
+        base = self.serve(payload=status_fixture())
+        self.write_pass_url(f"  {base}/  \n\n")
         e = self.endpoint()
-        self.assertEqual(e["pass_url"], "http://localhost:8815/")
+        self.assertEqual(e["pass_url"], base + "/")
         self.assertEqual(e["source"], "file")
+
+    def test_an_unreachable_file_target_falls_back_to_8811(self):
+        """A .pass-url naming a port nothing answers on used to be trusted
+        blindly, so a stale file could outlive the Pass that wrote it and
+        blank the widget. Now it is probed and, finding nothing, falls back
+        the same way a missing file does -- except the raw file contents and
+        the fallback taken are both still reported, so Settings can show
+        what was actually found there."""
+        self.write_pass_url("http://127.0.0.1:1/\n")
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:8811")
+        self.assertEqual(e["source"], "default")
+        self.assertEqual(e["file_url"], "http://127.0.0.1:1/")
+        self.assertIsNone(e["file_problem"])
+        self.assertEqual(e["fallback"], "8811 (pass-url target unreachable)")
+
+    def test_the_env_override_never_falls_back_even_to_a_dead_port(self):
+        """QT_PASS_URL is authoritative: it is how a test points the widget at
+        an ephemeral fixture port, and a probe that second-guessed it would
+        make that impossible to pin down deterministically."""
+        e = self.endpoint(extra_env={"QT_PASS_URL": "http://127.0.0.1:1"})
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:1")
+        self.assertEqual(e["source"], "env")
+        self.assertIsNone(e["fallback"])
 
     def test_no_file_means_the_default_port(self):
         """The normal state when The Pass is down: it removes the file on a
@@ -1683,9 +1715,10 @@ class TestPassDiscovery(ModelCase):
         belonging to a checkout it was not asked about."""
         other = self.tmp / "other-hub"
         other.mkdir()
-        (other / ".pass-url").write_text("http://127.0.0.1:8888/\n")
+        base = self.serve(payload=status_fixture())
+        (other / ".pass-url").write_text(base + "/\n")
         e = self.endpoint(extra_env={"QT_HUB": str(other)})
-        self.assertEqual(e["pass_url"], "http://127.0.0.1:8888/")
+        self.assertEqual(e["pass_url"], base + "/")
         self.assertEqual(e["file"], str(other / ".pass-url"))
 
     def test_the_discovered_url_is_actually_used(self):
@@ -1707,6 +1740,55 @@ class TestPassDiscovery(ModelCase):
         self.assertEqual(m["source"], "pass")
         self.assertEqual(m["pass_url_source"], "file")
         self.assertEqual(self.ids(m), ["alpha"])
+
+
+class TestRestart(PassCase):
+    """POST /restart, through `--dump-restart` (the request, unsent) and
+    `--post-restart` (a real round trip against the fixture Pass)."""
+
+    def post_restart(self, base, expect=0):
+        return self.run_binary("--post-restart", extra_env={"QT_PASS_URL": base},
+                               expect=expect)
+
+    def test_dump_restart_shows_the_request_with_a_loopback_origin(self):
+        body = json.loads(self.run_binary(
+            "--dump-restart", extra_env={"QT_PASS_URL": "http://127.0.0.1:8811"}).stdout)
+        self.assertEqual(body["method"], "POST")
+        self.assertEqual(body["path"], "restart")
+        self.assertEqual(body["headers"]["Origin"], "http://127.0.0.1:8811")
+
+    def test_a_supervised_restart_reports_supervised_true(self):
+        base = self.serve(payload=status_fixture(),
+                          post_body={"ok": True, "restarting": True, "supervised": True})
+        proc = self.post_restart(base)
+        self.assertEqual(json.loads(proc.stdout),
+                         {"ok": True, "restarting": True, "supervised": True})
+        posts = self.server.posts_to("/restart")
+        self.assertEqual(len(posts), 1, self.server.posts)
+        self.assertEqual(posts[0]["headers"]["Origin"], base)
+
+    def test_an_unsupervised_restart_reports_supervised_false(self):
+        base = self.serve(payload=status_fixture(),
+                          post_body={"ok": True, "restarting": True, "supervised": False})
+        proc = self.post_restart(base)
+        self.assertEqual(json.loads(proc.stdout),
+                         {"ok": True, "restarting": True, "supervised": False})
+
+    def test_a_404_reports_that_this_pass_predates_restart(self):
+        base = self.serve(payload=status_fixture(), post_codes={"/restart": 404})
+        proc = self.post_restart(base, expect=1)
+        body = json.loads(proc.stdout)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"], "This Pass predates POST /restart; update the hub")
+
+    def test_a_403_reports_the_origin_refusal(self):
+        base = self.serve(payload=status_fixture(), post_codes={"/restart": 403},
+                          post_text="Origin refused")
+        proc = self.post_restart(base, expect=1)
+        body = json.loads(proc.stdout)
+        self.assertFalse(body["ok"])
+        self.assertIn("Origin blocked", body["error"])
+        self.assertIn("Origin refused", body["error"])
 
 
 class TestKeyboardHighlight(PassCase):

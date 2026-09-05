@@ -12,18 +12,24 @@
 // client most worth pinning down and the part least worth a live server to
 // test, so it is a pure function with its own seam.
 //
-// `--dump-endpoint` prints where the widget would look for The Pass and why,
-// making no request at all -- discovery has to be testable without pointing a
-// test at whatever is actually listening on 8811.
+// `--dump-endpoint` prints where the widget would look for The Pass and why.
+// A `.file`-sourced result is probed exactly the way a live poll probes it --
+// one loopback GET, to catch a `.pass-url` left behind by a Pass that has
+// since died -- so this is no longer request-free for that one case; every
+// other source (env, setting, no file, default) still makes none.
 //
 // `--dump-keys` walks the keyboard highlight over the visible rows, so the
 // whole of the keyboard's behaviour can be checked without a display.
 //
-// `--post-run` is the one seam that really posts: it fires an item through
-// `POST /run` against whatever QT_PASS_URL points at, which in the tests is a
-// loopback fixture server. It exists because a 409 (already running, or all
-// three job slots busy) is an expected answer that has to be shown in the
-// widget's own words, and that mapping is worth a real round trip.
+// `--post-run` and `--post-restart` are the seams that really post: `--post-run`
+// fires an item through `POST /run`, and `--post-restart` fires `POST /restart`,
+// both against whatever QT_PASS_URL points at, which in the tests is a
+// loopback fixture server. `--post-run` exists because a 409 (already
+// running, or all three job slots busy) is an expected answer that has to be
+// shown in the widget's own words; `--post-restart` exists because
+// `supervised` is a real fact about the target process that only a real
+// round trip can report. `--dump-restart` is the request-free sibling, for
+// pinning the Origin header without a live Pass.
 
 import Foundation
 
@@ -173,10 +179,10 @@ enum DumpModel {
             "resolved_limit": config.limit,
             "setting_problem": config.pass.settingProblem ?? NSNull(),
             "describe": config.pass.describe,
-            // POST /restart is LD-212 and not built. The button is drawn
-            // disabled, and this says so, so a test can pin that it stays off
-            // until somebody deliberately turns it on.
-            "restart_available": false,
+            // POST /restart exists now (LD-201). Unlike /decide there is no
+            // per-Pass feature detection to report here -- the button is
+            // simply on, and a test can pin that.
+            "restart_available": true,
         ])
     }
 
@@ -267,10 +273,12 @@ enum DumpModel {
     }
 
     /// `--dump-endpoint`: where the widget would look for The Pass, and how it
-    /// decided. Makes no request, so a test can assert the discovery order
-    /// without depending on what is listening.
+    /// decided. Probes a `.file`-sourced result the same way the running
+    /// widget does, so this makes a request exactly when a live poll would --
+    /// a `.pass-url` that names an unreachable target reports the fallback it
+    /// actually used, rather than the stale value nothing is listening on.
     static func runEndpoint() -> Int32 {
-        let config = StoreConfig.resolve()
+        let config = StoreConfig.resolve(probeDiscovery: true)
         let pass = config.pass
         return emit([
             "pass_url": pass.url?.absoluteString ?? NSNull(),
@@ -278,9 +286,43 @@ enum DumpModel {
             "file": pass.file?.path ?? NSNull(),
             "file_url": pass.fileURL ?? NSNull(),
             "file_problem": pass.fileProblem ?? NSNull(),
+            "fallback": pass.fallback ?? NSNull(),
             "hub_dir": config.hubDir?.path ?? NSNull(),
             "describe": pass.describe,
         ])
+    }
+
+    /// `--dump-restart`: the exact request `restart()` would send -- method,
+    /// path, and the Origin header the gate requires -- without sending it.
+    static func runDumpRestart() -> Int32 {
+        let config = StoreConfig.resolve()
+        guard let base = config.passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        let request = PassClient.restartRequest(base: base)
+        return emit([
+            "method": request.method,
+            "path": request.path,
+            "headers": request.headers,
+        ])
+    }
+
+    /// `--post-restart`: really POSTs /restart against whatever QT_PASS_URL
+    /// points at, and prints the outcome. `supervised` is what SettingsView's
+    /// confirm-sheet flow branches on: launchd brings a supervised Pass back
+    /// within seconds, a hand-started one just stays down.
+    static func runPostRestart() -> Int32 {
+        let config = StoreConfig.resolve()
+        guard let base = config.passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        switch PassClient(base: base).restart() {
+        case .success(let outcome):
+            return emit(["ok": true, "restarting": true, "supervised": outcome.supervised])
+        case .failure(let failure):
+            _ = emit(["ok": false, "error": failure.problem.message])
+            return 1
+        }
     }
 
     /// `--dump-keys down,down,up`: the highlight's landing place after a key

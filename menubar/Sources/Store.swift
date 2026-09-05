@@ -48,7 +48,8 @@ struct StoreConfig {
 
     static func resolve(env: [String: String] = ProcessInfo.processInfo.environment,
                         limit: Int? = nil,
-                        settings: Settings? = nil) -> StoreConfig {
+                        settings: Settings? = nil,
+                        probeDiscovery: Bool = false) -> StoreConfig {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let qtData = env["QT_DATA"].map { URL(fileURLWithPath: expand($0)) }
             ?? home.appendingPathComponent(".quicktasks")
@@ -80,7 +81,8 @@ struct StoreConfig {
             hubJobsDir: hubURL?.appendingPathComponent("jobs"),
             // The hub dir is resolved first on purpose: its `.pass-url` is
             // where a Pass that had to move off 8811 says so.
-            pass: PassEndpoint.resolution(env: env, hubDir: hubURL, settings: settings),
+            pass: PassEndpoint.resolution(env: env, hubDir: hubURL, settings: settings,
+                                          probe: probeDiscovery),
             // An explicit --limit wins, so the CLI seams stay deterministic
             // whatever is stored in the settings window.
             limit: limit ?? settings.rowLimit,
