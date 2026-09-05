@@ -13,6 +13,21 @@ import SwiftUI
 import AppKit
 
 enum Snapshot {
+    /// `--snapshot-settings <file.png>`. The same trick against the settings
+    /// window's view rather than the panel's, so the settings can be eyeballed
+    /// without opening a window on a machine nobody is sitting at. Renders the
+    /// view and not the NSWindow the app really opens: the titled frame and its
+    /// traffic lights belong to AppKit, and cacheDisplay cannot draw them.
+    static func runSettings(path: String) -> Int32 {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let controller = StatusController(interval: 3600)
+        return render(NSHostingView(rootView: SettingsView(controller: controller)),
+                      width: SettingsView.windowWidth,
+                      minHeight: 320,
+                      to: path)
+    }
+
     static func run(path: String, width: CGFloat = MenuView.panelWidth) -> Int32 {
         let app = NSApplication.shared
         // Accessory, so rendering never puts an icon in the Dock or steals focus.
@@ -21,13 +36,26 @@ enum Snapshot {
         // A long interval: the initial synchronous load in init() is the data
         // we want, and a polling timer would only add churn during rendering.
         let controller = StatusController(interval: 3600)
-        let hosting = NSHostingView(rootView: MenuView(controller: controller))
+        return render(NSHostingView(rootView: MenuView(controller: controller)),
+                      width: width,
+                      minHeight: 140,
+                      to: path)
+    }
+
+    /// Measures, settles, re-measures, and writes the PNG. Shared by both
+    /// snapshot flags so the dropdown and the settings window are rendered by
+    /// exactly the same code, and a fix to the settling logic cannot land on
+    /// one and miss the other.
+    private static func render(_ hosting: NSHostingView<some View>,
+                               width: CGFloat,
+                               minHeight: CGFloat,
+                               to path: String) -> Int32 {
 
         // Measure at the real menu width, then grow to whatever height the
         // content needs, the same way the MenuBarExtra panel sizes itself.
         hosting.frame = NSRect(x: 0, y: 0, width: width, height: 1)
         hosting.layoutSubtreeIfNeeded()
-        let height = max(hosting.fittingSize.height, 140)
+        let height = max(hosting.fittingSize.height, minHeight)
         hosting.frame = NSRect(x: 0, y: 0, width: width, height: height)
 
         // The view has to belong to a window before cacheDisplay will draw it.
@@ -49,7 +77,7 @@ enum Snapshot {
         RunLoop.main.run(until: Date().addingTimeInterval(2))
         hosting.layoutSubtreeIfNeeded()
         // Re-measure, because rows arriving from the poll changed the height.
-        let settled = max(hosting.fittingSize.height, 140)
+        let settled = max(hosting.fittingSize.height, minHeight)
         if abs(settled - hosting.frame.height) > 0.5 {
             hosting.frame = NSRect(x: 0, y: 0, width: width, height: settled)
             window.setContentSize(NSSize(width: width, height: settled))

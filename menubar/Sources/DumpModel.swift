@@ -29,13 +29,17 @@ import Foundation
 
 enum DumpModel {
     static func run(args: [String]) -> Int32 {
-        var limit = 12
-        if let i = args.firstIndex(of: "--limit"), i + 1 < args.count, let n = Int(args[i + 1]) {
-            limit = n
-        }
+        // No --limit means the settings window's row limit, the same number the
+        // running widget uses. An explicit one wins, so the seam stays
+        // deterministic whatever is stored.
+        let limit = value(args, "--limit").flatMap { Int($0) }
         let config = StoreConfig.resolve(limit: limit)
         let now = Date()
-        let model = Feed.load(config: config, now: now)
+        let loaded = Feed.load(config: config, now: now)
+        // `--search` runs the same filter the search field runs, over the same
+        // model, so the seam tests the filter rather than a copy of it.
+        let query = value(args, "--search") ?? ""
+        let model = loaded.filtered(query: query)
 
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
@@ -53,6 +57,29 @@ enum DumpModel {
             "counts": model.counts,
             "truncated": model.truncated,
             "login_item": LoginItem.isEnabled(),
+            "search": query,
+            // Whether the payload carried a `suggestions` key at all, which is
+            // what decides if the section is drawn. Distinct from the list
+            // being empty: a Pass without the engine sends no key.
+            "suggestions_available": model.suggestionsAvailable,
+            "shows_suggestions": model.showsSuggestions,
+            "suggestions": model.suggestions.map { s in
+                [
+                    "item_id": s.itemID,
+                    "title": s.title,
+                    "rationale": s.rationale,
+                    "confidence": s.confidence,
+                    "confidence_step": s.confidenceStep,
+                    "proposed": s.proposed,
+                    "source": s.source.rawValue,
+                    "source_raw": s.sourceRaw ?? NSNull(),
+                    "source_url": s.sourceURL ?? NSNull(),
+                    "date": stamp(s.date),
+                ] as [String: Any]
+            },
+            "suggestions_headline": Suggestion.headline(model.suggestions.count),
+            "headline_preview": model.headlinePreview(limit: 3, now: now),
+            "visible_sections": Array(model.visibleSections).sorted(),
             "aggregate": aggregateJSON(model.aggregate),
             "headline": model.aggregate.headline,
             "badge": model.aggregate.badge,
@@ -105,6 +132,9 @@ enum DumpModel {
                     "wants_resume": r.wantsResume,
                     "can_decide": r.canDecide,
                     "can_run": r.canRun,
+                    "source_app": r.source.rawValue,
+                    "source_raw": r.sourceRaw ?? NSNull(),
+                    "source_symbol": r.source.symbol,
                     "primary_action": r.primaryAction.rawValue,
                     "item_url": Actions.itemURL(template: model.itemURLTemplate,
                                                 base: model.passURL,
@@ -120,6 +150,120 @@ enum DumpModel {
     private static func defaultVisibleIDs(_ model: MenuModel, now: Date) -> [String] {
         let collapsed = Set(Section.allCases.filter { $0.collapsedByDefault }.map { $0.rawValue })
         return model.visibleRecords(collapsed: collapsed, now: now).map { $0.id }
+    }
+
+    /// `--dump-settings`: the stored settings and what the widget resolved out
+    /// of them. Read-only, and the seam the settings-persistence tests drive:
+    /// writing a preference and reading it back through the real resolution
+    /// order is the only way to check that QT_PASS_URL still wins.
+    static func runSettings() -> Int32 {
+        let settings = Settings.load()
+        let config = StoreConfig.resolve()
+        return emit([
+            "pass_url_override": settings.passURLOverride ?? NSNull(),
+            "hub_dir_override": settings.hubDirOverride ?? NSNull(),
+            "poll_interval": settings.pollInterval,
+            "row_limit": settings.rowLimit,
+            "visible_sections": Array(settings.visibleSections).sorted(),
+            // What the overrides actually resolved to, which is the question
+            // the settings window exists to answer.
+            "resolved_pass_url": config.passURL?.absoluteString ?? NSNull(),
+            "resolved_pass_source": config.pass.source.rawValue,
+            "resolved_hub_dir": config.hubDir?.path ?? NSNull(),
+            "resolved_limit": config.limit,
+            "setting_problem": config.pass.settingProblem ?? NSNull(),
+            "describe": config.pass.describe,
+            // POST /restart is LD-212 and not built. The button is drawn
+            // disabled, and this says so, so a test can pin that it stays off
+            // until somebody deliberately turns it on.
+            "restart_available": false,
+        ])
+    }
+
+    /// `--dump-decide <id> <action> [comment]`: the POST /decide body, built
+    /// and printed without being sent.
+    static func runDecidePayload(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--dump-decide"), i + 2 < args.count else {
+            return fail("--dump-decide needs an item id and an action")
+        }
+        let comment = i + 3 < args.count && !args[i + 3].hasPrefix("--") ? args[i + 3] : ""
+        switch PassPayload.decide(id: args[i + 1], action: args[i + 2], comment: comment) {
+        case .failure(let problem): return fail(problem.message)
+        case .success(let body): return emit(body)
+        }
+    }
+
+    /// `--post-decide <id> <action> [comment]`: the real round trip, against
+    /// whatever QT_PASS_URL points at. Prints which route took the decision,
+    /// which is the whole point of the seam: a Pass without /decide has to fall
+    /// back to /save, and "it worked" is not enough to tell those apart.
+    static func runPostDecide(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--post-decide"), i + 2 < args.count else {
+            return fail("--post-decide needs an item id and an action")
+        }
+        let id = args[i + 1]
+        let action = args[i + 2]
+        let config = StoreConfig.resolve()
+        guard let base = config.passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        // Asks the client directly rather than through Actions, so the outcome
+        // comes back as the route that took it rather than as flash wording.
+        let outcome = PassClient(base: base).decide(id: id, action: action) {
+            guard let legacy = Actions.legacyVerdict(for: action) else {
+                return .failure("this Pass is too old to \(action) a suggestion")
+            }
+            return PassClient(base: base).decide(
+                record: TaskRecord(id: id, itemID: id, title: "",
+                                   status: .unknown, state: "suggest", origin: .pass),
+                action: legacy,
+                pending: PassPayload.pendingDecisions(hubDir: config.hubDir))
+        }
+        switch outcome {
+        case .success(let how):
+            return emit(["ok": true, "route": how.rawValue,
+                         "fell_back": how == .fellBackToSave])
+        case .failure(let problem):
+            _ = emit(["ok": false, "error": problem.message])
+            return 1
+        }
+    }
+
+    /// `--dump-search <query>`: what the filter matches, and the haystack it
+    /// matched over. Separate from `--dump-model --search` because a filter
+    /// that returns the wrong rows and a filter that reads the wrong fields
+    /// are different bugs, and only one of them is visible in the row list.
+    static func runSearch(args: [String]) -> Int32 {
+        guard let query = value(args, "--dump-search") else {
+            return fail("--dump-search needs a query")
+        }
+        let config = StoreConfig.resolve()
+        let now = Date()
+        let model = Feed.load(config: config, now: now)
+        let filtered = model.filtered(query: query)
+        return emit([
+            "query": query,
+            "terms": RowFilter.terms(query),
+            "matched_ids": filtered.records.map { $0.id },
+            "matched_count": filtered.records.count,
+            "total_count": model.records.count,
+            "matched_suggestions": filtered.suggestions.map { $0.itemID },
+            // The aggregate is deliberately untouched by the filter: the header
+            // keeps counting the feed while the list shows the matches.
+            "headline": filtered.aggregate.headline,
+            "sections": filtered.sections(now: now).map { entry in
+                ["key": entry.section.rawValue, "count": entry.records.count] as [String: Any]
+            },
+            "haystacks": Dictionary(uniqueKeysWithValues: model.records.map {
+                ($0.id, RowFilter.haystack($0))
+            }),
+        ])
+    }
+
+    /// The value after a flag, or nil when the flag is absent or last.
+    private static func value(_ args: [String], _ flag: String) -> String? {
+        guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+        return args[i + 1]
     }
 
     /// `--dump-endpoint`: where the widget would look for The Pass, and how it

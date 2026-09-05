@@ -215,4 +215,52 @@ enum Actions {
                                       comment: comment,
                                       pending: PassPayload.pendingDecisions(hubDir: hubDir))
     }
+
+    /// One of confirm / deny / go / snooze on a suggestion, through
+    /// `POST /decide`, falling back to `POST /save` on a Pass that has not
+    /// shipped the route yet.
+    ///
+    /// The fallback is the old wholesale save, so it still has to carry every
+    /// unreconciled decision along -- that is exactly the hazard `/decide`
+    /// exists to remove, and until the route lands the widget cannot pretend it
+    /// already has. It also has to translate the verb: `/save` knows accept /
+    /// redo / reject and nothing else, so a suggestion's four answers map onto
+    /// the two that mean the same thing there, and the other two are refused
+    /// rather than mistranslated. "This Pass cannot snooze yet" is honest;
+    /// posting "accept" for a snooze would file the wrong decision.
+    static func decideSuggestion(id: String,
+                                 title: String,
+                                 action: String,
+                                 base: URL,
+                                 hubDir: URL?) -> Result<String, Problem> {
+        let outcome = PassClient(base: base).decide(id: id, action: action) {
+            guard let legacy = legacyVerdict(for: action) else {
+                return .failure("this Pass is too old to \(action) a suggestion")
+            }
+            return PassClient(base: base).decide(
+                record: TaskRecord(id: id, itemID: id, title: title,
+                                   status: .unknown, state: "suggest", origin: .pass),
+                action: legacy,
+                pending: PassPayload.pendingDecisions(hubDir: hubDir))
+        }
+        return outcome.map { how in
+            let verb = ["confirm": "Confirmed", "deny": "Denied",
+                        "go": "Fired", "snooze": "Snoozed"][action] ?? "Done"
+            // Says which route took it. "Confirmed (old Pass)" is the same
+            // outcome for John and a different one for anyone wondering why a
+            // decision landed on top of somebody else's.
+            return how == .fellBackToSave ? "\(verb) (old Pass)" : verb
+        }
+    }
+
+    /// How a suggestion's answer reads to a Pass that only has `/save`.
+    /// Confirm and deny have honest equivalents there; go and snooze do not,
+    /// and are refused rather than approximated.
+    static func legacyVerdict(for action: String) -> String? {
+        switch action {
+        case "confirm": return "accept"
+        case "deny": return "reject"
+        default: return nil
+        }
+    }
 }

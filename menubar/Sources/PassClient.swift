@@ -35,6 +35,7 @@ enum PassEndpoint {
     /// widget guessed 8811 or read a live URL off disk.
     enum Source: String {
         case env                    // QT_PASS_URL
+        case setting                // the settings window's Pass URL field
         case file                   // <hub>/.pass-url, written by serve.py on bind
         case standard = "default"   // port 8811
         case off                    // QT_PASS_URL="", the file ledgers only
@@ -49,12 +50,31 @@ enum PassEndpoint {
         let fileURL: String?
         /// Why the file was ignored. nil when it was used or was simply absent.
         let fileProblem: String?
+        /// Why the settings window's Pass URL was ignored. nil when it was used
+        /// or was never set. Surfaced in the settings window next to the field,
+        /// so a typed-in URL that is refused says so where it was typed.
+        let settingProblem: String?
+
+        init(url: URL?,
+             source: Source,
+             file: URL?,
+             fileURL: String?,
+             fileProblem: String?,
+             settingProblem: String? = nil) {
+            self.url = url
+            self.source = source
+            self.file = file
+            self.fileURL = fileURL
+            self.fileProblem = fileProblem
+            self.settingProblem = settingProblem
+        }
 
         /// One line for the footer tooltip: where the widget is looking, and why.
         var describe: String {
             let shown = url?.absoluteString ?? ""
             switch source {
             case .env: return "\(shown) (QT_PASS_URL)"
+            case .setting: return "\(shown) (set in Settings)"
             case .file: return "\(shown) (from \(file?.path ?? urlFileName))"
             case .standard: return "\(shown) (default port)"
             case .off: return "off: QT_PASS_URL is empty, reading the ledgers only"
@@ -62,16 +82,23 @@ enum PassEndpoint {
         }
     }
 
-    /// Discovery order: QT_PASS_URL, then the hub checkout's `.pass-url`, then
-    /// port 8811. An empty QT_PASS_URL disables the Pass feed entirely and pins
-    /// the widget to the file ledgers, which is also how the tests keep the
-    /// file-feed cases deterministic on a machine where the Pass is up.
+    /// Discovery order: QT_PASS_URL, then the settings window's Pass URL, then
+    /// the hub checkout's `.pass-url`, then port 8811. An empty QT_PASS_URL
+    /// disables the Pass feed entirely and pins the widget to the file ledgers,
+    /// which is also how the tests keep the file-feed cases deterministic on a
+    /// machine where the Pass is up.
+    ///
+    /// The environment stays ahead of the setting on purpose: QT_PASS_URL is
+    /// how a test points the widget at an ephemeral port, and a stored
+    /// preference that could shadow it would make the widget's behaviour depend
+    /// on which of two places was written last.
     ///
     /// Only the configured hub's `.pass-url` is read -- `~/code/hub`'s when no
     /// hub is configured -- so the widget never discovers a Pass belonging to a
     /// checkout it was not pointed at.
     static func resolution(env: [String: String] = ProcessInfo.processInfo.environment,
-                           hubDir: URL? = nil) -> Resolution {
+                           hubDir: URL? = nil,
+                           settings: Settings = .load()) -> Resolution {
         let file = urlFile(hubDir: hubDir)
         if let raw = env["QT_PASS_URL"] {
             let trimmed = raw.trimmingCharacters(in: .whitespaces)
@@ -84,24 +111,41 @@ enum PassEndpoint {
             return Resolution(url: URL(string: trimmed), source: .env, file: file,
                               fileURL: nil, fileProblem: nil)
         }
+        // A refused override is reported and then stepped over, the same way a
+        // bad `.pass-url` is: a typo in a settings field should cost the user
+        // an explanation, not the whole feed.
+        var settingProblem: String?
+        switch settings.validatedPassURL() {
+        case .success(let url)?:
+            return Resolution(url: url, source: .setting, file: file,
+                              fileURL: nil, fileProblem: nil)
+        case .failure(let problem)?:
+            settingProblem = problem.message
+        case nil:
+            break
+        }
         switch read(file: file) {
         case .success(let url)?:
             return Resolution(url: url, source: .file, file: file,
-                              fileURL: url.absoluteString, fileProblem: nil)
+                              fileURL: url.absoluteString, fileProblem: nil,
+                              settingProblem: settingProblem)
         case .failure(let problem)?:
             // A malformed or non-loopback file is reported and then ignored, so
             // a half-written file cannot take the feed down with it.
             return Resolution(url: URL(string: defaultURL), source: .standard, file: file,
-                              fileURL: nil, fileProblem: problem.message)
+                              fileURL: nil, fileProblem: problem.message,
+                              settingProblem: settingProblem)
         case nil:
             return Resolution(url: URL(string: defaultURL), source: .standard, file: file,
-                              fileURL: nil, fileProblem: nil)
+                              fileURL: nil, fileProblem: nil,
+                              settingProblem: settingProblem)
         }
     }
 
     static func resolve(env: [String: String] = ProcessInfo.processInfo.environment,
-                        hubDir: URL? = nil) -> URL? {
-        resolution(env: env, hubDir: hubDir).url
+                        hubDir: URL? = nil,
+                        settings: Settings = .load()) -> URL? {
+        resolution(env: env, hubDir: hubDir, settings: settings).url
     }
 
     static func urlFile(hubDir: URL?) -> URL {
@@ -230,6 +274,50 @@ struct PassClient {
                 .map { _ in () }
                 .mapError { $0.problem }
         }
+    }
+
+    /// POST /decide with one decision, falling back to POST /save when the
+    /// Pass has not shipped the route yet.
+    ///
+    /// `/decide` is additive and single-item: it merges one decision into
+    /// `decisions.json` without touching the others, so unlike `/save` there is
+    /// nothing to carry along. `/save` overwrites the file wholesale, which is
+    /// why the old path has to drag every unreconciled decision through every
+    /// one-row post. Once `/decide` answers, that carry-forward stops -- it is
+    /// the whole reason the route exists.
+    ///
+    /// Feature-detected per call rather than cached: the Pass gets restarted
+    /// under the widget often enough (that is why `.pass-url` is re-read every
+    /// poll) that a "no /decide here" answer learned at launch would outlive
+    /// the build that gave it. A 404 or a 405 both mean the route is not there;
+    /// anything else is a real failure and is reported as one rather than
+    /// quietly retried against `/save`, which would turn one refused decision
+    /// into a wholesale overwrite.
+    func decide(id: String,
+                action: String,
+                comment: String = "",
+                fallback: () -> Result<Void, Problem>) -> Result<DecideOutcome, Problem> {
+        switch PassPayload.decide(id: id, action: action, comment: comment) {
+        case .failure(let problem): return .failure(problem)
+        case .success(let body):
+            switch post(path: "decide", body: body) {
+            case .success:
+                return .success(.decided)
+            case .failure(let failure) where failure.code == 404 || failure.code == 405:
+                return fallback().map { .fellBackToSave }
+            case .failure(let failure):
+                return .failure(failure.problem)
+            }
+        }
+    }
+
+    /// Which route actually took the decision. Worth reporting rather than
+    /// swallowing: "it worked, the old way" and "it worked" are the same
+    /// outcome for the user and different ones for anyone debugging why a
+    /// decision landed on top of somebody else's.
+    enum DecideOutcome: String {
+        case decided            // POST /decide took it
+        case fellBackToSave = "save"   // no /decide on this Pass; POST /save did
     }
 
     // MARK: - transport

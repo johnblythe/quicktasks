@@ -103,6 +103,129 @@ enum NeedsReason: String, Codable, CaseIterable {
     }
 }
 
+/// Where an item came into The Pass from. Shown as a small glyph on the row,
+/// because "who is asking" is most of what tells two similarly-titled rows
+/// apart, and it is the one thing the title never says.
+///
+/// The list is the set of spokes that actually feed the ledger. Anything else
+/// carries through as `.other` with its raw text kept for the tooltip: a spoke
+/// added upstream should show as an unlabelled row, never be dropped and never
+/// be guessed at.
+enum ItemSource: String, Codable, CaseIterable {
+    case slack
+    case monologue
+    case linear
+    case github
+    case gmail
+    case capture
+    case other
+
+    init(raw: String?) {
+        let key = (raw ?? "").lowercased().trimmingCharacters(in: .whitespaces)
+        // The Pass writes "pass" for its own captures and "menubar" for the
+        // ones this widget posts; both arrived through the capture route.
+        switch key {
+        case "menubar", "pass", "capture": self = .capture
+        default: self = ItemSource(rawValue: key) ?? .other
+        }
+    }
+
+    /// SF Symbol for the row glyph. Deliberately generic shapes rather than
+    /// brand marks, which are not in the system font and would need bundling.
+    var symbol: String {
+        switch self {
+        case .slack: return "number.square"
+        case .monologue: return "waveform"
+        case .linear: return "square.stack.3d.up"
+        case .github: return "chevron.left.forwardslash.chevron.right"
+        case .gmail: return "envelope"
+        case .capture: return "tray.and.arrow.down"
+        case .other: return "circle.dotted"
+        }
+    }
+
+    /// Word for the tooltip and for search to match on.
+    var label: String {
+        switch self {
+        case .other: return "unknown source"
+        default: return rawValue
+        }
+    }
+}
+
+/// One row of the suggestions section: something the Pass's suggestion engine
+/// thinks lands on John, with its reasoning and how sure it is.
+///
+/// Not a TaskRecord. A suggestion has no job, no lane, and no status -- it is a
+/// proposal, and the four things you can say to it (confirm, deny, go, snooze)
+/// are a different vocabulary from a verdict on finished work. Modelling it as
+/// a task record would have meant a record whose status, section, and actions
+/// all had to be special-cased, which is how the two would drift.
+struct Suggestion: Equatable {
+    let itemID: String
+    let title: String
+    /// One line saying why the engine thinks this is John's. Shown under the
+    /// title: a suggestion with no reasoning attached is one he has to
+    /// reconstruct himself, which costs more than it saves.
+    let rationale: String
+    /// 0...1, clamped on parse. Drawn as a three-step pip rather than a
+    /// percentage, because the engine's confidence is not precise enough to
+    /// deserve two digits.
+    let confidence: Double
+    /// What the engine proposes doing: fire it, track it, or put it on today.
+    let proposed: String
+    let source: ItemSource
+    /// Raw `source` string, kept for the tooltip when it is not one we know.
+    let sourceRaw: String?
+    /// Where the suggestion came from, for the title click.
+    let sourceURL: String?
+    let date: Date?
+
+    init(itemID: String,
+         title: String,
+         rationale: String = "",
+         confidence: Double = 0,
+         proposed: String = "",
+         source: ItemSource = .other,
+         sourceRaw: String? = nil,
+         sourceURL: String? = nil,
+         date: Date? = nil) {
+        self.itemID = itemID
+        self.title = title
+        self.rationale = rationale
+        self.confidence = confidence
+        self.proposed = proposed
+        self.source = source
+        self.sourceRaw = sourceRaw
+        self.sourceURL = sourceURL
+        self.date = date
+    }
+
+    /// Three steps, so the pip can be drawn as filled dots. The thresholds are
+    /// coarse on purpose: the difference between 0.61 and 0.68 is not something
+    /// the engine can defend, and drawing it would imply that it can.
+    var confidenceStep: Int {
+        if confidence >= 0.75 { return 3 }
+        if confidence >= 0.45 { return 2 }
+        return 1
+    }
+
+    var confidenceWord: String {
+        switch confidenceStep {
+        case 3: return "high confidence"
+        case 2: return "medium confidence"
+        default: return "low confidence"
+        }
+    }
+
+    /// Header line for the section, in John's own words for it. Titled from the
+    /// count so the section says what it holds before it is read.
+    static func headline(_ n: Int) -> String {
+        n == 1 ? "1 thing we think you need to do"
+               : "\(n) things we think you need to do"
+    }
+}
+
 /// A row's primary action, which is what return triggers on the highlighted
 /// row and what clicking its title does.
 enum RowAction: String, Codable {
@@ -202,6 +325,13 @@ struct TaskRecord: Codable, Equatable {
     /// and the review page's own fire action cannot disagree. Always false for
     /// a file-feed row: the ledgers do not carry the item's prompt.
     let canRun: Bool
+    /// Which spoke the item came in from, for the row's glyph. `.other` when
+    /// nothing said -- which is every quicktask, since a task fired from a
+    /// terminal has no spoke behind it.
+    let source: ItemSource
+    /// The raw `source` string, kept when it is not one of the known spokes, so
+    /// the tooltip can still name it.
+    let sourceRaw: String?
 
     init(id: String,
          itemID: String? = nil,
@@ -221,7 +351,9 @@ struct TaskRecord: Codable, Equatable {
          outputCount: Int = 0,
          error: String? = nil,
          denialCount: Int = 0,
-         canRun: Bool = false) {
+         canRun: Bool = false,
+         source: ItemSource = .other,
+         sourceRaw: String? = nil) {
         self.id = id
         self.itemID = itemID
         self.title = title
@@ -241,6 +373,8 @@ struct TaskRecord: Codable, Equatable {
         self.error = error
         self.denialCount = denialCount
         self.canRun = canRun
+        self.source = source
+        self.sourceRaw = sourceRaw
     }
 
     /// Newest timestamp the row actually carries. Drives the age text, so it
@@ -384,6 +518,19 @@ struct MenuModel: Equatable {
     /// as a footer hint, because a widget quietly showing a slice of the
     /// history is the kind of thing you only notice when it matters.
     let truncated: Bool
+    /// What the Pass's suggestion engine thinks lands on John. Empty when it
+    /// sent an empty list, which is different from not having sent one at all:
+    /// see `suggestionsAvailable`.
+    let suggestions: [Suggestion]
+    /// Whether `/status.json` carried a `suggestions` key at all. The section
+    /// hides itself entirely when it did not, so a Pass that has not shipped
+    /// the engine yet shows no empty section and no zero count -- an absent
+    /// feature has to look absent, not broken.
+    let suggestionsAvailable: Bool
+    /// Sections the settings window allows. A section switched off is dropped
+    /// from `sections()` entirely rather than collapsed, so it takes its header
+    /// and its count with it.
+    let visibleSections: Set<String>
 
     init(records: [TaskRecord],
          aggregate: Aggregate,
@@ -395,7 +542,10 @@ struct MenuModel: Equatable {
          groups: [PassGroup] = [],
          itemURLTemplate: String? = nil,
          counts: [String: Int] = [:],
-         truncated: Bool = false) {
+         truncated: Bool = false,
+         suggestions: [Suggestion] = [],
+         suggestionsAvailable: Bool = false,
+         visibleSections: Set<String> = Settings.allSectionKeys) {
         self.records = records
         self.aggregate = aggregate
         self.refreshedAt = refreshedAt
@@ -407,6 +557,9 @@ struct MenuModel: Equatable {
         self.itemURLTemplate = itemURLTemplate
         self.counts = counts
         self.truncated = truncated
+        self.suggestions = suggestions
+        self.suggestionsAvailable = suggestionsAvailable
+        self.visibleSections = visibleSections
     }
 
     static func build(records: [TaskRecord],
@@ -418,7 +571,10 @@ struct MenuModel: Equatable {
                       groups: [PassGroup] = [],
                       itemURLTemplate: String? = nil,
                       counts: [String: Int] = [:],
-                      truncated: Bool = false) -> MenuModel {
+                      truncated: Bool = false,
+                      suggestions: [Suggestion] = [],
+                      suggestionsAvailable: Bool = false,
+                      visibleSections: Set<String> = Settings.allSectionKeys) -> MenuModel {
         let ordered = records.sorted { lhs, rhs in
             // Sections first, then reason inside Needs-you, then
             // newest-activity. Attention rows have to pin above the merely
@@ -443,20 +599,69 @@ struct MenuModel: Equatable {
                          groups: groups,
                          itemURLTemplate: itemURLTemplate,
                          counts: counts,
-                         truncated: truncated)
+                         truncated: truncated,
+                         suggestions: suggestions,
+                         suggestionsAvailable: suggestionsAvailable,
+                         visibleSections: visibleSections)
     }
 
-    /// Rows grouped for display, in section order, empty sections dropped.
+    /// Rows grouped for display, in section order, empty sections dropped and
+    /// sections switched off in the settings window left out.
     func sections(now: Date? = nil) -> [(section: Section, records: [TaskRecord])] {
         let when = now ?? refreshedAt
         var buckets: [Section: [TaskRecord]] = [:]
         for r in records { buckets[r.section(now: when), default: []].append(r) }
         return Section.allCases
             .sorted { $0.order < $1.order }
+            .filter { visibleSections.contains($0.rawValue) }
             .compactMap { s in
                 guard let rows = buckets[s], !rows.isEmpty else { return nil }
                 return (s, rows)
             }
+    }
+
+    /// Whether the suggestions section should be drawn at all: the Pass has to
+    /// have sent the key, and it has to have sent something in it.
+    var showsSuggestions: Bool { suggestionsAvailable && !suggestions.isEmpty }
+
+    /// The first few row titles, for under the header count. "6 tasks need
+    /// you" on its own names nothing John can act on; the titles are the whole
+    /// point of the widget being a list rather than a badge.
+    ///
+    /// Drawn from the needs-you rows when there are any, because those are the
+    /// rows the count is counting, and from the top of the list otherwise.
+    func headlinePreview(limit: Int = 3, now: Date? = nil) -> [String] {
+        let when = now ?? refreshedAt
+        let attention = records.filter { $0.effectiveReason != nil }
+        let pool = attention.isEmpty
+            ? records.filter { $0.section(now: when) == .running }
+            : attention
+        return (pool.isEmpty ? records : pool).prefix(limit).map { $0.title }
+    }
+
+    /// Copy of the model narrowed to a search query, aggregate and counts left
+    /// alone. The header keeps saying how many rows need John while the list
+    /// shows the ones he is looking for -- a filter that also retallied the
+    /// header would make "6 tasks need you" mean "6 matching", which is not
+    /// something anybody wants a search box to decide.
+    func filtered(query: String) -> MenuModel {
+        guard !RowFilter.terms(query).isEmpty else { return self }
+        return MenuModel(records: RowFilter.apply(records, query: query),
+                         aggregate: aggregate,
+                         refreshedAt: refreshedAt,
+                         warning: warning,
+                         source: source,
+                         passURL: passURL,
+                         passError: passError,
+                         groups: groups,
+                         itemURLTemplate: itemURLTemplate,
+                         counts: counts,
+                         truncated: truncated,
+                         suggestions: suggestions.filter {
+                             RowFilter.matches($0, query: query)
+                         },
+                         suggestionsAvailable: suggestionsAvailable,
+                         visibleSections: visibleSections)
     }
 
     /// Rows in the order the menu draws them, with the collapsed sections'
@@ -481,7 +686,84 @@ struct MenuModel: Equatable {
                   groups: groups,
                   itemURLTemplate: itemURLTemplate,
                   counts: counts,
-                  truncated: truncated)
+                  truncated: truncated,
+                  suggestions: suggestions,
+                  suggestionsAvailable: suggestionsAvailable,
+                  visibleSections: visibleSections)
+    }
+}
+
+// MARK: - Quick search
+
+/// Narrows the row list by a typed query. Pure, and separate from the view, so
+/// the whole of the filter's behaviour can be checked without a display.
+///
+/// Matching is case- and diacritic-insensitive substring, across the four
+/// things a row shows or carries: its title, its status text, why it needs
+/// John, and which spoke it came from. Substring rather than prefix because a
+/// row's title is a trimmed sentence and the memorable word is rarely the first
+/// one ("atlas", not "look thru"). Every whitespace-separated term has to match
+/// somewhere in the row, so a second word narrows rather than widens -- typing
+/// "slack blocked" means both, which is the only reading that makes a filter
+/// field worth having on a list this short.
+///
+/// The id is deliberately searchable too, and deliberately last in the
+/// haystack: John does paste job slugs in, and a row whose title has been
+/// trimmed to 60 characters is sometimes only findable that way.
+enum RowFilter {
+    static func matches(_ record: TaskRecord, query: String) -> Bool {
+        let terms = self.terms(query)
+        guard !terms.isEmpty else { return true }
+        let haystack = self.haystack(record)
+        return terms.allSatisfy { haystack.contains($0) }
+    }
+
+    static func matches(_ suggestion: Suggestion, query: String) -> Bool {
+        let terms = self.terms(query)
+        guard !terms.isEmpty else { return true }
+        let haystack = fold([
+            suggestion.title,
+            suggestion.rationale,
+            suggestion.proposed,
+            suggestion.source.label,
+            suggestion.sourceRaw ?? "",
+            suggestion.itemID,
+        ].joined(separator: "\u{1F}"))
+        return terms.allSatisfy { haystack.contains($0) }
+    }
+
+    static func apply(_ records: [TaskRecord], query: String) -> [TaskRecord] {
+        guard !terms(query).isEmpty else { return records }
+        return records.filter { matches($0, query: query) }
+    }
+
+    /// What one row is searched over. `detail` rather than the raw status so
+    /// the words on screen are the words that match: the row says "Timed out",
+    /// and typing that has to find it.
+    static func haystack(_ record: TaskRecord) -> String {
+        fold([
+            record.title,
+            record.detail,
+            record.status.detail,
+            record.effectiveReason?.detail ?? "",
+            record.effectiveReason?.rawValue ?? "",
+            record.state ?? "",
+            record.source.label,
+            record.sourceRaw ?? "",
+            record.origin.rawValue,
+            record.id,
+            record.itemID ?? "",
+        ].joined(separator: "\u{1F}"))
+    }
+
+    /// Whitespace-separated, folded, empties dropped. A query of only spaces
+    /// is no query at all rather than one nothing can match.
+    static func terms(_ query: String) -> [String] {
+        fold(query).split(whereSeparator: { $0.isWhitespace }).map(String.init)
+    }
+
+    private static func fold(_ s: String) -> String {
+        s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
 }
 

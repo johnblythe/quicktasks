@@ -54,6 +54,13 @@ struct PassStatus: Equatable {
     /// separately from `counts` because it is a flag, not a tally.
     let truncated: Bool
     let records: [TaskRecord]
+    /// `suggestions`, parsed. Empty both when the key held an empty list and
+    /// when it was absent; `suggestionsAvailable` is what tells those apart.
+    let suggestions: [Suggestion]
+    /// Whether the payload carried a `suggestions` key at all. The section
+    /// hides itself when it did not, so a Pass without the engine shows no
+    /// empty section: an absent feature has to look absent, not broken.
+    let suggestionsAvailable: Bool
 
     /// Parses a /status.json body. Returns .failure only when the payload is
     /// not usable at all; missing optional keys inside a row are tolerated,
@@ -132,13 +139,50 @@ struct PassStatus: Equatable {
                                   generatedAt: generatedAt))
         }
 
+        // 4. Suggestions, if this Pass has the engine. Absence is the normal
+        //    state until LD-2xx ships, and is not a parse failure.
+        let rawSuggestions = obj["suggestions"] as? [[String: Any]]
+        let suggestions = (rawSuggestions ?? []).compactMap(suggestion(_:))
+
         return .success(PassStatus(generatedAt: generatedAt,
                                    passURL: passURL,
                                    itemURLTemplate: itemURLTemplate,
                                    groups: groups,
                                    counts: counts,
                                    truncated: truncated,
-                                   records: records))
+                                   records: records,
+                                   suggestions: suggestions,
+                                   // The key being there is what counts, not
+                                   // whether anything parsed out of it: a Pass
+                                   // that sent an empty list has the engine and
+                                   // nothing to suggest right now.
+                                   suggestionsAvailable: obj["suggestions"] != nil))
+    }
+
+    /// One suggestion. A row with no id is dropped -- every one of the four
+    /// buttons posts that id, so a row without one is a row whose buttons
+    /// would all fail. Everything else is optional: a suggestion with no
+    /// rationale still shows, it just has less to say for itself.
+    private static func suggestion(_ obj: [String: Any]) -> Suggestion? {
+        guard let itemID = obj["item_id"] as? String, !itemID.isEmpty else { return nil }
+        func text(_ key: String) -> String? {
+            guard let value = obj[key], !(value is NSNull) else { return nil }
+            return (value as? String).flatMap { $0.isEmpty ? nil : $0 }
+        }
+        let rawSource = text("source")
+        // Clamped rather than refused: a confidence outside 0...1 is a bug
+        // upstream, and drawing the pip at one end of its range says more than
+        // dropping the row would.
+        let confidence = min(max(doubleValue(obj["confidence"]) ?? 0, 0), 1)
+        return Suggestion(itemID: itemID,
+                          title: Store.titleFrom(text("title") ?? itemID),
+                          rationale: text("rationale") ?? "",
+                          confidence: confidence,
+                          proposed: (text("proposed") ?? "").lowercased(),
+                          source: ItemSource(raw: rawSource),
+                          sourceRaw: rawSource,
+                          sourceURL: text("source_url"),
+                          date: Store.parseDate(obj["date"]))
     }
 
     // MARK: - one row
@@ -216,7 +260,12 @@ struct PassStatus: Equatable {
             // prompt and is not already running or awaiting a verdict. Same
             // rule the review page's own canRun() applies, computed server-side
             // so the widget and the page cannot drift.
-            canRun: boolValue(field("can_run")) ?? false)
+            canRun: boolValue(field("can_run")) ?? false,
+            // Which spoke filed the item, for the row glyph. Absent on a v1
+            // payload and on any row the Pass has not tagged, which reads as
+            // .other and draws the neutral glyph.
+            source: ItemSource(raw: text("source")),
+            sourceRaw: text("source"))
     }
 
     /// The id every feed agrees on, so a Pass row and a qt-ledger row for the
@@ -307,6 +356,31 @@ enum PassPayload {
             return .failure("too long to capture: \(trimmed.count) characters, limit is \(captureLimit)")
         }
         return .success(["text": trimmed, "source": source])
+    }
+
+    /// The four things John can say to a suggestion. `confirm` and `deny` are
+    /// verdicts on the suggestion itself ("yes, that is mine" / "no, drop it"),
+    /// `go` fires it, and `snooze` puts it back for later. Kept separate from
+    /// `verdictActions` because these are decisions about a *suggestion*, not
+    /// about a finished job's work, and the two vocabularies must not blur:
+    /// posting "accept" to /decide or "confirm" to /save would both be wrong.
+    static let decideActions: Set<String> = ["confirm", "deny", "go", "snooze"]
+
+    /// POST /decide. Additive and single-item: the Pass merges this one
+    /// decision into decisions.json without touching the others, so unlike
+    /// /save there is nothing to carry along. The body is exactly what the
+    /// LD-2xx contract specifies -- id, action, comment -- and `comment` is
+    /// sent even when empty, because the route documents it as a key rather
+    /// than an optional one.
+    static func decide(id: String,
+                       action: String,
+                       comment: String = "") -> Result<[String: Any], Problem> {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .failure("no item id") }
+        guard decideActions.contains(action) else {
+            return .failure("\(action) is not one of confirm/deny/go/snooze")
+        }
+        return .success(["id": trimmed, "action": action, "comment": comment])
     }
 
     /// POST /save. Same shape the review page posts: a `saved_at` stamp and a

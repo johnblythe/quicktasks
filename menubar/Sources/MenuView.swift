@@ -27,16 +27,56 @@ struct MenuView: View {
     @State private var highlighted: String?
     @FocusState private var fieldFocused: Bool
 
+    /// The quick-search query. Narrows the rows across every section; the
+    /// header keeps counting the whole feed, because a search box that also
+    /// retallied "6 tasks need you" would be answering a question nobody asked.
+    @State private var search: String = ""
+    /// Whether the search field is on screen. Separate from the query being
+    /// empty, so the field can be opened with an empty query and stay open
+    /// while it is being typed into.
+    @State private var searching = false
+    @FocusState private var searchFocused: Bool
+    /// Which suggestion is mid-confirm, and for which action. Go and Deny ask
+    /// first: one spends a job slot, the other throws the engine's find away.
+    @State private var confirmingSuggestion: (id: String, action: String)?
+
     /// Wider than v1's 320: a verify row carries report, accept, redo, reject,
     /// and resume, and the title still has to be readable next to them.
     /// Shared with --snapshot so the render is the real panel width.
     static let panelWidth: CGFloat = 352
+
+    /// Tallest the row list may get before it scrolls, so a long history
+    /// cannot grow the panel off the bottom of the screen.
+    static let listMaxHeight: CGFloat = 320
+
+    /// Measured height of the row list's content, reported up from a
+    /// GeometryReader behind it.
+    ///
+    /// The list needs an *explicit* height, not a `maxHeight` cap. A bare
+    /// ScrollView is fully flexible along its scroll axis: it accepts a zero
+    /// height proposal, and `.frame(maxHeight:)` only caps it -- nothing
+    /// establishes a floor. `MenuBarExtra(.window)` hosts the panel under Auto
+    /// Layout with the content pinned top and bottom, and in that regime
+    /// SwiftUI compressed the flexible child to nothing: the entire list
+    /// vanished while the header, computed from the model, went on counting
+    /// the rows it was not drawing. Measuring the content and pinning the
+    /// height to it renders the same under every proposal.
+    @State private var listHeight: CGFloat = 0
+
+    /// The model the list draws: the controller's, narrowed to the search
+    /// query. Everything below the header reads this; the header itself reads
+    /// the controller's own model, so the count never moves while filtering.
+    private var model: MenuModel { controller.model.filtered(query: search) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             quickFire
             Divider()
             header
+            if searching {
+                Divider()
+                searchField
+            }
             Divider()
             if controller.model.records.isEmpty {
                 Text(emptyText)
@@ -44,10 +84,44 @@ struct MenuView: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
+            } else if model.records.isEmpty && !model.showsSuggestions {
+                // Filtered down to nothing. Says what was searched for, since
+                // the query is one line up and easy to forget mid-type.
+                Text("Nothing matches \u{201C}\(search)\u{201D}")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        ForEach(controller.model.sections(now: controller.now), id: \.section) { entry in
+                        // Suggestions lead the list: they are the only rows
+                        // that are here to be decided rather than watched.
+                        if model.showsSuggestions {
+                            SuggestionSectionHeader(count: model.suggestions.count,
+                                                    collapsed: controller.suggestionsCollapsed) {
+                                controller.toggleSuggestions()
+                            }
+                            if !controller.suggestionsCollapsed {
+                                ForEach(model.suggestions, id: \.itemID) { suggestion in
+                                    SuggestionRow(
+                                        suggestion: suggestion,
+                                        busy: controller.busy.contains(suggestion.itemID),
+                                        confirming: confirmingSuggestion?.id == suggestion.itemID
+                                            ? confirmingSuggestion?.action : nil,
+                                        onTitle: { openSuggestion(suggestion) },
+                                        onAsk: { action in
+                                            confirmingSuggestion = (suggestion.itemID, action)
+                                        },
+                                        onCancelAsk: { confirmingSuggestion = nil },
+                                        onDecide: { action in
+                                            confirmingSuggestion = nil
+                                            decideSuggestion(suggestion, action: action)
+                                        })
+                                }
+                            }
+                        }
+                        ForEach(model.sections(now: controller.now), id: \.section) { entry in
                             SectionHeader(section: entry.section,
                                           count: entry.records.count,
                                           collapsed: controller.isCollapsed(entry.section)) {
@@ -71,10 +145,20 @@ struct MenuView: View {
                             }
                         }
                     }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(key: ListHeightKey.self,
+                                                   value: geo.size.height)
+                        }
+                    )
                 }
-                // Caps the panel height so a long history scrolls instead of
-                // growing the menu off the bottom of the screen.
-                .frame(maxHeight: 320)
+                // An explicit height, not a cap: see `listHeight`. Scrolls
+                // once the content passes listMaxHeight, so a long history
+                // cannot grow the menu off the bottom of the screen.
+                .frame(height: renderedListHeight)
+                .onPreferenceChange(ListHeightKey.self) { measured in
+                    if abs(measured - listHeight) > 0.5 { listHeight = measured }
+                }
             }
             if let warning = controller.model.warning {
                 Divider()
@@ -88,6 +172,21 @@ struct MenuView: View {
             footer
         }
         .frame(width: Self.panelWidth)
+        // Two zero-sized buttons carry the command shortcuts. A MenuBarExtra
+        // window has no menu bar of its own to hang them off, and onKeyPress
+        // does not see a command-modified key that the menu system claims
+        // first, so the shortcut has to belong to a real (if invisible) button.
+        .background {
+            VStack(spacing: 0) {
+                Button("", action: toggleSearch)
+                    .keyboardShortcut("f", modifiers: .command)
+                Button("", action: { controller.showSettings() })
+                    .keyboardShortcut(",", modifiers: .command)
+            }
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+        }
         .onAppear {
             controller.refresh()
             // The panel needs to be key before the TextField will take
@@ -100,6 +199,22 @@ struct MenuView: View {
         .onKeyPress(.upArrow) { moveHighlight(-1) }
         .onKeyPress(.return) { triggerHighlighted() }
         .onKeyPress(.escape) { clearDraft() }
+        // Typing with neither field focused opens search and keeps the
+        // keystroke, so the letter that started the search is not swallowed.
+        // Only once the arrows have taken focus off the quick-fire field: while
+        // that field has focus it owns every character, which is what keeps
+        // "type, press return, task fired" working.
+        .onKeyPress(phases: .down) { press in
+            guard !fieldFocused, !searchFocused, !searching else { return .ignored }
+            guard press.modifiers.isEmpty || press.modifiers == .shift else { return .ignored }
+            guard let c = press.characters.first, c.isLetter || c.isNumber else {
+                return .ignored
+            }
+            search = String(press.characters)
+            searching = true
+            searchFocused = true
+            return .handled
+        }
         .onChange(of: controller.model.refreshedAt) { _, _ in
             // A highlight whose row has left the feed is dropped rather than
             // moved: the row under the cursor changing identity between polls
@@ -141,9 +256,25 @@ struct MenuView: View {
         return .handled
     }
 
-    /// Escape empties the quick-fire field first, then clears the highlight, so
-    /// one key backs out of whichever thing is in progress.
+    /// Escape backs out of one thing at a time, innermost first: a pending
+    /// Go/Deny confirmation, then the search, then the quick-fire draft, then
+    /// the highlight. One key undoing everything at once would make it
+    /// impossible to abandon a confirmation without also losing the search.
     private func clearDraft() -> KeyPress.Result {
+        if confirmingSuggestion != nil {
+            confirmingSuggestion = nil
+            return .handled
+        }
+        if searching {
+            // First escape empties a non-empty query, second closes the field.
+            if !search.isEmpty {
+                search = ""
+            } else {
+                searching = false
+                searchFocused = false
+            }
+            return .handled
+        }
         if !draft.isEmpty {
             draft = ""
             return .handled
@@ -153,6 +284,28 @@ struct MenuView: View {
             return .handled
         }
         return .ignored
+    }
+
+    /// Command-F. Opens the field and takes focus; closes it and drops the
+    /// query when it is already open, so the same key puts the list back.
+    private func toggleSearch() {
+        if searching {
+            searching = false
+            search = ""
+            searchFocused = false
+        } else {
+            searching = true
+            searchFocused = true
+            fieldFocused = false
+        }
+    }
+
+    /// Height to give the row list. Falls back to one section header plus a
+    /// row before the first measurement lands, so the list is never blank on
+    /// the frame the menu opens on.
+    private var renderedListHeight: CGFloat {
+        let measured = listHeight > 0.5 ? listHeight : 58
+        return min(measured, Self.listMaxHeight)
     }
 
     private var emptyText: String {
@@ -198,19 +351,89 @@ struct MenuView: View {
         .padding(.vertical, 10)
     }
 
+    /// The quick-search field. Narrows every section at once, including the
+    /// suggestions, over the row's title, status text, reason, and source.
+    private var searchField: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            TextField("Filter rows\u{2026}", text: $search)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .focused($searchFocused)
+            if !search.isEmpty {
+                // The count is the useful thing here rather than in the header:
+                // it says how much of the list the query is hiding.
+                Text("\(model.records.count + model.suggestions.count)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            RowButton(icon: "xmark.circle.fill", help: "Clear the filter") {
+                search = ""
+                searching = false
+                searchFocused = false
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .help("Matches on title, status, reason, and source. Escape clears it.")
+    }
+
     private var header: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(Color(StatusPalette.color(for: controller.model.aggregate)))
-                .frame(width: 8, height: 8)
-            Text(flash ?? controller.model.aggregate.headline)
-                .font(.system(size: 13, weight: .semibold))
-                .lineLimit(1)
-            Spacer()
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Color(StatusPalette.color(for: controller.model.aggregate)))
+                    .frame(width: 8, height: 8)
+                Text(flash ?? controller.model.aggregate.headline)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                FooterButton(icon: searching ? "magnifyingglass.circle.fill" : "magnifyingglass",
+                             help: "Filter the rows (\u{2318}F)",
+                             action: toggleSearch)
+            }
+            // "6 tasks need you" names nothing John can act on. The titles do,
+            // and they are the reason the widget is a list rather than a badge
+            // -- so the count carries two or three of them even when the rows
+            // themselves are collapsed or scrolled out of sight.
+            if let preview = headlinePreview {
+                Text(preview)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .help(groupsTooltip)
+    }
+
+    /// The titles under the count, or nil when they would say nothing new.
+    ///
+    /// Two cases earn them. When the section holding the counted rows is
+    /// collapsed, the count is all there is and the titles are the only way to
+    /// know what it means. When the list is short, they cost one line and make
+    /// the header readable without moving the eye. Once the list is long and
+    /// open, the rows are right there and a preview is a second copy of the
+    /// top of it -- so it is left off. A flash message owns the header while
+    /// it is up, so nothing is drawn under it either.
+    private var headlinePreview: String? {
+        guard flash == nil else { return nil }
+        // Nothing to preview when nothing needs him.
+        if case .idle = controller.model.aggregate { return nil }
+        let titles = controller.model.headlinePreview(limit: 3, now: controller.now)
+        guard !titles.isEmpty else { return nil }
+        let countedSection: Section = {
+            if case .running = controller.model.aggregate { return .running }
+            return .needsYou
+        }()
+        let collapsed = controller.isCollapsed(countedSection)
+        guard collapsed || titles.count <= 3 else { return nil }
+        return titles.joined(separator: " \u{00B7} ")
     }
 
     /// The Pass's own group counts. It sends every group it renders, including
@@ -251,6 +474,9 @@ struct MenuView: View {
                 Spacer()
                 FooterButton(icon: "list.bullet.rectangle", help: "Open the Pass") {
                     Actions.openPass(controller.model.passURL)
+                }
+                FooterButton(icon: "gearshape", help: "Settings (\u{2318},)") {
+                    controller.showSettings()
                 }
                 FooterButton(icon: "arrow.clockwise", help: "Refresh now") {
                     controller.refresh()
@@ -405,6 +631,42 @@ struct MenuView: View {
     /// Shows an outcome in the header for a couple of seconds. A failure has
     /// to be visible: the alternative is a task John believes is queued and
     /// never hears about again.
+    /// A suggestion's title click. Goes to wherever the suggestion came from
+    /// when the engine said (`source_url`), and to the item in the Pass
+    /// otherwise -- the source is the more useful of the two, since deciding a
+    /// suggestion usually means reading the Slack thread behind it.
+    private func openSuggestion(_ suggestion: Suggestion) {
+        if let raw = suggestion.sourceURL, let url = URL(string: raw) {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        switch Actions.openItem(template: controller.model.itemURLTemplate,
+                                base: controller.model.passURL,
+                                itemID: suggestion.itemID) {
+        case .success: break
+        case .failure(let problem): show(problem.message)
+        }
+    }
+
+    /// Posts one of confirm / deny / go / snooze through `POST /decide`,
+    /// falling back to `POST /save` on a Pass that has not shipped the route.
+    private func decideSuggestion(_ suggestion: Suggestion, action: String) {
+        let base = controller.passBase
+        let hubDir = controller.config.hubDir
+        controller.perform(key: suggestion.itemID, {
+            Actions.decideSuggestion(id: suggestion.itemID,
+                                     title: suggestion.title,
+                                     action: action,
+                                     base: base,
+                                     hubDir: hubDir)
+        }) { outcome in
+            switch outcome {
+            case .success(let message): show(message)
+            case .failure(let problem): show(problem.message)
+            }
+        }
+    }
+
     private func show(_ message: String) {
         flash = message
         let shown = message
@@ -421,6 +683,172 @@ struct MenuView: View {
 }
 
 // MARK: - section header
+
+/// The suggestions section's own header. Titled from the count rather than
+/// labelled and counted like the others ("3 things we think you need to do",
+/// not "Suggestions 3"), because the sentence is the pitch: these rows are a
+/// claim about John's day, and a claim reads differently from a tally.
+struct SuggestionSectionHeader: View {
+    let count: Int
+    let collapsed: Bool
+    let onToggle: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 6) {
+                Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 9)
+                Image(systemName: "sparkles")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                Text(Suggestion.headline(count))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(hovering ? Color.primary.opacity(0.06) : .clear)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(collapsed ? "Show the suggestions" : "Hide the suggestions")
+    }
+}
+
+/// One suggestion: title, a line of reasoning, a confidence pip, and the four
+/// answers. Two lines tall rather than one, because the rationale is the whole
+/// reason the row is trustworthy enough to act on from a menu.
+struct SuggestionRow: View {
+    let suggestion: Suggestion
+    let busy: Bool
+    /// Non-nil while this row is asking about an action, and the action it is
+    /// asking about.
+    let confirming: String?
+    let onTitle: () -> Void
+    let onAsk: (_ action: String) -> Void
+    let onCancelAsk: () -> Void
+    let onDecide: (_ action: String) -> Void
+
+    @State private var hovering = false
+
+    /// Go and Deny ask first. Go spends a job slot and a model's time; Deny
+    /// throws the engine's find away. Confirm and Snooze are both recoverable
+    /// in the review page, so they go straight through -- the same split the
+    /// task rows draw between accept/redo and reject/run.
+    static let asksFirst: Set<String> = ["go", "deny"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                ConfidencePip(step: suggestion.confidenceStep)
+                Image(systemName: suggestion.source.symbol)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 11)
+                Button(action: onTitle) {
+                    Text(suggestion.title)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 8)
+                if busy {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.6)
+                        .frame(width: 12)
+                } else if let action = confirming {
+                    Text(action == "go" ? "Run it?" : "Drop it?")
+                        .font(.system(size: 11))
+                        .foregroundStyle(action == "go" ? .blue : .red)
+                    RowButton(icon: "checkmark",
+                              help: action == "go" ? "Yes, fire it now" : "Yes, drop it",
+                              tint: AnyShapeStyle(action == "go" ? Color.blue : Color.red)) {
+                        onDecide(action)
+                    }
+                    RowButton(icon: "xmark", help: "Leave it", action: onCancelAsk)
+                } else {
+                    actions
+                }
+            }
+            if !suggestion.rationale.isEmpty {
+                Text(suggestion.rationale)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.leading, 26)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(hovering ? Color.primary.opacity(0.06) : .clear)
+        .onHover { hovering = $0 }
+        .help(helpText)
+    }
+
+    /// Confirm, Deny, Go, Snooze. Snooze is the hover-reveal one: it is the
+    /// only one of the four that changes nothing, so it is the one that can
+    /// afford to wait for the mouse to arrive on a 352-point row.
+    @ViewBuilder private var actions: some View {
+        RowButton(icon: "checkmark.circle", help: "Confirm: yes, this is mine") {
+            onDecide("confirm")
+        }
+        RowButton(icon: "play.circle", help: "Go: fire it now (asks first)") {
+            onAsk("go")
+        }
+        RowButton(icon: "xmark.circle", help: "Deny: not mine, drop it (asks first)") {
+            onAsk("deny")
+        }
+        if hovering {
+            RowButton(icon: "clock", help: "Snooze: ask me again later") {
+                onDecide("snooze")
+            }
+        }
+    }
+
+    var helpText: String {
+        var parts = [suggestion.title]
+        if !suggestion.rationale.isEmpty { parts.append(suggestion.rationale) }
+        parts.append("item: \(suggestion.itemID)")
+        parts.append("source: \(suggestion.sourceRaw ?? suggestion.source.label)")
+        parts.append(suggestion.confidenceWord)
+        if !suggestion.proposed.isEmpty { parts.append("proposed: \(suggestion.proposed)") }
+        if let at = suggestion.date { parts.append("from \(shortAge(from: at)) ago") }
+        parts.append("confirm / go / deny, and snooze on hover")
+        parts.append(suggestion.sourceURL == nil
+                     ? "click the title to open it in the Pass"
+                     : "click the title to open where it came from")
+        return parts.joined(separator: "\n")
+    }
+}
+
+/// Three dots, filled to the engine's confidence. Coarse on purpose: the
+/// difference between 0.61 and 0.68 is not something the engine can defend,
+/// and a percentage would imply that it can.
+struct ConfidencePip: View {
+    let step: Int
+
+    var body: some View {
+        HStack(spacing: 1.5) {
+            ForEach(1...3, id: \.self) { i in
+                Circle()
+                    .fill(i <= step ? Color.secondary : Color.secondary.opacity(0.22))
+                    .frame(width: 3.5, height: 3.5)
+            }
+        }
+        .frame(width: 14)
+    }
+}
 
 struct SectionHeader: View {
     let section: Section
@@ -488,6 +916,16 @@ struct TaskRow: View {
                 Circle()
                     .fill(Color(StatusPalette.color(for: record)))
                     .frame(width: 7, height: 7)
+                // Which spoke filed this. A fixed-width glyph rather than a
+                // word: at 352 points the title is the scarce thing, and the
+                // full name is one hover away in the tooltip. Drawn even for
+                // .other so the titles stay on one vertical line -- a column
+                // that appears and disappears per row is harder to read past
+                // than a neutral mark.
+                Image(systemName: record.source.symbol)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 11)
                 Button(action: onTitle) {
                     Text(record.title)
                         .font(.system(size: 12))
@@ -618,6 +1056,9 @@ struct TaskRow: View {
 
     var helpText: String {
         var parts = [record.title, "id: \(record.id)"]
+        // Names the glyph. `.other` still says something -- "no source" is a
+        // fact about the row, and for a quicktask it is the expected one.
+        parts.append("source: \(record.sourceRaw ?? record.source.label)")
         if let item = record.itemID, item != record.id { parts.append("item: \(item)") }
         if let state = record.state, !state.isEmpty { parts.append("state: \(state)") }
         if record.origin == .pass { parts.append("from the Pass") }
@@ -670,5 +1111,15 @@ struct FooterButton: View {
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
         .help(help)
+    }
+}
+
+/// Carries the measured height of the row list's content up to the panel, so
+/// the scroll area can be given an explicit height rather than a cap. See
+/// `MenuView.listHeight` for why a cap is not enough.
+struct ListHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

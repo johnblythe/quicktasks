@@ -37,17 +37,34 @@ struct StoreConfig {
     /// QT_PASS_URL="" and only the file ledgers should be read.
     let pass: PassEndpoint.Resolution
     let limit: Int
+    /// The settings window's stored preferences, resolved with the rest of the
+    /// config so a change takes effect on the next poll rather than the next
+    /// launch. Carried here because the feed needs three of them -- the row
+    /// limit, the visible sections, the Pass URL -- and the view needs the rest.
+    let settings: Settings
 
     /// Base URL of The Pass, or nil when the HTTP feed is off.
     var passURL: URL? { pass.url }
 
     static func resolve(env: [String: String] = ProcessInfo.processInfo.environment,
-                        limit: Int = 12) -> StoreConfig {
+                        limit: Int? = nil,
+                        settings: Settings? = nil) -> StoreConfig {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let qtData = env["QT_DATA"].map { URL(fileURLWithPath: expand($0)) }
             ?? home.appendingPathComponent(".quicktasks")
+        let settings = settings ?? Settings.load()
 
+        // QT_HUB first, then the settings window, then config.json's hub_dir,
+        // then off -- the same order as the Pass URL's and for the same reason:
+        // the environment is how a test points the widget at a fixture, so a
+        // stored preference must not be able to shadow it. An empty QT_HUB is
+        // "no value here", not "hub feed off": the feed is off only when none
+        // of the three says anything, which is what qt's own
+        // resolve_hub_dir() does and what the widget's tests pin.
         var hub = env["QT_HUB"].flatMap { $0.isEmpty ? nil : expand($0) }
+        if hub == nil, let chosen = settings.hubDirOverride {
+            hub = expand(chosen)
+        }
         if hub == nil {
             let cfg = qtData.appendingPathComponent("config.json")
             if let data = try? Data(contentsOf: cfg),
@@ -63,8 +80,11 @@ struct StoreConfig {
             hubJobsDir: hubURL?.appendingPathComponent("jobs"),
             // The hub dir is resolved first on purpose: its `.pass-url` is
             // where a Pass that had to move off 8811 says so.
-            pass: PassEndpoint.resolution(env: env, hubDir: hubURL),
-            limit: limit)
+            pass: PassEndpoint.resolution(env: env, hubDir: hubURL, settings: settings),
+            // An explicit --limit wins, so the CLI seams stay deterministic
+            // whatever is stored in the settings window.
+            limit: limit ?? settings.rowLimit,
+            settings: settings)
     }
 
     private static func expand(_ path: String) -> String {
@@ -109,7 +129,8 @@ enum Store {
             now: now,
             warning: problems.isEmpty ? nil : problems.joined(separator: " · "),
             source: .files,
-            passURL: config.passURL?.absoluteString ?? PassEndpoint.defaultURL
+            passURL: config.passURL?.absoluteString ?? PassEndpoint.defaultURL,
+            visibleSections: config.settings.visibleSections
         ).trimmed(to: config.limit)
     }
 

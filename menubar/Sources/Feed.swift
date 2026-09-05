@@ -34,7 +34,10 @@ enum Feed {
                              source: .files,
                              passURL: passURL.absoluteString,
                              passError: problem.message,
-                             groups: [])
+                             groups: [],
+                             // No Pass, no suggestions: the engine lives there,
+                             // and the ledgers have never heard of it.
+                             visibleSections: config.settings.visibleSections)
         case .success(let status):
             return merge(status: status, config: config, now: now)
         }
@@ -72,7 +75,10 @@ enum Feed {
             groups: status.groups,
             itemURLTemplate: status.itemURLTemplate,
             counts: status.counts,
-            truncated: status.truncated
+            truncated: status.truncated,
+            suggestions: status.suggestions,
+            suggestionsAvailable: status.suggestionsAvailable,
+            visibleSections: config.settings.visibleSections
         ).trimmed(to: config.limit)
     }
 
@@ -108,7 +114,12 @@ enum Feed {
             denialCount: max(pass.denialCount, ledger.denialCount),
             // Only The Pass knows whether an item can be fired: the rule needs
             // the item's prompt and its lane, neither of which is in a ledger.
-            canRun: pass.canRun)
+            canRun: pass.canRun,
+            // Only the Pass tags a row with the spoke it came from; a ledger
+            // row's own "source" says which of the two writers mirrored it,
+            // which is a different question and is already `origin`.
+            source: pass.source,
+            sourceRaw: pass.sourceRaw)
     }
 
     private static func nonEmpty(_ s: String?) -> String? {

@@ -588,6 +588,11 @@ class _Handler(BaseHTTPRequestHandler):
             parsed = None
         self.owner.posts.append({"path": self.path, "body": parsed,
                                  "headers": dict(self.headers)})
+        code = self.owner.post_codes.get(self.path, self.owner.post_code)
+        # A route this Pass does not have answers 404 with a plain-text body,
+        # the way BaseHTTPRequestHandler's own send_error would.
+        if code == 404:
+            return self.send_error(404)
         # serve.py answers a refused POST with plain text, not JSON: /run's 409
         # body is literally "already running" or "max concurrent jobs running".
         if self.owner.post_text is not None:
@@ -596,7 +601,7 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             body = json.dumps(self.owner.post_body).encode()
             ctype = "application/json"
-        self.send_response(self.owner.post_code)
+        self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -610,16 +615,26 @@ class FixturePass:
     trip works and that its absence is handled."""
 
     def __init__(self, payload=None, raw=None, status_code=200,
-                 post_body=None, post_code=200, post_text=None):
+                 post_body=None, post_code=200, post_text=None,
+                 post_codes=None):
         self.payload = payload
         self.raw = raw
         self.status_code = status_code
         self.post_body = post_body if post_body is not None else {"ok": True, "id": "cap-1"}
         self.post_code = post_code
         self.post_text = post_text
+        # Per-path status codes, keyed by path ("/decide"). This is how a Pass
+        # that has not shipped a route yet is modelled: the route 404s while
+        # every other POST still works, which is exactly the shape the widget
+        # feature-detects against. Falls back to post_code for any path not
+        # named here.
+        self.post_codes = dict(post_codes or {})
         self.gets = []
         self.posts = []
         self._srv = None
+
+    def posts_to(self, path):
+        return [p for p in self.posts if p["path"] == path]
 
     def status_bytes(self):
         if self.raw is not None:
@@ -1230,6 +1245,13 @@ class TestRealStatusSample(PassCase):
         payload = json.loads(REAL_STATUS_SAMPLE)
         payload["needs_you"] = []
         payload["jobs"] = [j for j in payload["jobs"] if j["item_id"] == "done1"]
+        # This one case has to move the sample's clock forward. The row it is
+        # about carries no timestamp of its own, so `generated_at` is the only
+        # thing placing it, and "today" is a claim about the day the payload was
+        # generated -- which for a verbatim sample is the day it was captured.
+        # Left as recorded it passed on 4 September 2026 and failed every day
+        # after. Everything else about the sample stays byte-for-byte.
+        payload["generated_at"] = _iso(datetime.now())
         base = self.serve(payload=payload)
         m = self.pass_model(base)
         self.assertEqual([s["key"] for s in m["sections"]], ["done_today"])
@@ -1791,3 +1813,351 @@ class TestCaptureLimits(ModelCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# --- fixtures for the suggestions contract -----------------------------
+#
+# status_fixture() predates `suggestions`, and has no keyword for it, so this
+# wraps it rather than editing the shared helper (per the brief: define a
+# local helper when the shared one is missing a keyword). suggestions=None
+# omits the key entirely, which is the only way to pin suggestions_available
+# False; passing [] pins it True with nothing to show -- that distinction is
+# the whole point of two of the tests below.
+
+def suggestion_fixture(item_id, **fields):
+    """One suggestions[] entry, with the contract's full key set."""
+    rec = {
+        "item_id": item_id,
+        "title": fields.pop("title", f"title for {item_id}"),
+        "rationale": fields.pop("rationale", f"rationale for {item_id}"),
+        "confidence": fields.pop("confidence", 0.5),
+        "proposed": fields.pop("proposed", "track"),
+        "source": fields.pop("source", "slack"),
+        "source_url": fields.pop("source_url", f"https://example.com/{item_id}"),
+        "date": fields.pop("date", _iso(datetime.now())),
+    }
+    rec.update(fields)
+    return rec
+
+
+def status_fixture_with_suggestions(suggestions=None, **kwargs):
+    payload = status_fixture(**kwargs)
+    if suggestions is not None:
+        payload["suggestions"] = list(suggestions)
+    return payload
+
+
+# A private defaults suite for every model()/run_binary() call below, so a
+# real com.quicktasks.menubar preference on this machine can never steer a
+# suggestions test, and nothing here reads or writes that real domain.
+_SUGGEST_DEFAULTS_ENV = {"QT_MENUBAR_DEFAULTS_SUITE": "com.quicktasks.menubar.testsuggest"}
+
+# Pinned from Suggestion.confidenceStep in Model.swift (>= high is step 3,
+# >= medium is step 2, else step 1), so the pip-threshold test below derives
+# its expected steps from these two constants rather than restating them.
+_SUGGEST_CONFIDENCE_HIGH = 0.75
+_SUGGEST_CONFIDENCE_MEDIUM = 0.45
+
+
+class TestSuggestionsParsing(PassCase):
+    """The `suggestions` array and `counts.suggest`, via `--dump-model`."""
+
+    def dump_model(self, base, *extra_args, expect=0):
+        proc = self.run_binary("--dump-model", "--limit", "50", *extra_args,
+                               extra_env={"QT_PASS_URL": base, **_SUGGEST_DEFAULTS_ENV},
+                               expect=expect)
+        return json.loads(proc.stdout)
+
+    def test_three_suggestions_parse_in_payload_order_with_fields_carried_through(self):
+        s1 = suggestion_fixture("sugg-1", title="Reply to Dan",
+                                rationale="Dan asked twice in #eng",
+                                proposed="fire", source="slack",
+                                source_url="https://example.com/1")
+        s2 = suggestion_fixture("sugg-2", title="Review PR 42",
+                                rationale="you are the last reviewer",
+                                proposed="track", source="github",
+                                source_url="https://example.com/2")
+        s3 = suggestion_fixture("sugg-3", title="Draft the LD-201 update",
+                                rationale="due Friday",
+                                proposed="today", source="linear",
+                                source_url="https://example.com/3")
+        base = self.serve(payload=status_fixture_with_suggestions(
+            suggestions=[s1, s2, s3]))
+        m = self.dump_model(base)
+        self.assertEqual([s["item_id"] for s in m["suggestions"]],
+                         ["sugg-1", "sugg-2", "sugg-3"])
+        for got, want in zip(m["suggestions"], (s1, s2, s3)):
+            self.assertEqual(got["title"], want["title"])
+            self.assertEqual(got["rationale"], want["rationale"])
+            self.assertEqual(got["proposed"], want["proposed"])
+            self.assertEqual(got["source"], want["source"])
+            self.assertEqual(got["source_url"], want["source_url"])
+        self.assertEqual(m["suggestions_headline"], "3 things we think you need to do")
+
+    def test_one_suggestion_headline_is_singular(self):
+        base = self.serve(payload=status_fixture_with_suggestions(
+            suggestions=[suggestion_fixture("sugg-1")]))
+        m = self.dump_model(base)
+        self.assertEqual(m["suggestions_headline"], "1 thing we think you need to do")
+
+    def test_suggestions_key_absent_from_the_payload_hides_the_section(self):
+        """No `suggestions` key at all is the shape every Pass sends today,
+        since the suggestion engine has not shipped. The section has to look
+        absent, not broken."""
+        base = self.serve(payload=status_fixture())
+        m = self.dump_model(base)
+        self.assertFalse(m["suggestions_available"])
+        self.assertFalse(m["shows_suggestions"])
+        self.assertEqual(m["suggestions"], [])
+
+    def test_suggestions_key_present_but_empty_is_available_with_nothing_to_show(self):
+        """The distinction is the point: this Pass has the engine and simply
+        has nothing to suggest right now."""
+        base = self.serve(payload=status_fixture_with_suggestions(suggestions=[]))
+        m = self.dump_model(base)
+        self.assertTrue(m["suggestions_available"])
+        self.assertFalse(m["shows_suggestions"])
+
+    def test_counts_suggest_tally_is_carried_through_like_every_other_count(self):
+        base = self.serve(payload=status_fixture_with_suggestions(
+            suggestions=[suggestion_fixture("sugg-1")],
+            counts={"running": 0, "verify": 0, "gate": 0, "blocked": 0,
+                   "failed": 0, "suggest": 4}))
+        m = self.dump_model(base)
+        self.assertEqual(m["counts"]["suggest"], 4)
+
+    def test_confidence_maps_to_a_three_step_pip_at_the_documented_thresholds(self):
+        values = {
+            "below-medium": (_SUGGEST_CONFIDENCE_MEDIUM - 0.01, 1),
+            "at-medium": (_SUGGEST_CONFIDENCE_MEDIUM, 2),
+            "below-high": (_SUGGEST_CONFIDENCE_HIGH - 0.01, 2),
+            "at-high": (_SUGGEST_CONFIDENCE_HIGH, 3),
+        }
+        suggestions = [suggestion_fixture(item_id, confidence=conf)
+                       for item_id, (conf, _step) in values.items()]
+        base = self.serve(payload=status_fixture_with_suggestions(suggestions=suggestions))
+        m = self.dump_model(base)
+        got_steps = {s["item_id"]: s["confidence_step"] for s in m["suggestions"]}
+        want_steps = {item_id: step for item_id, (_conf, step) in values.items()}
+        self.assertEqual(got_steps, want_steps)
+
+    def test_confidence_outside_zero_one_is_clamped_not_dropped(self):
+        """A bad number upstream must not lose the row."""
+        base = self.serve(payload=status_fixture_with_suggestions(suggestions=[
+            suggestion_fixture("sugg-hi", confidence=1.7),
+            suggestion_fixture("sugg-lo", confidence=-0.3),
+        ]))
+        m = self.dump_model(base)
+        hi = next(s for s in m["suggestions"] if s["item_id"] == "sugg-hi")
+        lo = next(s for s in m["suggestions"] if s["item_id"] == "sugg-lo")
+        self.assertEqual(hi["confidence"], 1.0)
+        self.assertEqual(hi["confidence_step"], 3)
+        self.assertEqual(lo["confidence"], 0.0)
+        self.assertEqual(lo["confidence_step"], 1)
+
+    def test_a_suggestion_with_no_item_id_is_dropped(self):
+        """Every one of the four decide buttons posts this id, so a row
+        without one has four buttons that would all fail."""
+        base = self.serve(payload=status_fixture_with_suggestions(suggestions=[
+            {"title": "no id at all"},
+            {"item_id": "", "title": "empty id"},
+            suggestion_fixture("sugg-keep"),
+        ]))
+        m = self.dump_model(base)
+        self.assertEqual([s["item_id"] for s in m["suggestions"]], ["sugg-keep"])
+
+    def test_a_suggestion_with_no_title_falls_back_to_its_item_id(self):
+        base = self.serve(payload=status_fixture_with_suggestions(
+            suggestions=[{"item_id": "bare-item"}]))
+        m = self.dump_model(base)
+        self.assertEqual(m["suggestions"][0]["title"], "bare-item")
+
+    def test_missing_optional_fields_are_all_tolerated(self):
+        base = self.serve(payload=status_fixture_with_suggestions(
+            suggestions=[{"item_id": "sparse-1", "title": "Sparse"}]))
+        m = self.dump_model(base)
+        row = m["suggestions"][0]
+        self.assertEqual(row["rationale"], "")
+        self.assertEqual(row["proposed"], "")
+        self.assertEqual(row["source"], "other")
+        self.assertIsNone(row["source_raw"])
+        self.assertIsNone(row["source_url"])
+        self.assertIsNone(row["date"])
+
+    def test_an_unknown_source_keeps_its_raw_text_while_source_reads_other(self):
+        base = self.serve(payload=status_fixture_with_suggestions(
+            suggestions=[suggestion_fixture("sugg-1", source="asana")]))
+        m = self.dump_model(base)
+        row = m["suggestions"][0]
+        self.assertEqual(row["source"], "other")
+        self.assertEqual(row["source_raw"], "asana")
+
+    def test_suggestions_do_not_leak_into_task_records_or_sections(self):
+        base = self.serve(payload=status_fixture_with_suggestions(
+            jobs=[job("job-1", status="running")],
+            suggestions=[suggestion_fixture("sugg-1")]))
+        m = self.dump_model(base)
+        self.assertNotIn("sugg-1", self.ids(m))
+        self.assertEqual(self.ids(m), ["job-1"])
+        self.assertEqual(m["count"], len(m["records"]))
+
+    def test_search_narrows_suggestions_to_the_matching_rationale(self):
+        base = self.serve(payload=status_fixture_with_suggestions(suggestions=[
+            suggestion_fixture("sugg-1", rationale="zephyr needs a follow-up"),
+            suggestion_fixture("sugg-2", rationale="something unrelated"),
+        ]))
+        m = self.dump_model(base, "--search", "zephyr")
+        self.assertEqual([s["item_id"] for s in m["suggestions"]], ["sugg-1"])
+
+
+class TestDecidePayload(ModelCase):
+    """`--dump-decide`: the POST /decide body, built without being sent."""
+
+    def dump_decide(self, *args, expect=0):
+        return self.run_binary("--dump-decide", *args,
+                               extra_env=dict(_SUGGEST_DEFAULTS_ENV), expect=expect)
+
+    def test_each_of_the_four_actions_builds_the_three_key_body(self):
+        for action in ("confirm", "deny", "go", "snooze"):
+            body = json.loads(self.dump_decide("sugg-1", action).stdout)
+            self.assertEqual(sorted(body), ["action", "comment", "id"])
+            self.assertEqual(body["id"], "sugg-1")
+            self.assertEqual(body["action"], action)
+
+    def test_comment_is_present_even_when_empty(self):
+        """The route documents `comment` as a key, not an optional one."""
+        body = json.loads(self.dump_decide("sugg-1", "confirm").stdout)
+        self.assertEqual(body["comment"], "")
+
+    def test_a_comment_is_carried_through_when_given(self):
+        body = json.loads(
+            self.dump_decide("sugg-1", "snooze", "revisit after standup").stdout)
+        self.assertEqual(body["comment"], "revisit after standup")
+
+    def test_an_action_outside_the_four_is_refused_naming_them(self):
+        """"accept" is the interesting case: it is a valid /save action, and
+        posting it to /decide would be exactly the wrong-vocabulary bug this
+        route exists to prevent."""
+        for action in ("accept", "yes", ""):
+            proc = self.dump_decide("sugg-1", action, expect=1)
+            self.assertIn("confirm/deny/go/snooze", proc.stderr)
+
+    def test_an_empty_item_id_is_refused(self):
+        self.dump_decide("", "confirm", expect=1)
+
+    def test_the_body_carries_no_saved_at_or_decisions_array(self):
+        """Unlike /save's payload, this is not a wholesale-overwrite shape --
+        carrying decisions along is exactly what /decide exists to stop."""
+        body = json.loads(self.dump_decide("sugg-1", "confirm").stdout)
+        self.assertNotIn("saved_at", body)
+        self.assertNotIn("decisions", body)
+
+
+class TestDecideRoundTrip(PassCase):
+    """POST /decide, and the POST /save fallback when a Pass has not shipped
+    the route yet, through `--post-decide` (a real round trip against the
+    fixture Pass, never a real server or port 8811)."""
+
+    def write_decisions(self, decisions, saved_at="2026-09-04T10:00:00.000Z"):
+        (self.hub / "decisions.json").write_text(
+            json.dumps({"saved_at": saved_at, "decisions": decisions}))
+
+    def post_decide(self, base, item_id, action, expect=0):
+        return self.run_binary("--post-decide", item_id, action,
+                               extra_env={"QT_PASS_URL": base, **_SUGGEST_DEFAULTS_ENV},
+                               expect=expect)
+
+    def test_a_pass_that_accepts_decide_gets_exactly_one_post_with_the_three_key_body(self):
+        base = self.serve(payload=status_fixture())
+        proc = self.post_decide(base, "sugg-1", "confirm")
+        self.assertEqual(json.loads(proc.stdout),
+                         {"ok": True, "route": "decided", "fell_back": False})
+        posts = self.server.posts_to("/decide")
+        self.assertEqual(len(posts), 1, self.server.posts)
+        self.assertEqual(posts[0]["body"], {"id": "sugg-1", "action": "confirm",
+                                            "comment": ""})
+        # The carry-forward must stop once /decide exists.
+        self.assertEqual(self.server.posts_to("/save"), [])
+
+    def test_a_404_on_decide_falls_back_to_save(self):
+        base = self.serve(payload=status_fixture(), post_codes={"/decide": 404})
+        proc = self.post_decide(base, "sugg-1", "confirm")
+        self.assertEqual(json.loads(proc.stdout),
+                         {"ok": True, "route": "save", "fell_back": True})
+        self.assertEqual(len(self.server.posts_to("/decide")), 1)
+        save_posts = self.server.posts_to("/save")
+        self.assertEqual(len(save_posts), 1, self.server.posts)
+        self.assertEqual(sorted(save_posts[0]["body"]), ["decisions", "saved_at"])
+
+    def test_confirm_maps_to_accept_and_deny_maps_to_reject_on_the_fallback(self):
+        """The two answers that have honest /save equivalents."""
+        base = self.serve(payload=status_fixture(), post_codes={"/decide": 404})
+        self.post_decide(base, "sugg-confirm", "confirm")
+        self.post_decide(base, "sugg-deny", "deny")
+        actions = {p["body"]["decisions"][-1]["id"]: p["body"]["decisions"][-1]["action"]
+                  for p in self.server.posts_to("/save")}
+        self.assertEqual(actions, {"sugg-confirm": "accept", "sugg-deny": "reject"})
+
+    def test_go_and_snooze_are_refused_rather_than_mistranslated_on_the_fallback(self):
+        """Mistranslating a snooze into an accept would file the wrong
+        decision, so these two are refused instead of approximated."""
+        base = self.serve(payload=status_fixture(), post_codes={"/decide": 404})
+        for action in ("go", "snooze"):
+            proc = self.post_decide(base, "sugg-1", action, expect=1)
+            body = json.loads(proc.stdout)
+            self.assertFalse(body["ok"])
+            self.assertIn("error", body)
+        # The /decide attempt still happened for both; neither ever reached /save.
+        self.assertEqual(len(self.server.posts_to("/decide")), 2)
+        self.assertEqual(self.server.posts_to("/save"), [])
+
+    def test_fallback_carries_a_pending_decision_for_a_different_item_and_appends_its_own_last(self):
+        self.write_decisions([
+            {"id": "other-item", "title": "Other", "state": "today",
+             "action": "snooze", "comment": ""},
+        ])
+        base = self.serve(payload=status_fixture(), post_codes={"/decide": 404})
+        self.post_decide(base, "sugg-1", "confirm")
+        decisions = self.server.posts_to("/save")[0]["body"]["decisions"]
+        self.assertEqual([d["id"] for d in decisions], ["other-item", "sugg-1"])
+        self.assertEqual(decisions[-1]["action"], "accept")
+
+    def test_the_decide_path_does_not_carry_a_pending_decision_along(self):
+        """/decide merges one decision without touching the rest of
+        decisions.json -- that is the whole point of the new route, unlike
+        /save's wholesale overwrite."""
+        self.write_decisions([
+            {"id": "other-item", "title": "Other", "state": "today",
+             "action": "snooze", "comment": ""},
+        ])
+        base = self.serve(payload=status_fixture())
+        self.post_decide(base, "sugg-1", "confirm")
+        self.assertEqual(self.server.posts_to("/save"), [])
+        self.assertEqual(self.server.posts_to("/decide")[0]["body"],
+                         {"id": "sugg-1", "action": "confirm", "comment": ""})
+
+    def test_a_405_on_decide_falls_back_the_same_way_a_404_does(self):
+        base = self.serve(payload=status_fixture(), post_codes={"/decide": 405})
+        proc = self.post_decide(base, "sugg-1", "confirm")
+        self.assertEqual(json.loads(proc.stdout),
+                         {"ok": True, "route": "save", "fell_back": True})
+        self.assertEqual(len(self.server.posts_to("/save")), 1)
+
+    def test_a_500_on_decide_is_a_real_failure_and_does_not_fall_back(self):
+        """Quietly retrying a refused decision against /save would turn one
+        refused decision into a wholesale overwrite."""
+        base = self.serve(payload=status_fixture(), post_codes={"/decide": 500})
+        proc = self.post_decide(base, "sugg-1", "confirm", expect=1)
+        body = json.loads(proc.stdout)
+        self.assertFalse(body["ok"])
+        self.assertIn("error", body)
+        self.assertEqual(self.server.posts_to("/save"), [])
+
+    def test_the_decide_post_carries_no_origin_header(self):
+        """serve.py's _origin_blocked() lets a request through only when
+        Origin is absent, the same hole every other POST in this suite comes
+        in by."""
+        base = self.serve(payload=status_fixture())
+        self.post_decide(base, "sugg-1", "confirm")
+        posts = self.server.posts_to("/decide")
+        self.assertEqual(len(posts), 1)
+        self.assertNotIn("Origin", posts[0]["headers"])

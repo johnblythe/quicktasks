@@ -12,6 +12,9 @@ final class StatusController: ObservableObject {
     @Published private(set) var now: Date = Date()
     /// Section keys the user has collapsed. Remembered in UserDefaults.
     @Published private(set) var collapsed: Set<String>
+    /// Whether the suggestions section is folded shut. Open by default: it
+    /// leads the list precisely because those rows are waiting to be decided.
+    @Published private(set) var suggestionsCollapsed: Bool
     /// Which half of the quick-fire toggle is armed: to The Pass, or run now.
     @Published var fireToPass: Bool {
         didSet { defaults.set(fireToPass, forKey: Keys.fireToPass) }
@@ -33,8 +36,13 @@ final class StatusController: ObservableObject {
     enum Keys {
         static let collapsed = "menubar.collapsedSections"
         static let fireToPass = "menubar.fireToPass"
+        /// The suggestions section's own collapse flag. Kept apart from
+        /// `collapsed`, which is keyed by `Section` raw values: suggestions are
+        /// not rows of the task list, and folding them in would have meant a
+        /// `Section` case that never holds a record.
+        static let suggestionsCollapsed = "menubar.suggestionsCollapsed"
 
-        /// Where the two remembered preferences live. Overridable with
+        /// Where the remembered preferences live. Overridable with
         /// QT_MENUBAR_DEFAULTS_SUITE so a snapshot or a test can seed them
         /// without writing into the real app's preferences.
         static func store(env: [String: String] = ProcessInfo.processInfo.environment) -> UserDefaults {
@@ -46,16 +54,27 @@ final class StatusController: ObservableObject {
         }
     }
 
+    /// The settings window, created on first use and reused after. Held here
+    /// rather than declared as a SwiftUI `Window` scene because this is an
+    /// LSUIElement app: it has no Dock icon and no menu bar of its own, so it
+    /// has to activate itself before a window it opens will take a keystroke.
+    private var settingsWindow: NSWindow?
+
     init(config: StoreConfig = .resolve(),
-         interval: TimeInterval = 5,
+         interval: TimeInterval? = nil,
          defaults: UserDefaults = Keys.store()) {
         self.config = config
         self.defaults = defaults
+        // The settings window's poll interval, unless a caller pinned one --
+        // which --snapshot and --dump-layout both do, to keep a render from
+        // churning while it is being measured.
+        let interval = interval ?? config.settings.pollInterval
         let stored = defaults.array(forKey: Keys.collapsed) as? [String]
         self.collapsed = Set(stored ?? Section.allCases
             .filter { $0.collapsedByDefault }
             .map { $0.rawValue })
         self.fireToPass = defaults.bool(forKey: Keys.fireToPass)
+        self.suggestionsCollapsed = defaults.bool(forKey: Keys.suggestionsCollapsed)
         self.loginItem = LoginItem.isEnabled()
         // The first read is the *file* model, synchronously: it is a handful
         // of small JSON files, so the menu-bar dot is right the moment the
@@ -95,13 +114,12 @@ final class StatusController: ObservableObject {
     var hasLiveRows: Bool { model.records.contains { $0.status.isActive } }
 
     func refresh() {
-        let limit = config.limit
         // Feed.load blocks on a loopback request, so it must never run on the
         // main thread: a wedged Pass would freeze the open menu. The config is
-        // resolved out here too, so re-reading .pass-url costs the main thread
-        // nothing either.
+        // resolved out here too, so re-reading .pass-url and the settings costs
+        // the main thread nothing either.
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let config = StoreConfig.resolve(limit: limit)
+            let config = StoreConfig.resolve()
             let fresh = Feed.load(config: config)
             DispatchQueue.main.async {
                 self?.config = config
@@ -122,6 +140,65 @@ final class StatusController: ObservableObject {
             collapsed.insert(section.rawValue)
         }
         defaults.set(Array(collapsed).sorted(), forKey: Keys.collapsed)
+    }
+
+    func toggleSuggestions() {
+        suggestionsCollapsed.toggle()
+        defaults.set(suggestionsCollapsed, forKey: Keys.suggestionsCollapsed)
+    }
+
+    // MARK: - settings
+
+    /// Current settings, straight off the resolved config so the window and
+    /// the feed can never be reading two different generations of them.
+    var settings: Settings { config.settings }
+
+    /// Writes the settings and re-reads the feed with them, so a changed row
+    /// limit or Pass URL takes effect on the spot rather than at the next poll.
+    /// The poll timer is rebuilt only when its interval actually moved: tearing
+    /// it down on every keystroke in the settings window would mean a widget
+    /// that never gets round to polling while it is being configured.
+    func apply(_ new: Settings) {
+        let oldInterval = config.settings.pollInterval
+        new.save(defaults)
+        config = StoreConfig.resolve(settings: new)
+        if abs(new.pollInterval - oldInterval) > 0.01 { restartPoll(new.pollInterval) }
+        refresh()
+    }
+
+    private func restartPoll(_ interval: TimeInterval) {
+        poll?.invalidate()
+        let p = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+        p.tolerance = interval / 2
+        RunLoop.main.add(p, forMode: .common)
+        poll = p
+    }
+
+    /// Opens the settings window, or brings it forward when it is already up.
+    /// Activates the app first: an accessory app's window comes up behind
+    /// everything and will not take a keystroke until the app is frontmost.
+    func showSettings() {
+        if let window = settingsWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let hosting = NSHostingView(rootView: SettingsView(controller: self))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0,
+                                                  width: SettingsView.windowWidth,
+                                                  height: 480),
+                              styleMask: [.titled, .closable, .fullSizeContentView],
+                              backing: .buffered,
+                              defer: false)
+        window.title = "Quicktask Status Settings"
+        window.contentView = hosting
+        window.isReleasedWhenClosed = false
+        window.center()
+        settingsWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
 
     // MARK: - acting
@@ -192,9 +269,19 @@ enum Entry {
               --dump-decision <id> <accept|redo|reject> [comment]
                                       print the POST /save body and exit
               --dump-keys <seq>       walk the keyboard highlight (e.g. down,down,up)
+              --dump-decide <id> <confirm|deny|go|snooze> [comment]
+                                      print the POST /decide body and exit
+              --dump-search <query>   print what the quick search matches, and why
+              --dump-settings         print the stored settings and what they resolved to
               --post-run <id>         really POST /run for an item and print the outcome
+              --post-decide <id> <action>
+                                      really decide a suggestion; says which route took it
               --snapshot <png>        render the dropdown to a PNG and exit
-              --limit <n>             rows to include (default 12)
+              --snapshot-settings <png>
+                                      render the settings window to a PNG and exit
+              --dump-layout           print panel-layout measurements as JSON and exit
+              --search <query>        with --dump-model, filter the rows first
+              --limit <n>             rows to include (default: the settings row limit)
               --help                  this text
 
             Environment:
@@ -222,8 +309,29 @@ enum Entry {
         if args.contains("--dump-keys") {
             exit(DumpModel.runKeys(args: args))
         }
+        if args.contains("--dump-decide") {
+            exit(DumpModel.runDecidePayload(args: args))
+        }
+        if args.contains("--dump-search") {
+            exit(DumpModel.runSearch(args: args))
+        }
+        if args.contains("--dump-settings") {
+            exit(DumpModel.runSettings())
+        }
         if args.contains("--post-run") {
             exit(DumpModel.runPost(args: args))
+        }
+        if args.contains("--post-decide") {
+            exit(DumpModel.runPostDecide(args: args))
+        }
+        // Checked before --snapshot, which is a prefix of it.
+        if let i = args.firstIndex(of: "--snapshot-settings") {
+            guard i + 1 < args.count else {
+                FileHandle.standardError.write(
+                    Data("--snapshot-settings needs a file path\n".utf8))
+                exit(2)
+            }
+            exit(Snapshot.runSettings(path: args[i + 1]))
         }
         if let i = args.firstIndex(of: "--snapshot") {
             guard i + 1 < args.count else {
@@ -232,6 +340,7 @@ enum Entry {
             }
             exit(Snapshot.run(path: args[i + 1]))
         }
+        if args.contains("--dump-layout") { exit(LayoutProbe.run()) }
         QuicktaskStatusApp.main()
     }
 }
