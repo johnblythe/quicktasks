@@ -106,7 +106,16 @@ if [ "$INSTALL" -eq 1 ]; then
     echo "starts at every login · remove with:"
     echo "  launchctl bootout gui/$(id -u)/com.quicktasks.menubar && rm \"$AGENT_PLIST\""
   fi
-  if [ "$RUN" -eq 1 ] || [ "$AGENT" -eq 1 ]; then
+  AGENT_LABEL="gui/$(id -u)/com.quicktasks.menubar"
+  if launchctl print "$AGENT_LABEL" >/dev/null 2>&1; then
+    # The login agent owns the running copy, and the pkill above just took it
+    # down (KeepAlive is deliberately off, so nothing brings it back on its
+    # own). Restart through launchd. A bare `open` here would start a second,
+    # unmanaged instance next to the agent's: two dots in the menu bar, which
+    # is exactly what --run used to do on a machine with the agent loaded.
+    launchctl kickstart -k "$AGENT_LABEL"
+    echo "restarted through the login agent ($AGENT_LABEL)."
+  elif [ "$RUN" -eq 1 ]; then
     open "$TARGET"
     echo "launched. Look for the status dot in the menu bar."
   else
