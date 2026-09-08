@@ -23,6 +23,15 @@ final class StatusController: ObservableObject {
     /// Set while a row action is in flight, so the row can show it is busy and
     /// a second click cannot post the same verdict twice.
     @Published private(set) var busy: Set<String> = []
+    /// Bumped after every `showHotkeyPanel()` call, once the panel has been
+    /// asked to become key -- see that function. MenuView's summon panel
+    /// observes this to re-run its focus dance on every re-show; a plain
+    /// `.onAppear` only fires once for a view this class caches and reuses
+    /// (see `hotkeyPanel`), which is why the panel used to focus on the
+    /// first \u{2325}Q and go silent on every one after. Also observed by
+    /// the real dropdown's own MenuView, harmlessly: writing that view's
+    /// @FocusState while its window is not key has no visible effect.
+    @Published private(set) var summonTick: Int = 0
 
     /// Re-resolved on every poll, not just at launch: a Pass that restarted on
     /// another port rewrites `.pass-url`, and the widget should follow it
@@ -265,6 +274,10 @@ final class StatusController: ObservableObject {
             NSApp.activate(ignoringOtherApps: true)
             positionNearStatusItem(panel)
             panel.makeKeyAndOrderFront(nil)
+            // Bumped here too, not just below: this branch is what every
+            // summon after the first actually takes, since the panel below
+            // is only ever built once.
+            summonTick += 1
             return
         }
         let view = MenuView(controller: self, onEscapeExhausted: { [weak self] in
@@ -288,11 +301,18 @@ final class StatusController: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
         positionNearStatusItem(panel)
         panel.makeKeyAndOrderFront(nil)
+        summonTick += 1
     }
 
     func hideHotkeyPanel() {
         hotkeyPanel?.orderOut(nil)
     }
+
+    /// `hotkeyPanel`, read-only, for `--dump-summon` to check `isVisible`/
+    /// `isKeyWindow`/`firstResponder` after driving a summon -- the same
+    /// reason `passBase` and `settings` are exposed as plain reads
+    /// elsewhere on this class.
+    var summonPanel: NSPanel? { hotkeyPanel }
 
     /// The hotkey's own toggle: press once to summon, press again while it is
     /// already showing to dismiss it. Checked with `isVisible` rather than a
@@ -463,8 +483,15 @@ enum Entry {
               --dump-fire <text> [--mode run|pass]
                                       print the resolved argv (Run now) or /capture body (To
                                       Pass) a quick-fire send would use, and exit
+              --dump-fire-outcome <text> [--mode run|pass] [--panel]
+                                      really fire it, and print the state and panel-hide
+                                      decision the field lands on (--panel: as the summon
+                                      panel; omitted: as the real dropdown)
               --dump-hotkey           print the registered summon shortcut and whether
                                       RegisterEventHotKey took it
+              --dump-summon <seq>     drive summon/escape (comma-separated) on a headless
+                                      panel and print {panel_visible, is_key,
+                                      first_responder_is_field, focused_field, mode}
               --dump-recent-dirs      print the directory chip's recent-directory list
               --dump-decide <id> <confirm|deny|go|snooze> [comment]
                                       print the POST /decide body and exit
@@ -513,8 +540,14 @@ enum Entry {
         if args.contains("--dump-fire") {
             exit(DumpModel.runFire(args: args))
         }
+        if args.contains("--dump-fire-outcome") {
+            exit(DumpModel.runFireOutcome(args: args))
+        }
         if args.contains("--dump-hotkey") {
             exit(DumpModel.runHotkey())
+        }
+        if args.contains("--dump-summon") {
+            exit(DumpModel.runSummon(args: args))
         }
         if args.contains("--dump-recent-dirs") {
             exit(DumpModel.runRecentDirs())

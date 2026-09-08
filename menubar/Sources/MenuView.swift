@@ -19,10 +19,61 @@
 import SwiftUI
 import AppKit
 
+/// What quick-fire's own field is doing right now, driving both its
+/// disabled state and the line drawn under it. Kept apart from `flash`
+/// (the header's own message, for every other action -- resume, run,
+/// decide): a failure here has to leave the typed text on screen rather
+/// than clearing it the way every other action's flash does, and there is
+/// no header equivalent of the field itself being re-enabled.
+enum FireFieldState: Equatable {
+    case idle
+    case firing(toPass: Bool)
+    case success(String)
+    case failure(String)
+
+    var isFiring: Bool {
+        if case .firing = self { return true }
+        return false
+    }
+}
+
+/// What a fire's `Result` becomes on screen, and whether the panel it
+/// happened in should close because of it -- pure, so `--dump-fire-outcome`
+/// and MenuView's own `fire()` compute the exact same outcome from the same
+/// `Actions.fire`/`Actions.capture` result, the same reason `FireResolve
+/// .describe` exists apart from the view it backs.
+///
+/// A success closes the panel (`isPanel` gates it: never the real
+/// dropdown) once the field has had a moment to show it landed; a failure
+/// never closes anything, in either host, because the point of keeping the
+/// typed text on screen is that John still has it in front of him to fix
+/// or retry.
+enum FireFieldOutcome {
+    static func describe(result: Result<String, Problem>,
+                         toPass: Bool,
+                         displayText: String,
+                         isPanel: Bool) -> (state: FireFieldState, hidesPanel: Bool) {
+        switch result {
+        case .success:
+            let shown = toPass ? "On the Pass: \(displayText)"
+                               : "Fired: \(String(displayText.prefix(40)))"
+            return (.success(shown), isPanel)
+        case .failure(let problem):
+            return (.failure(problem.message), false)
+        }
+    }
+}
+
 struct MenuView: View {
     @ObservedObject var controller: StatusController
     @State private var draft: String = ""
     @State private var flash: String?
+    /// What quick-fire's own field is doing right now -- idle, firing,
+    /// landed, or refused. Separate from `flash`, which every other action
+    /// (resume, run, decide) still uses: a refusal here has to leave `draft`
+    /// on screen, which `flash`'s always-clears-after-a-timer behaviour
+    /// cannot do.
+    @State private var fireState: FireFieldState = .idle
     /// Row id the keyboard highlight sits on, nil when nothing is highlighted.
     @State private var highlighted: String?
     @FocusState private var fieldFocused: Bool
@@ -208,9 +259,20 @@ struct MenuView: View {
             controller.refresh()
             // The panel needs to be key before the TextField will take
             // keystrokes, and opening a MenuBarExtra window does not
-            // activate the app on its own.
+            // activate the app on its own -- see `focusQuickFireField`.
             NSApp.activate(ignoringOtherApps: true)
-            fieldFocused = true
+            focusQuickFireField()
+        }
+        .onChange(of: controller.summonTick) { _, _ in
+            // A cached, reused panel (StatusController.showHotkeyPanel keeps
+            // one and re-shows it) never re-fires .onAppear after its first
+            // show, which is exactly why \u{2325}Q used to focus once and go
+            // silent on every summon after. This tick is bumped on every
+            // summon, cached panel or not, so the dance below always
+            // reruns. Harmless for the real dropdown's own MenuView, which
+            // observes the same controller: writing @FocusState on a
+            // window that is not key has no visible effect.
+            focusQuickFireField()
         }
         .onKeyPress(.downArrow) { moveHighlight(1) }
         .onKeyPress(.upArrow) { moveHighlight(-1) }
@@ -358,8 +420,9 @@ struct MenuView: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .focused($fieldFocused)
+                    .disabled(fireState.isFiring)
                     .onSubmit(send)
-                if !draft.isEmpty {
+                if !draft.isEmpty, !fireState.isFiring {
                     Button(action: send) {
                         Image(systemName: "return")
                             .font(.system(size: 10, weight: .semibold))
@@ -369,6 +432,12 @@ struct MenuView: View {
                     .help(controller.fireToPass ? "Add to the Pass" : "Queue this task")
                 }
             }
+            if let line = fireStatusLine {
+                Text(line.text)
+                    .font(.system(size: 11))
+                    .foregroundStyle(line.isError ? Color.red : Color.secondary)
+                    .lineLimit(2)
+            }
             HStack(spacing: 7) {
                 Picker("", selection: $controller.fireToPass) {
                     Text("Run now").tag(false)
@@ -377,6 +446,7 @@ struct MenuView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .controlSize(.small)
+                .disabled(fireState.isFiring)
                 .help("Run now fires it with qt, in the chip's folder. To Pass files it "
                       + "as an item needing your go. Tab swaps the two; \u{2318}1/\u{2318}2 "
                       + "pick one directly; \u{2318}\u{21A9} fires the other one once.")
@@ -388,6 +458,22 @@ struct MenuView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+    }
+
+    /// The line drawn under quick-fire's field for `fireState`, nil at rest.
+    /// A firing state is worded so nothing reads as done before it is
+    /// ("Firing\u{2026}" / "Sending to the Pass\u{2026}"); a landed one
+    /// names what happened, briefly, before clearing itself; a refused one
+    /// keeps its message on screen -- in red -- until the next fire
+    /// replaces it, because nothing here ever clears it on a timer.
+    private var fireStatusLine: (text: String, isError: Bool)? {
+        switch fireState {
+        case .idle: return nil
+        case .firing(let toPass):
+            return (toPass ? "Sending to the Pass\u{2026}" : "Firing\u{2026}", false)
+        case .success(let text): return (text, false)
+        case .failure(let message): return (message, true)
+        }
     }
 
     /// The quick-search field. Narrows every section at once, including the
@@ -603,10 +689,20 @@ struct MenuView: View {
 
     // MARK: - behaviour
 
+    /// The belt-and-braces focus dance a summon needs: SwiftUI drops an
+    /// `@FocusState` write that lands before the hosting window is actually
+    /// key, and `makeKeyAndOrderFront` returning is not the same moment as
+    /// that becoming true. Setting it once on the next run-loop turn and
+    /// again \u{2248}50ms later catches the ordinary case and the rare one
+    /// where the first attempt loses that race.
+    private func focusQuickFireField() {
+        DispatchQueue.main.async { fieldFocused = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { fieldFocused = true }
+    }
+
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        draft = ""
+        guard !text.isEmpty, !fireState.isFiring else { return }
         fire(rawText: text, toPass: controller.fireToPass)
     }
 
@@ -616,29 +712,58 @@ struct MenuView: View {
     /// one-shot all end up here so a fire is described and dispatched exactly
     /// one way regardless of which key sent it.
     ///
+    /// `draft` is not cleared up front any more -- only `settle(...)` clears
+    /// it, and only on success -- so a refusal leaves the typed text exactly
+    /// where John can fix it or retry, instead of throwing it away the
+    /// moment Return was pressed.
+    ///
     /// To Pass ignores `--in`/`@` outright: the raw, unstripped text goes to
     /// `/capture`, matching `FireResolve.describe`'s own rule that the
     /// directory convention is a Run-now-only thing.
     private func fire(rawText: String, toPass: Bool) {
+        fireState = .firing(toPass: toPass)
+        // The standalone summon panel is the only host that ever closes
+        // itself on a successful fire; the real dropdown never does. This
+        // is the same "am I the panel" signal `clearDraft()` already uses
+        // for Escape.
+        let isPanel = onEscapeExhausted != nil
         if toPass {
             let base = controller.passBase
             controller.perform(key: "capture", { Actions.capture(text: rawText, base: base) }) { outcome in
-                switch outcome {
-                case .success(let id): show(id.isEmpty ? "Added to the Pass" : "Added \(id)")
-                case .failure(let problem): show(problem.message)
-                }
+                let (state, hidesPanel) = FireFieldOutcome.describe(
+                    result: outcome, toPass: true, displayText: rawText, isPanel: isPanel)
+                settle(state, hidesPanel: hidesPanel)
             }
         } else {
             let (prefixDir, stripped) = FireResolve.parsePrefix(rawText)
             let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: controller.settings)
             controller.perform(key: "fire", {
-                Actions.fire(prompt: stripped, in: resolved.url).map { "Queued" }
+                Actions.fire(prompt: stripped, in: resolved.url).map { "" }
             }) { outcome in
-                switch outcome {
-                case .success: show("Queued")
-                case .failure(let problem): show(problem.message)
-                }
+                let (state, hidesPanel) = FireFieldOutcome.describe(
+                    result: outcome, toPass: false, displayText: stripped, isPanel: isPanel)
+                settle(state, hidesPanel: hidesPanel)
             }
+        }
+    }
+
+    /// Lands one fire's outcome on the field. A success clears `draft` right
+    /// away and shows its confirmation for \u{2248}1.2s before clearing
+    /// itself -- closing the panel then too, when `hidesPanel` -- so "type,
+    /// Enter" reads as one completed action. A failure clears nothing and
+    /// schedules nothing: it shows and stays, in red, with the draft intact,
+    /// until the next fire replaces it.
+    private func settle(_ state: FireFieldState, hidesPanel: Bool) {
+        if case .success = state { draft = "" }
+        fireState = state
+        guard case .success = state else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            // Only clear up and close if nothing else -- a fresh fire, the
+            // panel already closing some other way -- has superseded this
+            // one in the meantime.
+            guard fireState == state else { return }
+            fireState = .idle
+            if hidesPanel { onEscapeExhausted?() }
         }
     }
 
@@ -664,10 +789,9 @@ struct MenuView: View {
     /// To Pass" and the opposite without either habit fighting the other's
     /// remembered default.
     private func fireOtherMode() {
-        guard fieldFocused else { return }
+        guard fieldFocused, !fireState.isFiring else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        draft = ""
         fire(rawText: text, toPass: !controller.fireToPass)
     }
 

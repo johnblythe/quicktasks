@@ -2718,3 +2718,208 @@ class TestSummonHotkey(SettingsSuiteCase):
         self.assertIsNone(result["modifiers"])
         self.assertIsNone(result["display"])
         self.assertFalse(result["registered"])
+
+
+# ---------------------------------------------------------------------------
+# LD-201 v7: focus lands on every summon, and the quick-fire field's own
+# firing/fired/failed states.
+# ---------------------------------------------------------------------------
+
+
+class TestSummonFocus(SettingsSuiteCase):
+    """`--dump-summon`: the same toggleHotkeyPanel()/hideHotkeyPanel() calls
+    the real hotkey and Escape make, run without a display or a real
+    RegisterEventHotKey registration (StatusController is built with
+    activatesGlobalHotkey: false, so this never competes with John's own
+    already-running widget for the ⌥Q registration).
+
+    This is the v7 fix's own test: before it, `.onAppear` only ever fired
+    once for the panel's whole lifetime (SwiftUI's hosting view is reused,
+    not rebuilt, on the second and later summons), so focus landed on the
+    first ⌥Q and never again. summonTick's `.onChange` re-running
+    focusQuickFireField() on every summon is what these tests are pinning.
+
+    `is_key` is reported, since that is part of the JSON shape the task
+    asked for, but never asserted strictly true: this sandboxed subprocess
+    has no real window-server session, so `isKeyWindow` reads false here
+    even immediately after `makeKeyAndOrderFront`, confirmed with a
+    throwaway standalone Swift script and independent of anything this
+    fix changed. That is the same environment-dependent gap
+    TestSummonHotkey documents for its own `registered` field, and it gets
+    the same treatment: assert the type, not the value. The deterministic,
+    behaviourally meaningful signal is `first_responder_is_field` -- the
+    real AppKit check a keystroke actually goes through -- and it is what
+    proves the fix."""
+
+    def summon(self, sequence, extra_env=None):
+        return json.loads(
+            self.run_binary("--dump-summon", sequence, extra_env=extra_env).stdout)
+
+    def test_first_summon_focuses_the_field(self):
+        result = self.summon("summon")
+        self.assertEqual(result["tokens"], ["summon"])
+        self.assertTrue(result["panel_visible"])
+        self.assertTrue(result["first_responder_is_field"])
+        self.assertEqual(result["focused_field"], "quick_fire")
+        self.assertIsInstance(result["is_key"], bool)
+
+    def test_a_later_summon_after_a_hide_focuses_again(self):
+        """The bug, reproduced directly: summon, hide, summon again is the
+        shape every real second-or-later ⌥Q takes, and it is exactly the
+        case that stayed unfocused before this fix."""
+        result = self.summon("summon,escape,summon")
+        self.assertEqual(result["tokens"], ["summon", "escape", "summon"])
+        self.assertTrue(result["panel_visible"])
+        self.assertTrue(result["first_responder_is_field"])
+        self.assertEqual(result["focused_field"], "quick_fire")
+
+    def test_four_summons_in_a_row_all_land_focus(self):
+        result = self.summon("summon,escape,summon,escape,summon,escape,summon")
+        self.assertEqual(result["panel_visible"], True)
+        self.assertTrue(result["first_responder_is_field"])
+
+    def test_a_second_summon_with_no_hide_between_toggles_the_panel_away(self):
+        """⌥Q while the panel is already showing hides it -- the summon key
+        is a toggle, not just an opener -- so back-to-back summons with no
+        escape between them must end with the panel gone. Not asserted
+        here: first_responder_is_field. hideHotkeyPanel() only calls
+        orderOut(nil); AppKit does not clear a window's firstResponder just
+        because the window is no longer visible, so the field can still
+        read as first responder on an ordered-out panel. Harmless -- an
+        invisible panel cannot be typed into either way -- but it means
+        that field is not the signal for "did this hide", panel_visible
+        is."""
+        result = self.summon("summon,summon")
+        self.assertEqual(result["tokens"], ["summon", "summon"])
+        self.assertFalse(result["panel_visible"])
+
+    def test_escape_hides_the_panel(self):
+        result = self.summon("summon,escape")
+        self.assertFalse(result["panel_visible"])
+
+
+class TestFireOutcome(PassCase):
+    """`--dump-fire-outcome`: the same FireFieldOutcome.describe() call
+    MenuView's own fire() makes when Enter (or the return-arrow button)
+    sends the quick-fire field, so what the field would show on screen and
+    what this test asserts can never drift apart -- the same guarantee
+    FireResolve.describe already gives `--dump-fire`/`--dump-keys`.
+
+    Subclasses PassCase (not SettingsSuiteCase) for its real-loopback-server
+    fixture, and isolates settings by hand in setUp() the same way
+    SettingsSuiteCase does: FireResolve.runDirectory() reads
+    settings.fireDirOverride, and a stray value sitting in John's real
+    com.quicktasks.menubar domain must not change which directory a
+    run-now fire is launched in.
+
+    Every to-pass case below passes QT_PASS_URL explicitly. Leaving it
+    unset would not disable the Pass feed the way it does for --dump-model:
+    an empty/absent override here still resolves to nil in StoreConfig, and
+    `--dump-fire-outcome` then falls back to Actions.passURL -- the real
+    default http://127.0.0.1:8811/, exactly like the shipping app's own
+    `passBase` does on purpose when nothing else says where The Pass is. On
+    this dev machine that port is a real candidate for John's own live
+    Pass, so a to-pass test that forgot the override could actually POST to
+    it. Run-now failure is tested by pointing QT_BIN at a directory rather
+    than a missing path: `isExecutableFile(atPath:)` is true for a
+    directory (the traversal bit), so Actions.qtBinary()'s override check
+    passes and short-circuits past every real qt candidate path on this
+    machine -- including ~/code/quicktasks/qt, which this task's
+    constraints forbid touching -- and Process.run() only then throws,
+    trying to execute a directory. That is a deterministic, portable
+    failure with no real qt ever invoked."""
+
+    def setUp(self):
+        super().setUp()
+        self.suite = f"com.quicktasks.menubar.test.{self.tmp.name}"
+        self.addCleanup(subprocess.run, ["defaults", "delete", self.suite],
+                        capture_output=True, text=True)
+
+    def outcome(self, text, mode=None, panel=False, extra_env=None):
+        args = ["--dump-fire-outcome", text]
+        if mode is not None:
+            args += ["--mode", mode]
+        if panel:
+            args += ["--panel"]
+        env = {"QT_MENUBAR_DEFAULTS_SUITE": self.suite}
+        env.update(extra_env or {})
+        return json.loads(self.run_binary(*args, extra_env=env).stdout)
+
+    def stub_qt(self):
+        """A real, safe, throwaway executable -- never the real qt on this
+        machine, never anything under ~/.quicktasks -- so Actions.fire()
+        has something harmless to actually run."""
+        path = self.tmp / "bin" / "qt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        return str(path)
+
+    # --- run now -----------------------------------------------------------
+
+    def test_run_now_success_shows_fired_and_hides_the_panel(self):
+        result = self.outcome("fix the flaky test", mode="run", panel=True,
+                              extra_env={"QT_BIN": self.stub_qt()})
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(result["message"], "Fired: fix the flaky test")
+        self.assertTrue(result["hides_panel"])
+        self.assertFalse(result["is_error"])
+
+    def test_run_now_success_truncates_to_forty_chars(self):
+        result = self.outcome("x" * 60, mode="run", panel=True,
+                              extra_env={"QT_BIN": self.stub_qt()})
+        self.assertEqual(result["message"], "Fired: " + "x" * 40)
+
+    def test_run_now_success_in_the_real_dropdown_never_hides_anything(self):
+        """Without --panel this is the real MenuBarExtra dropdown, which
+        never closes on a fire -- only the standalone summon panel does."""
+        result = self.outcome("fix the flaky test", mode="run", panel=False,
+                              extra_env={"QT_BIN": self.stub_qt()})
+        self.assertEqual(result["state"], "success")
+        self.assertFalse(result["hides_panel"])
+
+    def test_run_now_failure_keeps_the_panel_open_and_shows_the_real_error(self):
+        result = self.outcome("fix the flaky test", mode="run", panel=True,
+                              extra_env={"QT_BIN": str(self.tmp)})
+        self.assertEqual(result["state"], "failure")
+        self.assertTrue(result["is_error"])
+        self.assertFalse(result["hides_panel"])
+        self.assertTrue(result["message"].startswith("could not run qt: "),
+                        result["message"])
+
+    # --- to Pass -------------------------------------------------------------
+
+    def test_to_pass_success_shows_on_the_pass_and_hides_the_panel(self):
+        base = self.serve()
+        result = self.outcome("write the release notes", mode="pass", panel=True,
+                              extra_env={"QT_PASS_URL": base})
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(result["message"], "On the Pass: write the release notes")
+        self.assertTrue(result["hides_panel"])
+        self.assertFalse(result["is_error"])
+        self.assertEqual(len(self.server.posts_to("/capture")), 1)
+
+    def test_to_pass_success_does_not_truncate(self):
+        long_text = "x" * 60
+        base = self.serve()
+        result = self.outcome(long_text, mode="pass", panel=True,
+                              extra_env={"QT_PASS_URL": base})
+        self.assertEqual(result["message"], "On the Pass: " + long_text)
+
+    def test_to_pass_success_in_the_real_dropdown_never_hides_anything(self):
+        base = self.serve()
+        result = self.outcome("write the release notes", mode="pass", panel=False,
+                              extra_env={"QT_PASS_URL": base})
+        self.assertEqual(result["state"], "success")
+        self.assertFalse(result["hides_panel"])
+
+    def test_to_pass_failure_keeps_the_panel_open_and_shows_the_real_error(self):
+        """The same guaranteed-refused 127.0.0.1:1 loopback port this file
+        already uses elsewhere for an unreachable Pass -- never John's real
+        8811."""
+        result = self.outcome("write the release notes", mode="pass", panel=True,
+                              extra_env={"QT_PASS_URL": "http://127.0.0.1:1"})
+        self.assertEqual(result["state"], "failure")
+        self.assertTrue(result["is_error"])
+        self.assertFalse(result["hides_panel"])
+        self.assertEqual(result["message"], "the Pass is not answering")

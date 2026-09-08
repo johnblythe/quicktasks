@@ -118,16 +118,34 @@ chip remembers. Resolution order, highest first: the typed prefix, then
 **Summon hotkey.** A global shortcut -- `⌥Q` by default, changeable (or
 clearable) in Settings -- opens quick-fire from anywhere: it shows the panel,
 brings the app forward, and focuses the field, so typing can start
-immediately. `⏎` fires with whichever mode is currently selected; `⎋` closes
-the panel; pressing the hotkey again while it is showing closes it too. It is
-registered with Carbon's `RegisterEventHotKey`, the same mechanism menu-bar
-utilities have used for years, specifically so this needs no Accessibility or
-Input Monitoring permission -- unlike `NSEvent.addGlobalMonitorForEvents`,
-which would ask for one. Because SwiftUI's `MenuBarExtra` has no supported way
-to trigger its own dropdown from code, the summon hotkey opens a separate
-floating window hosting the same quick-fire view rather than the real
-menu-bar dropdown; clicking the menu-bar dot still opens the real dropdown
-exactly as before, unchanged.
+immediately. That focus lands the same way on every summon, not just the
+first: the panel is activated and made a real key window before
+`@FocusState` is set, and it is set twice -- once on the next run-loop turn,
+once again ~50ms later as belt-and-braces -- because SwiftUI silently drops
+a `@FocusState` write made before its hosting window is actually key. `⏎`
+fires with whichever mode is currently selected, then hides the panel; `⎋`
+closes it; pressing the hotkey again while it is showing closes it too. It
+is registered with Carbon's `RegisterEventHotKey`, the same mechanism
+menu-bar utilities have used for years, specifically so this needs no
+Accessibility or Input Monitoring permission -- unlike
+`NSEvent.addGlobalMonitorForEvents`, which would ask for one. Because
+SwiftUI's `MenuBarExtra` has no supported way to trigger its own dropdown
+from code, the summon hotkey opens a separate floating window hosting the
+same quick-fire view rather than the real menu-bar dropdown; clicking the
+menu-bar dot still opens the real dropdown exactly as before, unchanged.
+
+**Firing feedback.** The quick-fire field never leaves you unsure whether a
+fire took: pressing return disables the field and the mode toggle and shows
+"Firing…" (Run now) or "Sending to the Pass…" (To Pass) in place of the hint
+caption. On success it shows "Fired: \<first 40 characters\>" (Run now) or
+"On the Pass: \<full text\>" (To Pass, never truncated) for about 1.2
+seconds, then clears the field -- and, in the summon panel only, hides it
+too; the real dropdown never closes on a fire. On failure the field stays
+exactly as typed, disabled state lifts, and the same message space shows the
+refusal in red -- "qt not found; run install.sh", "could not run qt: …", "the
+Pass is not answering" -- until the next attempt replaces it. These states
+are shared by the summon panel and the real dropdown's own quick-fire field,
+since both host the same view.
 
 **Sections.** Running, Needs you, Done today, Earlier. Click a header to
 collapse it; the state is remembered in `UserDefaults`. Only Earlier starts
@@ -189,7 +207,7 @@ model's time.
 | Tab | (in the quick-fire field) Flips Run now/To Pass and remembers the flip. |
 | ⌘1 / ⌘2 | (in the quick-fire field) Selects Run now/To Pass directly. |
 | ⌘⏎ | (in the quick-fire field) Fires with the other mode once, without moving the remembered default. |
-| ⌥Q (configurable) | Summons the panel from anywhere, even while some other app is focused; pressing it again while showing closes it. |
+| ⌥Q (configurable) | Summons the panel from anywhere, even while some other app is focused, and focuses the quick-fire field every time; pressing it again while showing closes it. |
 
 The quick-fire field owns the arrows and return while it has focus, which is
 what keeps "type, press return, task fired" working. The first arrow key the
@@ -430,6 +448,8 @@ QuicktaskStatus --dump-keys tab,cmd-return \
 QuicktaskStatus --dump-fire "--in ~/code/hub fix it"   # the resolved argv or /capture body
 QuicktaskStatus --dump-fire "call dan" --mode pass
 QuicktaskStatus --dump-hotkey                    # the registered summon shortcut, and whether it took
+QuicktaskStatus --dump-summon summon,escape,summon   # drives the real ⌥Q/Escape code path, headless
+QuicktaskStatus --dump-fire-outcome "call dan" --mode pass --panel   # what the field would show, no display
 QuicktaskStatus --dump-recent-dirs               # the chip's recency menu, off the qt ledger
 QuicktaskStatus --post-run <id>                  # really fire an item through POST /run
 QuicktaskStatus --dump-restart                   # the POST /restart request: method, path, Origin
@@ -471,7 +491,19 @@ the To-Pass side, which ignores any directory entirely. `--dump-hotkey`
 registers and immediately unregisters its own copy of the summon shortcut
 and prints the key code, modifiers, display string, and whether registration
 actually succeeded, without touching a real running widget's own
-registration. `--dump-recent-dirs` prints the directory chip's recency menu,
+registration. `--dump-summon <tokens>` drives `toggleHotkeyPanel()` and
+`hideHotkeyPanel()` directly -- the same calls the real hotkey and Escape
+make -- through a comma-separated sequence of `summon`/`escape` tokens, and
+reports whether the panel is visible, key, and has the quick-fire field as
+its first responder after each one; it is how the LD-201 v7 fix (focus
+landing on every summon, not only the first) is tested without a display.
+`--dump-fire-outcome <text> [--mode run|pass] [--panel]` really performs the
+fire against whatever `QT_BIN`/`QT_PASS_URL` the environment points at, then
+runs the result through the same `FireFieldOutcome.describe()` the quick-fire
+field itself calls, so the printed state/message/`hides_panel` can never
+drift from what the field would show; `--panel` reports as the standalone
+summon panel (which closes on a successful fire) rather than the real
+dropdown (which never does). `--dump-recent-dirs` prints the directory chip's recency menu,
 read off `run_cwd` in the `qt` task ledger. `--post-run` is the one seam that
 really posts: it fires an item through `POST /run` against whatever
 `QT_PASS_URL` points at, and exits non-zero with the widget's own wording for a
@@ -505,9 +537,10 @@ the remembered settings without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-227 tests in `tests/test_menubar_model.py` (239 across the whole suite, 12 of
-them new for the v6 discovery precedence and the last-good-model hold). They
-build the app and drive the
+240 tests in `tests/test_menubar_model.py` (252 across the whole suite, 13 of
+them new for LD-201 v7: focus landing on every summon rather than only the
+first, and the quick-fire field's firing/fired/failed states). They build the
+app and drive the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in

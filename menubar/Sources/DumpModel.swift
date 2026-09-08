@@ -32,6 +32,7 @@
 // pinning the Origin header without a live Pass.
 
 import Foundation
+import AppKit
 
 enum DumpModel {
     static func run(args: [String]) -> Int32 {
@@ -467,6 +468,122 @@ enum DumpModel {
         let toPass = value(args, "--mode") == "pass"
         let config = StoreConfig.resolve()
         return emit(FireResolve.describe(text: text, toPass: toPass, settings: config.settings))
+    }
+
+    /// `--dump-summon <sequence>`: drives the real, non-Carbon half of the
+    /// hotkey path -- `toggleHotkeyPanel`/`hideHotkeyPanel` on a real,
+    /// headless `StatusController` -- and reads back what a live \u{2325}Q
+    /// actually left on screen. `--dump-hotkey` only checks whether
+    /// RegisterEventHotKey took the combo; this is the seam for whether
+    /// summoning it focuses anything, which is the bug LD-201 v7 exists to
+    /// fix: a panel `showHotkeyPanel` caches and reuses only ever runs its
+    /// view's one-shot `.onAppear` once, so every summon after the first
+    /// used to land no focus at all.
+    ///
+    /// Tokens, comma-separated: `summon` (one \u{2325}Q -- `toggleHotkeyPanel`,
+    /// which shows the panel or hides it if already showing, exactly like a
+    /// second real press) and `escape` (`hideHotkeyPanel` directly -- what
+    /// the panel's own Escape does once draft/search/highlight are already
+    /// empty, which they are in a freshly summoned one). Each token is
+    /// followed by a short real run-loop spin so the async focus dance
+    /// (`DispatchQueue.main.async`, then +50ms) has actually landed before
+    /// the next token or the final read.
+    ///
+    /// `first_responder_is_field` reads `NSWindow.firstResponder is NSText`
+    /// rather than anything SwiftUI-private: a freshly summoned panel has
+    /// exactly one focusable control, so that is what actually distinguishes
+    /// "focus landed" from "the window is merely key."
+    static func runSummon(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--dump-summon"), i + 1 < args.count,
+              !args[i + 1].hasPrefix("--") else {
+            return fail("--dump-summon needs a comma-separated token sequence (summon, escape)")
+        }
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let controller = StatusController(interval: 3600, activatesGlobalHotkey: false)
+
+        func settle(_ seconds: TimeInterval = 0.3) {
+            RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+        }
+
+        var seen: [String] = []
+        for token in args[i + 1].split(separator: ",") {
+            let name = token.trimmingCharacters(in: .whitespaces).lowercased()
+            guard !name.isEmpty else { continue }
+            switch name {
+            case "summon":
+                controller.toggleHotkeyPanel()
+                settle()
+            case "escape":
+                controller.hideHotkeyPanel()
+                settle(0.1)
+            default:
+                return fail("unknown token: \(name) (summon, escape)")
+            }
+            seen.append(name)
+        }
+
+        let panel = controller.summonPanel
+        let isField = panel?.firstResponder is NSText
+        return emit([
+            "tokens": seen,
+            "panel_visible": panel?.isVisible ?? false,
+            "is_key": panel?.isKeyWindow ?? false,
+            "first_responder_is_field": isField,
+            "focused_field": isField ? "quick_fire" : NSNull(),
+            "mode": controller.fireToPass ? "pass" : "run",
+        ])
+    }
+
+    /// `--dump-fire-outcome <text> [--mode run|pass] [--panel]`: really
+    /// performs the fire -- `Actions.fire`/`Actions.capture` against
+    /// whatever QT_BIN/QT_PASS_URL the environment points at -- and reports
+    /// the exact state and panel-hide decision MenuView's own quick-fire
+    /// field lands on, both computed by `FireFieldOutcome.describe`: the one
+    /// place that logic lives, so this seam and the live field can never
+    /// disagree. Exists because `--dump-fire` only describes what a fire
+    /// *would* send, not what the field shows once one actually lands or
+    /// fails.
+    ///
+    /// `--panel` reports as the standalone summon panel would (a success
+    /// closes it); omitted, reports as the real dropdown would (a fire never
+    /// closes that).
+    static func runFireOutcome(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--dump-fire-outcome"), i + 1 < args.count else {
+            return fail("--dump-fire-outcome needs some text")
+        }
+        let text = args[i + 1]
+        let toPass = value(args, "--mode") == "pass"
+        let isPanel = args.contains("--panel")
+        let config = StoreConfig.resolve()
+
+        let result: Result<String, Problem>
+        let displayText: String
+        if toPass {
+            let base = config.passURL ?? Actions.passURL
+            result = Actions.capture(text: text, base: base)
+            displayText = text
+        } else {
+            let (prefixDir, stripped) = FireResolve.parsePrefix(text)
+            let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: config.settings)
+            result = Actions.fire(prompt: stripped, in: resolved.url).map { "" }
+            displayText = stripped
+        }
+        let (state, hidesPanel) = FireFieldOutcome.describe(
+            result: result, toPass: toPass, displayText: displayText, isPanel: isPanel)
+        let (kind, message): (String, String) = {
+            switch state {
+            case .idle: return ("idle", "")
+            case .firing: return ("firing", "")
+            case .success(let text): return ("success", text)
+            case .failure(let text): return ("failure", text)
+            }
+        }()
+        return emit([
+            "state": kind,
+            "message": message,
+            "hides_panel": hidesPanel,
+            "is_error": kind == "failure",
+        ])
     }
 
     /// `--dump-hotkey`: the registered summon shortcut -- key code, modifiers,
