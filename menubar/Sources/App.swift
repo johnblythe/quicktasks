@@ -60,9 +60,23 @@ final class StatusController: ObservableObject {
     /// has to activate itself before a window it opens will take a keystroke.
     private var settingsWindow: NSWindow?
 
+    /// The summon shortcut, registered in `init` and re-registered by `apply`
+    /// whenever the combo changes. nil for every `StatusController` built by
+    /// `--snapshot`, `--snapshot-settings`, and `--dump-layout` -- those pass
+    /// `activatesGlobalHotkey: false` because a measuring/rendering process
+    /// has no business claiming a global shortcut out from under a real,
+    /// already-running widget.
+    private var globalHotkey: GlobalHotkey?
+
+    /// The window the global hotkey shows. See `showHotkeyPanel` for why this
+    /// is a second window rather than a simulated click on the MenuBarExtra's
+    /// own dropdown.
+    private var hotkeyPanel: NSPanel?
+
     init(config: StoreConfig = .resolve(),
          interval: TimeInterval? = nil,
-         defaults: UserDefaults = Keys.store()) {
+         defaults: UserDefaults = Keys.store(),
+         activatesGlobalHotkey: Bool = true) {
         self.config = config
         self.defaults = defaults
         // The settings window's poll interval, unless a caller pinned one --
@@ -104,11 +118,18 @@ final class StatusController: ObservableObject {
         // Now go ask The Pass, off the main thread. The window between the
         // file model and the first Pass answer is one refresh long.
         refresh()
+
+        if activatesGlobalHotkey {
+            let hotkey = GlobalHotkey { [weak self] in self?.toggleHotkeyPanel() }
+            hotkey.register(config.settings.hotkeyCombo)
+            globalHotkey = hotkey
+        }
     }
 
     deinit {
         poll?.invalidate()
         ticker?.invalidate()
+        globalHotkey?.unregister()
     }
 
     var hasLiveRows: Bool { model.records.contains { $0.status.isActive } }
@@ -164,9 +185,11 @@ final class StatusController: ObservableObject {
     /// that never gets round to polling while it is being configured.
     func apply(_ new: Settings) {
         let oldInterval = config.settings.pollInterval
+        let oldCombo = config.settings.hotkeyCombo
         new.save(defaults)
         config = StoreConfig.resolve(settings: new)
         if abs(new.pollInterval - oldInterval) > 0.01 { restartPoll(new.pollInterval) }
+        if new.hotkeyCombo != oldCombo { globalHotkey?.register(new.hotkeyCombo) }
         refresh()
     }
 
@@ -203,6 +226,93 @@ final class StatusController: ObservableObject {
         settingsWindow = window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: - global summon
+
+    /// Shows the same quick-fire view the MenuBarExtra dropdown shows, in a
+    /// standalone floating panel.
+    ///
+    /// A MenuBarExtra's own dropdown is not something this can drive by
+    /// itself: NSStatusBar's public API exposes the status item's button, not
+    /// the window the dropdown opens, and NSApp.windows only lists that window
+    /// *after* something has already opened it -- there is no supported way
+    /// to call `performClick` on a button and land the click's effect before
+    /// the button exists to click. Chasing that with private API would trade
+    /// a real feature for one a point release of macOS could silently break.
+    /// So the summon hotkey hosts `MenuView` a second time in a panel built
+    /// for exactly this: `.utilityWindow` so it floats above normal windows,
+    /// `isFloatingPanel` and `becomesKeyOnlyIfNeeded = false` so it can take
+    /// keyboard focus without a click, `hidesOnDeactivate = false` so
+    /// switching apps does not yank it away mid-type. The real dropdown is
+    /// untouched: clicking the status-bar dot still opens it exactly as
+    /// before, and this panel is a second, independent window layered above
+    /// whatever else is on screen -- not a replacement for it.
+    ///
+    /// Known limits: this is a second window, not the real dropdown, so it
+    /// does not sit visually anchored under the status item the way the real
+    /// dropdown does (see `positionNearStatusItem`); and because it has its
+    /// own title bar (hidden here, but still AppKit chrome underneath), a
+    /// screen reader or window switcher sees it as a distinct window titled
+    /// "Quicktask Quick Fire" rather than as the menu-bar extra's dropdown.
+    func showHotkeyPanel() {
+        if let panel = hotkeyPanel {
+            NSApp.activate(ignoringOtherApps: true)
+            positionNearStatusItem(panel)
+            panel.makeKeyAndOrderFront(nil)
+            return
+        }
+        let view = MenuView(controller: self, onEscapeExhausted: { [weak self] in
+            self?.hideHotkeyPanel()
+        })
+        let hosting = NSHostingView(rootView: view)
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: MenuView.panelWidth, height: 420),
+                            styleMask: [.titled, .closable, .fullSizeContentView, .utilityWindow],
+                            backing: .buffered,
+                            defer: false)
+        panel.title = "Quicktask Quick Fire"
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.level = .floating
+        panel.contentView = hosting
+        hotkeyPanel = panel
+        NSApp.activate(ignoringOtherApps: true)
+        positionNearStatusItem(panel)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    func hideHotkeyPanel() {
+        hotkeyPanel?.orderOut(nil)
+    }
+
+    /// The hotkey's own toggle: press once to summon, press again while it is
+    /// already showing to dismiss it. Checked with `isVisible` rather than a
+    /// separately tracked bool, so a panel the user already closed (its own
+    /// close button, or Escape) is never mistaken for one still open.
+    func toggleHotkeyPanel() {
+        if let panel = hotkeyPanel, panel.isVisible {
+            hideHotkeyPanel()
+        } else {
+            showHotkeyPanel()
+        }
+    }
+
+    /// Best-effort placement at the top-right of the active screen, under the
+    /// menu bar -- the same corner a Spotlight-adjacent utility would use.
+    /// There is no public API for "under the status item" once the panel is
+    /// summoned by a hotkey rather than opened by clicking that item: an
+    /// NSStatusItem's frame is only meaningful relative to its own private
+    /// window, so this does not promise to sit under any particular icon.
+    private func positionNearStatusItem(_ panel: NSPanel) {
+        guard let screen = NSScreen.main else { return }
+        let frame = screen.visibleFrame
+        let size = panel.frame.size
+        let origin = NSPoint(x: frame.maxX - size.width - 12, y: frame.maxY - size.height - 4)
+        panel.setFrameOrigin(origin)
     }
 
     // MARK: - acting
@@ -342,7 +452,15 @@ enum Entry {
               --dump-run <id>         print the POST /run body and exit
               --dump-decision <id> <accept|redo|reject> [comment]
                                       print the POST /save body and exit
-              --dump-keys <seq>       walk the keyboard highlight (e.g. down,down,up)
+              --dump-keys <seq>       walk the keyboard highlight (e.g. down,down,up), or the
+                                      quick-fire mode toggle (tab, cmd-1, cmd-2, cmd-return);
+                                      --mode run|pass seeds the toggle, --draft seeds the text
+              --dump-fire <text> [--mode run|pass]
+                                      print the resolved argv (Run now) or /capture body (To
+                                      Pass) a quick-fire send would use, and exit
+              --dump-hotkey           print the registered summon shortcut and whether
+                                      RegisterEventHotKey took it
+              --dump-recent-dirs      print the directory chip's recent-directory list
               --dump-decide <id> <confirm|deny|go|snooze> [comment]
                                       print the POST /decide body and exit
               --dump-search <query>   print what the quick search matches, and why
@@ -367,7 +485,9 @@ enum Entry {
                                       which overrides \(PassEndpoint.defaultURL).
                                       Empty pins the widget to the file ledgers
               QT_BIN                  path to the qt script
-              QT_MENUBAR_FIRE_DIR     cwd for quick-fired tasks (default $HOME)
+              QT_MENUBAR_FIRE_DIR     cwd for a Run-now fire with no typed --in/@ prefix;
+                                      overrides the directory chip's own last choice
+                                      (default $HOME)
               QT_MENUBAR_AGENT_PLIST  LaunchAgent plist (default ~/Library/LaunchAgents)
             """)
             return
@@ -384,6 +504,15 @@ enum Entry {
         }
         if args.contains("--dump-keys") {
             exit(DumpModel.runKeys(args: args))
+        }
+        if args.contains("--dump-fire") {
+            exit(DumpModel.runFire(args: args))
+        }
+        if args.contains("--dump-hotkey") {
+            exit(DumpModel.runHotkey())
+        }
+        if args.contains("--dump-recent-dirs") {
+            exit(DumpModel.runRecentDirs())
         }
         if args.contains("--dump-decide") {
             exit(DumpModel.runDecidePayload(args: args))

@@ -36,25 +36,14 @@ enum Actions {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
-    /// Directory the fired task records as `invoked_from`. Deliberately $HOME
-    /// and not a trusted dir, so a task fired from the menu bar runs under the
-    /// default permission mode rather than silently escalating. Override with
-    /// QT_MENUBAR_FIRE_DIR if you want quick-fire to land somewhere specific.
-    static func fireDirectory(env: [String: String] = ProcessInfo.processInfo.environment) -> URL {
-        if let dir = env["QT_MENUBAR_FIRE_DIR"], !dir.isEmpty {
-            let url = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-                return url
-            }
-        }
-        return FileManager.default.homeDirectoryForCurrentUser
-    }
-
-    /// Queues a task the same way a shell would: `qt <prompt>`. qt's own
-    /// catch-all branch turns a bare argument list into a queued task.
+    /// Queues a task the same way raycast/quick-task.sh does: `qt --in <dir>
+    /// <prompt>`. `--in` is what makes qt trust the directory the task
+    /// actually meant to run in rather than wherever the widget's own process
+    /// happens to have as its cwd; `dir` comes from `FireResolve`, which is
+    /// also where the widget's own `--in`/`@`-prefix parsing and the
+    /// directory chip's precedence live.
     @discardableResult
-    static func fire(prompt: String) -> Result<Void, Problem> {
+    static func fire(prompt: String, in dir: URL) -> Result<Void, Problem> {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return .failure("nothing to fire") }
         guard let qt = qtBinary() else {
@@ -62,8 +51,8 @@ enum Actions {
         }
         let p = Process()
         p.executableURL = qt
-        p.arguments = [text]
-        p.currentDirectoryURL = fireDirectory()
+        p.arguments = ["--in", dir.path, text]
+        p.currentDirectoryURL = dir
         // qt detaches the run itself, so this returns as soon as it is queued.
         do {
             try p.run()

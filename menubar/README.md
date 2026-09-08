@@ -82,18 +82,52 @@ If you would rather use a login item: System Settings → General → Login Item
 
 **Quick-fire, two ways.** Type into the field at the top and press return. The
 segmented toggle under it decides where the text goes, and the choice is
-remembered:
+remembered. `Tab` flips it without touching the field; `⌘1`/`⌘2` select Run
+now/To Pass directly; `⌘⏎` fires with whichever mode is *not* currently
+selected, once, without moving the remembered default -- the hint caption
+under the field ("Tab swaps · ⌘⏎ fires the other way") is there so this is
+never a party trick you have to remember.
 
 - **Run now** shells out to `qt <your text>`, the same entry point a terminal
   uses, so the task lands in the same ledger with the same notification and
-  resume behaviour. It runs with `$HOME` as the working directory, deliberately
-  *not* one of the trusted dirs, so a menu-bar task runs under the default
-  permission mode instead of silently escalating. Point it somewhere else with
-  `QT_MENUBAR_FIRE_DIR`.
+  resume behaviour. The directory it runs in is deliberately *not* one of the
+  trusted dirs by default, so a menu-bar task runs under the default
+  permission mode instead of silently escalating -- see **The directory
+  chip** below for where that directory actually comes from and how to change
+  it per fire, not just globally.
 - **To Pass** posts to `POST /capture`, which files it as an item needing your
   go rather than running it. The flash message names the id The Pass assigned
   (`cap-20260904-153933-7ab83a9`). Text over 4000 characters is refused here
-  rather than sent, since the route answers 400 for it.
+  rather than sent, since the route answers 400 for it. To Pass ignores the
+  directory chip and any typed `--in`/`@` prefix outright: the raw text,
+  prefix included, goes to `/capture` unstripped, because a gate item has no
+  directory field to put one in.
+
+**The directory chip**, next to the mode toggle, shows the directory Run now
+will use, `~`-abbreviated, and dims when To Pass is selected since it does
+not apply there. Clicking it opens a menu of the eight most recently used
+directories (read off `run_cwd` in the `qt` task ledger, most recent first),
+plus **Choose…** (pick any folder) and **Reset to default**. The chosen
+directory is remembered across launches. You can also just type it: a prefix
+of `--in <dir> ` or `@<dir> ` at the start of the field -- the same
+convention `raycast/quick-task.sh` uses -- fires that one time in `<dir>` and
+is stripped before the rest of the text is sent, without changing what the
+chip remembers. Resolution order, highest first: the typed prefix, then
+`QT_MENUBAR_FIRE_DIR`, then the chip's own last choice, then `$HOME`.
+
+**Summon hotkey.** A global shortcut -- `⌥Q` by default, changeable (or
+clearable) in Settings -- opens quick-fire from anywhere: it shows the panel,
+brings the app forward, and focuses the field, so typing can start
+immediately. `⏎` fires with whichever mode is currently selected; `⎋` closes
+the panel; pressing the hotkey again while it is showing closes it too. It is
+registered with Carbon's `RegisterEventHotKey`, the same mechanism menu-bar
+utilities have used for years, specifically so this needs no Accessibility or
+Input Monitoring permission -- unlike `NSEvent.addGlobalMonitorForEvents`,
+which would ask for one. Because SwiftUI's `MenuBarExtra` has no supported way
+to trigger its own dropdown from code, the summon hotkey opens a separate
+floating window hosting the same quick-fire view rather than the real
+menu-bar dropdown; clicking the menu-bar dot still opens the real dropdown
+exactly as before, unchanged.
 
 **Sections.** Running, Needs you, Done today, Earlier. Click a header to
 collapse it; the state is remembered in `UserDefaults`. Only Earlier starts
@@ -152,6 +186,10 @@ model's time.
 | ↓ / ↑ | Moves a highlight through the visible rows. The ends do not wrap. |
 | ⏎ | Takes the highlighted row's primary action: resume if there is a session, else the item's deep link. |
 | ⎋ | Clears the quick-fire field, then the highlight. |
+| Tab | (in the quick-fire field) Flips Run now/To Pass and remembers the flip. |
+| ⌘1 / ⌘2 | (in the quick-fire field) Selects Run now/To Pass directly. |
+| ⌘⏎ | (in the quick-fire field) Fires with the other mode once, without moving the remembered default. |
+| ⌥Q (configurable) | Summons the panel from anywhere, even while some other app is focused; pressing it again while showing closes it. |
 
 The quick-fire field owns the arrows and return while it has focus, which is
 what keeps "type, press return, task fired" working. The first arrow key the
@@ -348,6 +386,12 @@ QuicktaskStatus --dump-run <id>                  # the POST /run body
 QuicktaskStatus --dump-decision <id> accept      # the POST /save body
 QuicktaskStatus --dump-decision <id> redo "note"
 QuicktaskStatus --dump-keys down,down,up         # where the keyboard highlight lands
+QuicktaskStatus --dump-keys tab,cmd-return \
+  --mode pass --draft "fix it"                   # the mode flip, and what ⌘⏎ would fire
+QuicktaskStatus --dump-fire "--in ~/code/hub fix it"   # the resolved argv or /capture body
+QuicktaskStatus --dump-fire "call dan" --mode pass
+QuicktaskStatus --dump-hotkey                    # the registered summon shortcut, and whether it took
+QuicktaskStatus --dump-recent-dirs               # the chip's recency menu, off the qt ledger
 QuicktaskStatus --post-run <id>                  # really fire an item through POST /run
 QuicktaskStatus --dump-restart                   # the POST /restart request: method, path, Origin
 QuicktaskStatus --post-restart                   # really POST /restart and print the outcome
@@ -367,7 +411,20 @@ fallback if that target did not answer; every other source still makes no
 request, so most of discovery stays testable without depending on what is
 really listening. `--dump-keys` walks the highlight over the visible rows
 (default collapse, as a freshly opened menu would show them) and prints where
-it lands and what return would do there. `--post-run` is the one seam that
+it lands and what return would do there; `tab`, `cmd-1`, `cmd-2`, and
+`cmd-return` drive the same mode flip and one-shot other-mode fire the field's
+own hotkeys do, with `--mode` seeding which side it starts on and `--draft`
+seeding the text `cmd-return` would fire. `--dump-fire <text>` prints exactly
+what a Run-now or To-Pass fire of that text would do -- the resolved `argv`
+(directory, its source, and the stripped text) or the `/capture` body --
+through the same `FireResolve.describe()` that `cmd-return` calls, so the two
+can never describe a fire two different ways; `--mode pass` switches it to
+the To-Pass side, which ignores any directory entirely. `--dump-hotkey`
+registers and immediately unregisters its own copy of the summon shortcut
+and prints the key code, modifiers, display string, and whether registration
+actually succeeded, without touching a real running widget's own
+registration. `--dump-recent-dirs` prints the directory chip's recency menu,
+read off `run_cwd` in the `qt` task ledger. `--post-run` is the one seam that
 really posts: it fires an item through `POST /run` against whatever
 `QT_PASS_URL` points at, and exits non-zero with the widget's own wording for a
 409. `--dump-restart` prints the `POST /restart` request -- method, path, and
@@ -386,12 +443,12 @@ Environment:
 | `QT_HUB` | `config.json`'s `hub_dir` | hub checkout; empty means the hub feed is off. Also where `.pass-url` is read from |
 | `QT_PASS_URL` | `<hub>/.pass-url`, else `http://127.0.0.1:8811` | The Pass's base URL; empty pins the widget to the file ledgers |
 | `QT_BIN` | `~/.local/bin/qt` and friends | path to the `qt` script |
-| `QT_MENUBAR_FIRE_DIR` | `$HOME` | working directory for quick-fired tasks |
+| `QT_MENUBAR_FIRE_DIR` | the directory chip's own choice, else `$HOME` | working directory for quick-fired tasks; outranks the chip, loses to a typed `--in`/`@` prefix |
 | `QT_MENUBAR_AGENT_PLIST` | `~/Library/LaunchAgents/…` | LaunchAgent path the login switch reads and writes |
-| `QT_MENUBAR_DEFAULTS_SUITE` | the app's own | preferences domain for the remembered collapse and toggle state |
+| `QT_MENUBAR_DEFAULTS_SUITE` | the app's own | preferences domain for every stored setting -- the remembered collapse/toggle state, the directory chip's last choice, and the summon hotkey combo |
 
 The last two exist so a test or a snapshot can exercise the login read-back and
-the remembered UI state without touching the real ones.
+the remembered settings without touching the real ones.
 
 ## Tests
 
@@ -399,8 +456,9 @@ the remembered UI state without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-190 tests in `tests/test_menubar_model.py` (202 across the whole suite). They
-build the app and drive the
+215 tests in `tests/test_menubar_model.py` (227 across the whole suite, 25 of
+them new for the mode hotkeys, the summon hotkey, and the fire directory).
+They build the app and drive the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in
@@ -418,9 +476,14 @@ that is not a status payload, the Pass/ledger merge in both directions, capture
 and decisions payload construction including the carry-forward of unreconciled
 decisions and the capture length limit, section membership and collapse
 defaults, aggregate precedence, resume affordances, both file dedup directions,
-staleness resolution, hub-feed-off, limit trimming, malformed input, and one
-read-only pass over the machine's actual ledgers asserting only invariants that
-hold for any real state.
+staleness resolution, hub-feed-off, limit trimming, malformed input, the
+mode-swap keys' flips and one-shot other-mode fire in both starting modes, the
+fire directory's full precedence order down to an invalid prefix falling
+through, To Pass's refusal to carry a directory at all, the recent-dirs list's
+dedup/order/cap, the summon hotkey's default and an overridden combo each in
+their own isolated preferences suite so neither can read or write the real
+widget's settings, and one read-only pass over the machine's actual ledgers
+asserting only invariants that hold for any real state.
 
 `TestRealStatusSample` and `TestStatusV2Sample` hold real `/status.json` bodies
 verbatim, as raw bytes rather than rebuilt from the test helpers, so the suite
@@ -458,8 +521,10 @@ The module skips rather than fails when `swiftc` is unavailable.
 | `Sources/MenuView.swift` | The dropdown |
 | `Sources/MenuBarIcon.swift` | The menu-bar dot and count |
 | `Sources/App.swift` | Entry point, polling controller, `MenuBarExtra` scene |
-| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--post-run`, `--dump-restart`, `--post-restart` |
-| `Sources/Snapshot.swift` | `--snapshot` |
+| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--dump-restart`, `--post-restart` |
+| `Sources/Snapshot.swift` | `--snapshot`, `--snapshot-settings` |
+| `Sources/Hotkey.swift` | Carbon global hotkey registration, the mode-swap keys, the recorder control in Settings |
+| `Sources/FireResolve.swift` | What a fire actually does: directory precedence, `--in`/`@` prefix parsing, the recent-dirs list, and the shared description `--dump-fire` and ⌘⏎ both call |
 | `build.sh` | Compile, bundle, sign, install, optionally register the agent |
 | `com.quicktasks.menubar.plist` | LaunchAgent template, shared by `build.sh` and the toggle |
 

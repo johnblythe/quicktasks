@@ -21,7 +21,7 @@ enum Snapshot {
     static func runSettings(path: String) -> Int32 {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
-        let controller = StatusController(interval: 3600)
+        let controller = StatusController(interval: 3600, activatesGlobalHotkey: false)
         return render(NSHostingView(rootView: SettingsView(controller: controller)),
                       width: SettingsView.windowWidth,
                       minHeight: 320,
@@ -35,7 +35,7 @@ enum Snapshot {
 
         // A long interval: the initial synchronous load in init() is the data
         // we want, and a polling timer would only add churn during rendering.
-        let controller = StatusController(interval: 3600)
+        let controller = StatusController(interval: 3600, activatesGlobalHotkey: false)
         return render(NSHostingView(rootView: MenuView(controller: controller)),
                       width: width,
                       minHeight: 140,

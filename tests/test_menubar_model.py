@@ -15,8 +15,14 @@ them, because payload construction is the part of an HTTP client most worth
 pinning down and the part least worth a live server to check. `--dump-endpoint`
 prints where the widget would look for The Pass without making a request, which
 is the only way to test discovery without depending on what is really listening
-on 8811. `--dump-keys` walks the keyboard highlight over the visible rows, so
-the keyboard is tested without a display. And FixturePass stands up a real
+on 8811. `--dump-keys` walks the keyboard highlight over the visible rows, and
+(LD-201 v5) now also drives Tab/⌘1/⌘2/⌘↩'s mode-swap logic and
+its one-shot "fire the other way," so the keyboard is tested without a display.
+`--dump-fire` and `--dump-keys`'s own ⌘↩ case both call
+FireResolve.describe(), so a fire is described the same way from either seam;
+`--dump-recent-dirs` reads the directory chip's recency menu off a fixture qt
+ledger; and `--dump-hotkey` reads the registered summon shortcut and whether
+RegisterEventHotKey actually took it. And FixturePass stands up a real
 loopback server on an ephemeral port, so the /status.json path is exercised end
 to end -- transport, parse, join, merge -- and so is the fallback when nothing
 answers, and so is the one seam that really posts (`--post-run`, whose 409 is
@@ -2243,3 +2249,274 @@ class TestDecideRoundTrip(PassCase):
         posts = self.server.posts_to("/decide")
         self.assertEqual(len(posts), 1)
         self.assertNotIn("Origin", posts[0]["headers"])
+
+
+# ---------------------------------------------------------------------------
+# LD-201 v5: mode-swap hotkeys, the directory chip, and the summon shortcut.
+# ---------------------------------------------------------------------------
+
+
+class SettingsSuiteCase(ModelCase):
+    """Base for anything that reads or writes Settings through UserDefaults --
+    the directory chip's remembered choice, the summon hotkey combo.
+    Settings.load() falls back to `.standard` (the real com.quicktasks.menubar
+    domain) whenever QT_MENUBAR_DEFAULTS_SUITE is unset, and by the time this
+    ships John's real, already-running widget may well have its own
+    fireDirOverride or hotkeyCombo sitting in exactly that domain. So every
+    test here gets QT_MENUBAR_DEFAULTS_SUITE pointed at a private suite, one
+    per test method (named off the test's own already-unique tmp dir) --
+    the same isolation _SUGGEST_DEFAULTS_ENV uses further down, except this
+    one also needs to *write* settings, and there is no Swift seam for that,
+    so it shells out to the real `defaults` CLI against the plist file
+    directly."""
+
+    def setUp(self):
+        super().setUp()
+        self.suite = f"com.quicktasks.menubar.test.{self.tmp.name}"
+        self.addCleanup(subprocess.run, ["defaults", "delete", self.suite],
+                        capture_output=True, text=True)
+
+    def run_binary(self, *args, extra_env=None, expect=0):
+        env = {"QT_MENUBAR_DEFAULTS_SUITE": self.suite}
+        env.update(extra_env or {})
+        return super().run_binary(*args, extra_env=env, expect=expect)
+
+    def write_default(self, key, kind, value):
+        subprocess.run(["defaults", "write", self.suite, key, kind, str(value)],
+                       check=True, capture_output=True, text=True)
+
+
+class TestModeHotkeys(SettingsSuiteCase):
+    """Tab/⌘1/⌘2/⌘↩ inside quick-fire, via the extended `--dump-keys`: the
+    same toggle logic MenuView's mode control and hidden command-key buttons
+    drive, exercised without a display. Subclasses SettingsSuiteCase (rather
+    than plain ModelCase) because a bare ⌘↩ with no `--in`/`@` prefix falls
+    through to the directory chip, which reads Settings.fireDirOverride --
+    and that must not depend on whatever is sitting in John's real
+    com.quicktasks.menubar domain."""
+
+    def keys(self, sequence, mode=None, draft=None):
+        args = ["--dump-keys", sequence]
+        if mode is not None:
+            args += ["--mode", mode]
+        if draft is not None:
+            args += ["--draft", draft]
+        return json.loads(self.run_binary(*args).stdout)
+
+    def test_tab_flips_run_now_to_to_pass(self):
+        self.assertEqual(self.keys("tab")["mode"], "pass")
+
+    def test_two_tabs_flip_back_to_run_now(self):
+        self.assertEqual(self.keys("tab,tab")["mode"], "run")
+
+    def test_cmd_1_selects_run_now_from_to_pass(self):
+        self.assertEqual(self.keys("cmd-1", mode="pass")["mode"], "run")
+
+    def test_cmd_1_is_a_no_op_already_on_run_now(self):
+        self.assertEqual(self.keys("cmd-1")["mode"], "run")
+
+    def test_cmd_2_selects_to_pass_from_run_now(self):
+        self.assertEqual(self.keys("cmd-2")["mode"], "pass")
+
+    def test_cmd_2_is_a_no_op_already_on_to_pass(self):
+        self.assertEqual(self.keys("cmd-2", mode="pass")["mode"], "pass")
+
+    def test_cmd_return_fires_the_other_mode_without_moving_the_toggle(self):
+        """The one-shot fire: the stored toggle stays exactly where it
+        started (Run now), and the fired payload describes the opposite
+        mode (To Pass) instead."""
+        result = self.keys("cmd-return", draft="fix the flaky test")
+        self.assertEqual(result["mode"], "run")
+        self.assertIsNotNone(result["fired"])
+        self.assertEqual(result["fired"]["mode"], "pass")
+        self.assertEqual(result["fired"]["text"], "fix the flaky test")
+
+    def test_cmd_return_from_to_pass_fires_run_now_without_moving_the_toggle(self):
+        result = self.keys("cmd-return", mode="pass", draft="fix the flaky test")
+        self.assertEqual(result["mode"], "pass")
+        self.assertEqual(result["fired"]["mode"], "run")
+        self.assertEqual(result["fired"]["text"], "fix the flaky test")
+
+    def test_tab_really_moves_the_toggle_unlike_cmd_returns_one_shot(self):
+        """Tab is the persistent flip; only ⌘↩'s own fire is one-shot. A Tab
+        ahead of it proves the two are not the same mechanism wearing two
+        keys."""
+        result = self.keys("tab,cmd-return", draft="ship it")
+        self.assertEqual(result["mode"], "pass")
+        self.assertEqual(result["fired"]["mode"], "run")
+
+    def test_unknown_key_is_refused(self):
+        self.run_binary("--dump-keys", "cmd-3", expect=1)
+
+
+class TestFireDirectory(SettingsSuiteCase):
+    """The directory chip's resolution order, via `--dump-fire`: a typed
+    `--in`/`@` prefix, then QT_MENUBAR_FIRE_DIR, then the chip's own last
+    choice, then $HOME -- and To Pass ignoring all of it, prefix included."""
+
+    def fire(self, text, mode="run", extra_env=None, expect=0):
+        return json.loads(self.run_binary("--dump-fire", text, "--mode", mode,
+                                          extra_env=extra_env, expect=expect).stdout)
+
+    def test_an_in_prefix_fires_in_the_expanded_directory_and_is_stripped(self):
+        result = self.fire("--in ~/code/hub fix the test")
+        expected = str(Path.home() / "code" / "hub")
+        self.assertEqual(result["dir"], expected)
+        self.assertEqual(result["dir_source"], "prefix")
+        self.assertEqual(result["text"], "fix the test")
+        self.assertEqual(result["argv"], ["--in", expected, "fix the test"])
+
+    def test_an_at_prefix_does_the_same_thing(self):
+        result = self.fire("@~/code/hub fix the test")
+        expected = str(Path.home() / "code" / "hub")
+        self.assertEqual(result["dir"], expected)
+        self.assertEqual(result["dir_source"], "prefix")
+        self.assertEqual(result["text"], "fix the test")
+
+    def test_no_prefix_falls_back_to_home_with_nothing_else_configured(self):
+        result = self.fire("just some text")
+        self.assertEqual(result["dir"], str(Path.home()))
+        self.assertEqual(result["dir_source"], "default")
+        self.assertEqual(result["text"], "just some text")
+
+    def test_no_prefix_uses_the_chips_last_chosen_directory_once_set(self):
+        chip_dir = self.tmp / "chip-choice"
+        chip_dir.mkdir()
+        self.write_default("menubar.fireDirOverride", "-string", str(chip_dir))
+        result = self.fire("just some text")
+        self.assertEqual(result["dir"], str(chip_dir))
+        self.assertEqual(result["dir_source"], "chip")
+
+    def test_qt_menubar_fire_dir_overrides_the_chips_choice(self):
+        chip_dir = self.tmp / "chip-choice"
+        chip_dir.mkdir()
+        self.write_default("menubar.fireDirOverride", "-string", str(chip_dir))
+        env_dir = self.tmp / "env-choice"
+        env_dir.mkdir()
+        result = self.fire("just some text",
+                           extra_env={"QT_MENUBAR_FIRE_DIR": str(env_dir)})
+        self.assertEqual(result["dir"], str(env_dir))
+        self.assertEqual(result["dir_source"], "env")
+
+    def test_a_typed_prefix_wins_over_the_env_override_too(self):
+        """FireResolve.runDirectory checks the prefix before it ever calls
+        chipDirectory, so a one-shot typed dir outranks even
+        QT_MENUBAR_FIRE_DIR -- the one override every other setting in this
+        widget answers to."""
+        env_dir = self.tmp / "env-choice"
+        env_dir.mkdir()
+        prefix_dir = self.tmp / "prefix-choice"
+        prefix_dir.mkdir()
+        result = self.fire(f"--in {prefix_dir} fix it",
+                           extra_env={"QT_MENUBAR_FIRE_DIR": str(env_dir)})
+        self.assertEqual(result["dir"], str(prefix_dir))
+        self.assertEqual(result["dir_source"], "prefix")
+
+    def test_an_invalid_prefix_falls_through_to_the_chip_rather_than_failing(self):
+        result = self.fire("--in /no/such/place fix it")
+        self.assertEqual(result["dir"], str(Path.home()))
+        self.assertEqual(result["dir_source"], "default")
+        self.assertEqual(result["text"], "fix it")
+
+    def test_to_pass_never_carries_a_directory_even_with_a_prefix_typed(self):
+        result = self.fire("--in ~/code/hub fix the test", mode="pass")
+        self.assertNotIn("dir", result)
+        self.assertNotIn("dir_source", result)
+        self.assertNotIn("argv", result)
+        # Unstripped: To Pass ignores the --in/@ convention outright, rather
+        # than stripping a prefix it has no field for.
+        self.assertEqual(result["text"], "--in ~/code/hub fix the test")
+        self.assertEqual(result["mode"], "pass")
+
+
+class TestRecentDirectories(ModelCase):
+    """`--dump-recent-dirs`: the directory chip's recency menu, off the qt
+    ledger's `run_cwd` field. No Settings involved, so plain ModelCase is
+    enough -- no suite isolation needed."""
+
+    def recent_dirs(self):
+        return json.loads(self.run_binary("--dump-recent-dirs").stdout)
+
+    def test_dedup_keeps_only_the_most_recent_of_a_repeated_directory(self):
+        self.write_task("t-old", run_cwd="/tmp/proj-a", created="2026-09-01T10:00:00")
+        self.write_task("t-new", run_cwd="/tmp/proj-a", created="2026-09-03T10:00:00")
+        self.write_task("t-other", run_cwd="/tmp/proj-b", created="2026-09-02T10:00:00")
+        result = self.recent_dirs()
+        self.assertEqual(result["dirs"], ["/tmp/proj-a", "/tmp/proj-b"])
+        self.assertEqual(result["count"], 2)
+
+    def test_order_is_most_recently_created_task_first(self):
+        for i, cwd in enumerate(["/tmp/proj-a", "/tmp/proj-b", "/tmp/proj-c"]):
+            self.write_task(f"t-{i}", run_cwd=cwd,
+                            created=f"2026-09-0{i + 1}T10:00:00")
+        result = self.recent_dirs()
+        self.assertEqual(result["dirs"], ["/tmp/proj-c", "/tmp/proj-b", "/tmp/proj-a"])
+
+    def test_capped_at_eight_keeping_the_most_recent(self):
+        for i in range(10):
+            self.write_task(f"t-{i}", run_cwd=f"/tmp/proj-{i}",
+                            created=f"2026-09-{i + 1:02d}T10:00:00")
+        result = self.recent_dirs()
+        self.assertEqual(result["count"], 8)
+        self.assertEqual(result["dirs"], [f"/tmp/proj-{i}" for i in range(9, 1, -1)])
+
+    def test_a_task_missing_run_cwd_is_skipped_rather_than_shown_blank(self):
+        """A task filed before this field existed has no run_cwd at all --
+        RecentDirs.load must skip it, not show an empty-string row."""
+        self.write_task("t-old-format", created="2026-09-01T10:00:00")
+        self.write_task("t-with-dir", run_cwd="/tmp/proj-a", created="2026-09-02T10:00:00")
+        result = self.recent_dirs()
+        self.assertEqual(result["dirs"], ["/tmp/proj-a"])
+
+
+class TestSummonHotkey(SettingsSuiteCase):
+    """The global summon shortcut, via `--dump-hotkey`: default ⌥Q on a
+    never-configured suite, a Settings override round-tripping through the
+    same three UserDefaults keys Settings.swift itself writes, and Clear
+    disabling registration outright.
+
+    `registered` is asserted strictly only where it is deterministic --
+    Clear's `register(nil)` returns false without ever calling
+    RegisterEventHotKey. For the default and override combos, `registered`
+    depends on whether *some* process already holds that exact combo on this
+    machine, and John's own already-running widget (this task's constraints
+    forbid touching it) is a real candidate for already holding the default
+    ⌥Q. So those cases assert the deterministic, environment-independent
+    fields -- configured/key_code/modifiers/display -- and only check that
+    `registered` came back as a bool, rather than risk a flaky hard failure
+    over a collision this test has no business asserting either way."""
+
+    def dump_hotkey(self, extra_env=None):
+        return json.loads(self.run_binary("--dump-hotkey", extra_env=extra_env).stdout)
+
+    def test_default_is_option_q_on_a_never_configured_suite(self):
+        result = self.dump_hotkey()
+        self.assertTrue(result["configured"])
+        self.assertEqual(result["key_code"], 12)  # kVK_ANSI_Q
+        self.assertEqual(result["modifiers"], 2048)  # optionKey
+        self.assertEqual(result["display"], "⌥Q")
+        self.assertIsInstance(result["registered"], bool)
+
+    def test_a_settings_override_round_trips(self):
+        """⌃⌥⇧⌘W (kVK_ANSI_W=13), all four modifiers: deliberately unlikely
+        to already be claimed by anything else on a dev machine, which is
+        why `registered: true` is asserted here but not for the default."""
+        self.write_default("menubar.hotkeyKeyCode", "-int", 13)
+        self.write_default("menubar.hotkeyModifiers", "-int", 4096 + 2048 + 512 + 256)
+        result = self.dump_hotkey()
+        self.assertTrue(result["configured"])
+        self.assertEqual(result["key_code"], 13)
+        self.assertEqual(result["modifiers"], 6912)
+        self.assertEqual(result["display"], "⌃⌥⇧⌘W")
+        self.assertTrue(result["registered"])
+
+    def test_clear_disables_registration(self):
+        self.write_default("menubar.hotkeyKeyCode", "-int", 13)
+        self.write_default("menubar.hotkeyModifiers", "-int", 256)
+        self.write_default("menubar.hotkeyCleared", "-bool", "true")
+        result = self.dump_hotkey()
+        self.assertFalse(result["configured"])
+        self.assertIsNone(result["key_code"])
+        self.assertIsNone(result["modifiers"])
+        self.assertIsNone(result["display"])
+        self.assertFalse(result["registered"])

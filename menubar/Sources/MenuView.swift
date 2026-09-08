@@ -40,6 +40,13 @@ struct MenuView: View {
     /// first: one spends a job slot, the other throws the engine's find away.
     @State private var confirmingSuggestion: (id: String, action: String)?
 
+    /// Called when Escape has nothing left to clear (draft, search, and
+    /// highlight are already empty). nil for the real MenuBarExtra dropdown,
+    /// which just keeps falling through to `.ignored`; the standalone hotkey
+    /// panel wires this to close itself, since Escape closing the panel is
+    /// the one behaviour a floating window needs that a dropdown does not.
+    var onEscapeExhausted: (() -> Void)? = nil
+
     /// Wider than v1's 320: a verify row carries report, accept, redo, reject,
     /// and resume, and the title still has to be readable next to them.
     /// Shared with --snapshot so the render is the real panel width.
@@ -182,6 +189,16 @@ struct MenuView: View {
                     .keyboardShortcut("f", modifiers: .command)
                 Button("", action: { controller.showSettings() })
                     .keyboardShortcut(",", modifiers: .command)
+                // Mode-select and one-shot-fire, all command-modified: same
+                // reason as \u{2318}F/\u{2318}, above, a hidden button rather than
+                // onKeyPress. Each checks fieldFocused itself so the shortcut
+                // only fires while quick-fire's own field owns the keystroke.
+                Button("", action: { selectMode(toPass: false) })
+                    .keyboardShortcut("1", modifiers: .command)
+                Button("", action: { selectMode(toPass: true) })
+                    .keyboardShortcut("2", modifiers: .command)
+                Button("", action: fireOtherMode)
+                    .keyboardShortcut(.return, modifiers: .command)
             }
             .opacity(0)
             .frame(width: 0, height: 0)
@@ -198,6 +215,11 @@ struct MenuView: View {
         .onKeyPress(.downArrow) { moveHighlight(1) }
         .onKeyPress(.upArrow) { moveHighlight(-1) }
         .onKeyPress(.return) { triggerHighlighted() }
+        // Bare Tab, no modifier, so onKeyPress sees it directly -- only the
+        // command-modified shortcuts above need the hidden-button trick.
+        // Guarded to the quick-fire field itself: Tab while it is unfocused
+        // is normal control-to-control focus movement, not a mode swap.
+        .onKeyPress(.tab) { toggleMode() }
         .onKeyPress(.escape) { clearDraft() }
         // Typing with neither field focused opens search and keeps the
         // keystroke, so the letter that started the search is not swallowed.
@@ -283,6 +305,15 @@ struct MenuView: View {
             highlighted = nil
             return .handled
         }
+        // Nothing left to clear. The real MenuBarExtra dropdown passes no
+        // closure here and keeps falling through to .ignored unchanged; the
+        // standalone hotkey panel wires this to close itself, which is the
+        // one thing a floating window needs from Escape that a dropdown does
+        // not (a dropdown's own Escape-to-dismiss is AppKit's, not this).
+        if let onEscapeExhausted {
+            onEscapeExhausted()
+            return .handled
+        }
         return .ignored
     }
 
@@ -338,14 +369,22 @@ struct MenuView: View {
                     .help(controller.fireToPass ? "Add to the Pass" : "Queue this task")
                 }
             }
-            Picker("", selection: $controller.fireToPass) {
-                Text("Run now").tag(false)
-                Text("To Pass").tag(true)
+            HStack(spacing: 7) {
+                Picker("", selection: $controller.fireToPass) {
+                    Text("Run now").tag(false)
+                    Text("To Pass").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .help("Run now fires it with qt, in the chip's folder. To Pass files it "
+                      + "as an item needing your go. Tab swaps the two; \u{2318}1/\u{2318}2 "
+                      + "pick one directly; \u{2318}\u{21A9} fires the other one once.")
+                FireDirectoryChip(controller: controller)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .controlSize(.small)
-            .help("Run now fires it with qt. To Pass files it as an item needing your go.")
+            Text("Tab swaps \u{00B7} \u{2318}\u{21A9} fires the other way")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -550,22 +589,68 @@ struct MenuView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
-        if controller.fireToPass {
+        fire(rawText: text, toPass: controller.fireToPass)
+    }
+
+    /// The one place a quick-fire text actually goes out, in either mode.
+    /// `send()` (return, or the field's own return-arrow button), \u{2318}1/\u{2318}2
+    /// after they have already changed the mode, and `fireOtherMode()`'s
+    /// one-shot all end up here so a fire is described and dispatched exactly
+    /// one way regardless of which key sent it.
+    ///
+    /// To Pass ignores `--in`/`@` outright: the raw, unstripped text goes to
+    /// `/capture`, matching `FireResolve.describe`'s own rule that the
+    /// directory convention is a Run-now-only thing.
+    private func fire(rawText: String, toPass: Bool) {
+        if toPass {
             let base = controller.passBase
-            controller.perform(key: "capture", { Actions.capture(text: text, base: base) }) { outcome in
+            controller.perform(key: "capture", { Actions.capture(text: rawText, base: base) }) { outcome in
                 switch outcome {
                 case .success(let id): show(id.isEmpty ? "Added to the Pass" : "Added \(id)")
                 case .failure(let problem): show(problem.message)
                 }
             }
         } else {
-            controller.perform(key: "fire", { Actions.fire(prompt: text).map { "Queued" } }) { outcome in
+            let (prefixDir, stripped) = FireResolve.parsePrefix(rawText)
+            let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: controller.settings)
+            controller.perform(key: "fire", {
+                Actions.fire(prompt: stripped, in: resolved.url).map { "Queued" }
+            }) { outcome in
                 switch outcome {
                 case .success: show("Queued")
                 case .failure(let problem): show(problem.message)
                 }
             }
         }
+    }
+
+    /// Tab, while the quick-fire field has focus: flips Run now/To Pass and
+    /// back. Unguarded Tab elsewhere is left to do its normal job of moving
+    /// focus between controls.
+    private func toggleMode() -> KeyPress.Result {
+        guard fieldFocused else { return .ignored }
+        controller.fireToPass.toggle()
+        return .handled
+    }
+
+    /// \u{2318}1/\u{2318}2: picks a mode directly rather than toggling it, so
+    /// pressing the same one twice is a no-op instead of flipping back.
+    private func selectMode(toPass: Bool) {
+        guard fieldFocused else { return }
+        controller.fireToPass = toPass
+    }
+
+    /// \u{2318}-Return: fires once with whichever mode the segmented control is
+    /// *not* currently showing, then leaves the control exactly where it was.
+    /// This is what lets one field serve both "mostly Run now, occasionally
+    /// To Pass" and the opposite without either habit fighting the other's
+    /// remembered default.
+    private func fireOtherMode() {
+        guard fieldFocused else { return }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        draft = ""
+        fire(rawText: text, toPass: !controller.fireToPass)
     }
 
     private func resume(_ record: TaskRecord) {
@@ -1111,6 +1196,87 @@ struct FooterButton: View {
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
         .help(help)
+    }
+}
+
+/// The compact directory chip next to the mode picker: where a Run-now fire
+/// with no typed `--in`/`@` prefix lands. Dims and stops responding when To
+/// Pass is selected, since To Pass ignores the directory outright -- the
+/// chip would otherwise be inviting a click that changes nothing.
+struct FireDirectoryChip: View {
+    @ObservedObject var controller: StatusController
+
+    private var resolved: FireResolve.Directory {
+        FireResolve.chipDirectory(settings: controller.settings)
+    }
+
+    private var abbreviated: String {
+        Self.abbreviate(resolved.url.path)
+    }
+
+    var body: some View {
+        let recents = RecentDirs.load(tasksDir: controller.config.tasksDir)
+        Menu {
+            ForEach(recents, id: \.self) { dir in
+                Button(Self.abbreviate(dir)) { commit(dir) }
+            }
+            if !recents.isEmpty { Divider() }
+            Button("Choose\u{2026}") { chooseDirectory() }
+            Button("Reset to default") { reset() }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "folder")
+                    .font(.system(size: 9))
+                Text(abbreviated)
+                    .font(.system(size: 10))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .frame(maxWidth: 130)
+        .disabled(controller.fireToPass)
+        .opacity(controller.fireToPass ? 0.35 : 1)
+        .help(chipHelp)
+    }
+
+    private var chipHelp: String {
+        switch resolved.source {
+        case "env": return "QT_MENUBAR_FIRE_DIR overrides this: \(resolved.url.path)"
+        case "chip": return "Run now fires in \(resolved.url.path). Click to change, or type "
+            + "\u{201C}--in <dir>\u{201D} or \u{201C}@<dir>\u{201D} to fire in a directory once."
+        default: return "Run now fires in \(resolved.url.path) (default). Click to change, or "
+            + "type \u{201C}--in <dir>\u{201D} or \u{201C}@<dir>\u{201D} to fire in a directory once."
+        }
+    }
+
+    private static func abbreviate(_ raw: String) -> String {
+        (raw as NSString).abbreviatingWithTildeInPath
+    }
+
+    private func chooseDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = resolved.url
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            commit(url.path)
+        }
+    }
+
+    private func reset() {
+        var next = controller.settings
+        next.fireDirOverride = nil
+        controller.apply(next)
+    }
+
+    private func commit(_ dir: String) {
+        var next = controller.settings
+        next.fireDirOverride = dir
+        controller.apply(next)
     }
 }
 

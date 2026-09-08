@@ -22,6 +22,7 @@
 // that breaks the thing it configures.
 
 import Foundation
+import Carbon.HIToolbox
 
 struct Settings {
     /// Pass base URL the user typed, nil when the field is empty. Validated the
@@ -41,6 +42,16 @@ struct Settings {
     /// Rows to keep after ordering. The aggregate still counts everything, so
     /// this trims what is drawn and never what is tallied.
     var rowLimit: Int
+    /// The directory chip's last choice, nil when the field is empty (falls
+    /// through to $HOME). QT_MENUBAR_FIRE_DIR still overrides this when set --
+    /// same precedence every other override in this file follows.
+    var fireDirOverride: String?
+    /// The global summon shortcut. nil is a real, distinct state from "never
+    /// configured": it means Clear was pressed, and the hotkey should not be
+    /// registered at all. A fresh install (never configured) uses
+    /// `KeyCombo.defaultCombo` instead of nil, which is why this is loaded and
+    /// saved through its own three-state logic rather than `text(_:_:)`.
+    var hotkeyCombo: KeyCombo?
 
     static let pollRange: ClosedRange<TimeInterval> = 2...120
     static let limitRange: ClosedRange<Int> = 5...200
@@ -58,7 +69,9 @@ struct Settings {
                                     hubDirOverride: nil,
                                     pollInterval: defaultPollInterval,
                                     visibleSections: allSectionKeys,
-                                    rowLimit: defaultRowLimit)
+                                    rowLimit: defaultRowLimit,
+                                    fireDirOverride: nil,
+                                    hotkeyCombo: KeyCombo.defaultCombo)
 
     enum Keys {
         static let passURL = "menubar.passURLOverride"
@@ -66,6 +79,13 @@ struct Settings {
         static let pollInterval = "menubar.pollInterval"
         static let visibleSections = "menubar.visibleSections"
         static let rowLimit = "menubar.rowLimit"
+        static let fireDir = "menubar.fireDirOverride"
+        static let hotkeyKeyCode = "menubar.hotkeyKeyCode"
+        static let hotkeyModifiers = "menubar.hotkeyModifiers"
+        /// Distinct from the keyCode/modifiers keys being absent: absent means
+        /// "never configured, use the default"; this true means "configured
+        /// to nothing, on purpose" -- the difference Clear exists to make.
+        static let hotkeyCleared = "menubar.hotkeyCleared"
     }
 
     /// Reads the stored settings, falling back to the defaults key by key. A
@@ -82,7 +102,22 @@ struct Settings {
                 .map { Set($0).intersection(allSectionKeys) } ?? allSectionKeys,
             rowLimit: defaults.object(forKey: Keys.rowLimit) == nil
                 ? defaultRowLimit
-                : clamp(defaults.integer(forKey: Keys.rowLimit), to: limitRange))
+                : clamp(defaults.integer(forKey: Keys.rowLimit), to: limitRange),
+            fireDirOverride: text(defaults, Keys.fireDir),
+            hotkeyCombo: loadHotkey(defaults))
+    }
+
+    /// The hotkey's three states: cleared (nil, on purpose), configured (a
+    /// stored combo), or never touched (the default). Checked in that order
+    /// because `hotkeyCleared` has to win even though a stale keyCode/modifiers
+    /// pair from before a Clear could otherwise still be sitting in the store.
+    private static func loadHotkey(_ defaults: UserDefaults) -> KeyCombo? {
+        if defaults.bool(forKey: Keys.hotkeyCleared) { return nil }
+        guard defaults.object(forKey: Keys.hotkeyKeyCode) != nil else {
+            return KeyCombo.defaultCombo
+        }
+        return KeyCombo(keyCode: UInt32(defaults.integer(forKey: Keys.hotkeyKeyCode)),
+                        modifiers: UInt32(defaults.integer(forKey: Keys.hotkeyModifiers)))
     }
 
     func save(_ defaults: UserDefaults = StatusController.Keys.store()) {
@@ -93,6 +128,16 @@ struct Settings {
         defaults.set(Settings.clamp(pollInterval, to: Settings.pollRange), forKey: Keys.pollInterval)
         defaults.set(Array(visibleSections).sorted(), forKey: Keys.visibleSections)
         defaults.set(Settings.clamp(rowLimit, to: Settings.limitRange), forKey: Keys.rowLimit)
+        write(defaults, Keys.fireDir, fireDirOverride)
+        if let combo = hotkeyCombo {
+            defaults.set(false, forKey: Keys.hotkeyCleared)
+            defaults.set(Int(combo.keyCode), forKey: Keys.hotkeyKeyCode)
+            defaults.set(Int(combo.modifiers), forKey: Keys.hotkeyModifiers)
+        } else {
+            defaults.set(true, forKey: Keys.hotkeyCleared)
+            defaults.removeObject(forKey: Keys.hotkeyKeyCode)
+            defaults.removeObject(forKey: Keys.hotkeyModifiers)
+        }
     }
 
     func shows(_ section: Section) -> Bool { visibleSections.contains(section.rawValue) }

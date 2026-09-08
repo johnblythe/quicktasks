@@ -148,6 +148,16 @@ struct SettingsView: View {
                          + "and count included. Collapsing one in the menu keeps both.")
                 }
 
+                section("Summon hotkey") {
+                    HotkeyRecorderControl(combo: Binding(
+                        get: { controller.settings.hotkeyCombo },
+                        set: { new in commit { $0.hotkeyCombo = new } }
+                    ))
+                    note("Opens quick-fire from anywhere, focused and ready to type. "
+                         + "Default is \u{2325}Q. Clear turns the shortcut off; it does "
+                         + "not fall back to the default.")
+                }
+
                 section("Launch") {
                     Toggle(isOn: Binding(
                         get: { controller.loginItem },

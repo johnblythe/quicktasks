@@ -37,7 +37,7 @@ enum LayoutProbe {
 
         // A long interval: the initial synchronous load in init() is the data
         // we want, and a polling timer would only add churn during measuring.
-        let controller = StatusController(interval: 3600)
+        let controller = StatusController(interval: 3600, activatesGlobalHotkey: false)
 
         // Let the initial file load and the first refresh() (Pass or files)
         // land before either regime measures anything.

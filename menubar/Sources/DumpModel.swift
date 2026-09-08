@@ -327,8 +327,19 @@ enum DumpModel {
 
     /// `--dump-keys down,down,up`: the highlight's landing place after a key
     /// sequence, over the same visible rows a freshly opened menu would show.
-    /// Anything but `up`/`down` is refused rather than ignored, so a typo in a
-    /// test is not a silent pass.
+    /// Anything but `up`/`down`/`escape`/`tab`/`cmd-1`/`cmd-2`/`cmd-return` is
+    /// refused rather than ignored, so a typo in a test is not a silent pass.
+    ///
+    /// `tab`, `cmd-1`, `cmd-2`, and `cmd-return` walk quick-fire's mode toggle
+    /// exactly the way MenuView's own hidden buttons do (`toggleMode`,
+    /// `selectMode`, `fireOtherMode`): `tab` flips Run now/To Pass, `cmd-1`/
+    /// `cmd-2` select one directly, and `cmd-return` fires with the *other*
+    /// mode once without moving the toggle -- `mode` in the payload is where
+    /// the toggle actually landed, `fired` is what that one-shot fire
+    /// resolved to (nil unless `cmd-return` appeared). `--mode pass` seeds the
+    /// toggle before the sequence runs; `--draft` seeds the text a
+    /// `cmd-return` fires, defaulting to a non-empty placeholder so a bare
+    /// `cmd-return` never fails on "nothing to fire".
     static func runKeys(args: [String]) -> Int32 {
         guard let i = args.firstIndex(of: "--dump-keys"), i + 1 < args.count else {
             return fail("--dump-keys needs a comma-separated key sequence")
@@ -339,6 +350,9 @@ enum DumpModel {
         let ids = defaultVisibleIDs(model, now: now)
         var highlight: String?
         var keys: [String] = []
+        var toPass = value(args, "--mode") == "pass"
+        let draft = value(args, "--draft") ?? "sample text"
+        var fired: [String: Any]?
         for key in args[i + 1].split(separator: ",") {
             let name = key.trimmingCharacters(in: .whitespaces).lowercased()
             guard !name.isEmpty else { continue }
@@ -346,7 +360,13 @@ enum DumpModel {
             case "down": highlight = KeyboardNav.move(ids: ids, from: highlight, delta: 1)
             case "up": highlight = KeyboardNav.move(ids: ids, from: highlight, delta: -1)
             case "escape": highlight = nil
-            default: return fail("unknown key: \(name) (down, up, escape)")
+            case "tab": toPass.toggle()
+            case "cmd-1": toPass = false
+            case "cmd-2": toPass = true
+            case "cmd-return":
+                fired = FireResolve.describe(text: draft, toPass: !toPass, settings: config.settings)
+            default:
+                return fail("unknown key: \(name) (down, up, escape, tab, cmd-1, cmd-2, cmd-return)")
             }
             keys.append(name)
         }
@@ -364,7 +384,56 @@ enum DumpModel {
                                                    itemID: r.itemID ?? r.id)?.absoluteString
                 }
             } ?? NSNull(),
+            "mode": toPass ? "pass" : "run",
+            "fired": fired ?? NSNull(),
         ])
+    }
+
+    /// `--dump-fire <text> [--mode run|pass]`: the resolved argv for a Run-now
+    /// fire, or the `/capture` body for To Pass -- whichever `send()` would
+    /// actually do, without doing it. Delegates to `FireResolve.describe`, the
+    /// same function the live quick-fire field and the `cmd-return` case of
+    /// `--dump-keys` call, so this seam and the widget can never describe a
+    /// fire two different ways.
+    static func runFire(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--dump-fire"), i + 1 < args.count else {
+            return fail("--dump-fire needs some text")
+        }
+        let text = args[i + 1]
+        let toPass = value(args, "--mode") == "pass"
+        let config = StoreConfig.resolve()
+        return emit(FireResolve.describe(text: text, toPass: toPass, settings: config.settings))
+    }
+
+    /// `--dump-hotkey`: the registered summon shortcut -- key code, modifiers,
+    /// and its display string -- and whether RegisterEventHotKey actually
+    /// took it. Registers and immediately unregisters its own `GlobalHotkey`
+    /// rather than touching a real running widget's: this process is not the
+    /// widget, and holding two live registrations at once is exactly the
+    /// ownership problem `register`'s own unregister-then-try-again dance
+    /// exists to avoid.
+    static func runHotkey() -> Int32 {
+        let combo = Settings.load().hotkeyCombo
+        let hotkey = GlobalHotkey {}
+        let registered = hotkey.register(combo)
+        hotkey.unregister()
+        return emit([
+            "configured": combo != nil,
+            "key_code": combo.map { Int($0.keyCode) } ?? NSNull(),
+            "modifiers": combo.map { Int($0.modifiers) } ?? NSNull(),
+            "display": combo?.displayString ?? NSNull(),
+            "registered": registered,
+        ])
+    }
+
+    /// `--dump-recent-dirs`: the directory chip's own recency list -- distinct
+    /// `run_cwd` values off the qt ledger, most recent first, capped at 8.
+    /// Reads QT_DATA/tasks exactly the way `RecentDirs.load` and the live chip
+    /// do, so a fixture ledger under QT_DATA is what a test points this at.
+    static func runRecentDirs() -> Int32 {
+        let config = StoreConfig.resolve()
+        let dirs = RecentDirs.load(tasksDir: config.tasksDir)
+        return emit(["dirs": dirs, "count": dirs.count])
     }
 
     /// `--post-run <item-id>`: the real POST, against whatever QT_PASS_URL
