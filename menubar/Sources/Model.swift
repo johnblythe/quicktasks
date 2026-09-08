@@ -531,6 +531,23 @@ struct MenuModel: Equatable {
     /// from `sections()` entirely rather than collapsed, so it takes its header
     /// and its count with it.
     let visibleSections: Set<String>
+    /// Whether the most recent poll actually reached the Pass -- distinct from
+    /// `source`, which stays `.pass` while a held-stale model is still being
+    /// shown after a poll has started failing. False whenever the Pass was not
+    /// even in play (the file feed, or a poll that has not run yet).
+    let passReachable: Bool
+    /// When the Pass first stopped answering, nil while it is reachable. Set
+    /// on the first failed poll after a success (or a prior hold) and carried
+    /// forward unchanged -- by a held `.pass` model and by the `.files` model
+    /// the widget falls back to once the hold runs out -- so both "still
+    /// holding" and "gave up, but the Pass is the reason" can tell how long
+    /// it has actually been down.
+    let passStaleSince: Date?
+    /// The deadline the widget will keep showing a held Pass model past.
+    /// Non-nil only while `source == .pass` and a poll is actively failing;
+    /// nil once the model has fallen back to file feeds, or while the Pass is
+    /// reachable and there is nothing to hold.
+    let heldUntil: Date?
 
     init(records: [TaskRecord],
          aggregate: Aggregate,
@@ -545,7 +562,10 @@ struct MenuModel: Equatable {
          truncated: Bool = false,
          suggestions: [Suggestion] = [],
          suggestionsAvailable: Bool = false,
-         visibleSections: Set<String> = Settings.allSectionKeys) {
+         visibleSections: Set<String> = Settings.allSectionKeys,
+         passReachable: Bool = false,
+         passStaleSince: Date? = nil,
+         heldUntil: Date? = nil) {
         self.records = records
         self.aggregate = aggregate
         self.refreshedAt = refreshedAt
@@ -560,6 +580,9 @@ struct MenuModel: Equatable {
         self.suggestions = suggestions
         self.suggestionsAvailable = suggestionsAvailable
         self.visibleSections = visibleSections
+        self.passReachable = passReachable
+        self.passStaleSince = passStaleSince
+        self.heldUntil = heldUntil
     }
 
     static func build(records: [TaskRecord],
@@ -574,7 +597,10 @@ struct MenuModel: Equatable {
                       truncated: Bool = false,
                       suggestions: [Suggestion] = [],
                       suggestionsAvailable: Bool = false,
-                      visibleSections: Set<String> = Settings.allSectionKeys) -> MenuModel {
+                      visibleSections: Set<String> = Settings.allSectionKeys,
+                      passReachable: Bool = false,
+                      passStaleSince: Date? = nil,
+                      heldUntil: Date? = nil) -> MenuModel {
         let ordered = records.sorted { lhs, rhs in
             // Sections first, then reason inside Needs-you, then
             // newest-activity. Attention rows have to pin above the merely
@@ -602,7 +628,20 @@ struct MenuModel: Equatable {
                          truncated: truncated,
                          suggestions: suggestions,
                          suggestionsAvailable: suggestionsAvailable,
-                         visibleSections: visibleSections)
+                         visibleSections: visibleSections,
+                         passReachable: passReachable,
+                         passStaleSince: passStaleSince,
+                         heldUntil: heldUntil)
+    }
+
+    /// The header line MenuView draws and `--dump-model` reports as
+    /// `"headline"`. Gets a suffix only once a held-stale Pass has actually
+    /// given up and fallen back to the file ledgers -- `passStaleSince`
+    /// survives that fallback specifically so this can tell "files because
+    /// there is no Pass" apart from "files because the Pass went quiet".
+    var headlineText: String {
+        guard source == .files, passStaleSince != nil else { return aggregate.headline }
+        return "\(aggregate.headline) \u{00B7} file feeds only, Pass down"
     }
 
     /// Rows grouped for display, in section order, empty sections dropped and
@@ -661,7 +700,10 @@ struct MenuModel: Equatable {
                              RowFilter.matches($0, query: query)
                          },
                          suggestionsAvailable: suggestionsAvailable,
-                         visibleSections: visibleSections)
+                         visibleSections: visibleSections,
+                         passReachable: passReachable,
+                         passStaleSince: passStaleSince,
+                         heldUntil: heldUntil)
     }
 
     /// Rows in the order the menu draws them, with the collapsed sections'
@@ -689,7 +731,10 @@ struct MenuModel: Equatable {
                   truncated: truncated,
                   suggestions: suggestions,
                   suggestionsAvailable: suggestionsAvailable,
-                  visibleSections: visibleSections)
+                  visibleSections: visibleSections,
+                  passReachable: passReachable,
+                  passStaleSince: passStaleSince,
+                  heldUntil: heldUntil)
     }
 }
 

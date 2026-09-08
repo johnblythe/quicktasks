@@ -41,6 +41,20 @@
 
 import Foundation
 
+/// Which Pass process answered, and which hub checkout it is serving.
+/// Added (LD-201 v6) so a `.pass-url`-discovered target can be checked against
+/// the widget's own configured hub before it is trusted -- a Pass serving a
+/// different checkout answers `/status.json` just fine, it just is not the
+/// one this widget should be showing. nil fields, or the whole struct being
+/// absent from a payload, read as "unknown", not "different": an older Pass
+/// that predates this field is not treated as a mismatch.
+struct PassInstance: Equatable {
+    let hubDir: String?
+    let pid: Int?
+    let started: Date?
+    let port: Int?
+}
+
 struct PassStatus: Equatable {
     let generatedAt: Date?
     let passURL: String
@@ -61,6 +75,9 @@ struct PassStatus: Equatable {
     /// hides itself when it did not, so a Pass without the engine shows no
     /// empty section: an absent feature has to look absent, not broken.
     let suggestionsAvailable: Bool
+    /// The process and checkout that answered. nil on a payload that predates
+    /// this field, which discovery reads as "unknown" rather than "different".
+    let instance: PassInstance?
 
     /// Parses a /status.json body. Returns .failure only when the payload is
     /// not usable at all; missing optional keys inside a row are tolerated,
@@ -144,6 +161,16 @@ struct PassStatus: Equatable {
         let rawSuggestions = obj["suggestions"] as? [[String: Any]]
         let suggestions = (rawSuggestions ?? []).compactMap(suggestion(_:))
 
+        // 5. instance, if this Pass has it (LD-201 v6). Absent on anything
+        //    that predates the field -- read as "unknown", not "different",
+        //    by whoever compares it against the widget's configured hub.
+        let instance: PassInstance? = (obj["instance"] as? [String: Any]).map { i in
+            PassInstance(hubDir: (i["hub_dir"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                        pid: intValue(i["pid"]),
+                        started: Store.parseDate(i["started"]),
+                        port: intValue(i["port"]))
+        }
+
         return .success(PassStatus(generatedAt: generatedAt,
                                    passURL: passURL,
                                    itemURLTemplate: itemURLTemplate,
@@ -156,7 +183,8 @@ struct PassStatus: Equatable {
                                    // whether anything parsed out of it: a Pass
                                    // that sent an empty list has the engine and
                                    // nothing to suggest right now.
-                                   suggestionsAvailable: obj["suggestions"] != nil))
+                                   suggestionsAvailable: obj["suggestions"] != nil,
+                                   instance: instance))
     }
 
     /// One suggestion. A row with no id is dropped -- every one of the four

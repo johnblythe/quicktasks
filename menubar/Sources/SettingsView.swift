@@ -193,8 +193,9 @@ struct SettingsView: View {
 
     private var passNote: String {
         "QT_PASS_URL overrides this. Has to be http on 127.0.0.1 or localhost -- "
-        + "the widget only ever talks to loopback. Leave it empty to use the hub's "
-        + "\(PassEndpoint.urlFileName), then port 8811."
+        + "the widget only ever talks to loopback. Leave it empty to use port "
+        + "8811 when it answers, then the hub's \(PassEndpoint.urlFileName) if it "
+        + "names this same hub."
     }
 
     // MARK: - pieces

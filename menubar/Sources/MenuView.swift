@@ -426,7 +426,7 @@ struct MenuView: View {
                 Circle()
                     .fill(Color(StatusPalette.color(for: controller.model.aggregate)))
                     .frame(width: 8, height: 8)
-                Text(flash ?? controller.model.aggregate.headline)
+                Text(flash ?? controller.model.headlineText)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
                 Spacer(minLength: 6)
@@ -550,10 +550,13 @@ struct MenuView: View {
     /// Which feed the rows came from. Grey is not an error state -- the file
     /// ledgers are a complete answer for everything qt knows about -- but it
     /// does mean gates and verify rows are invisible, so it has to be visible.
+    /// Amber is its own state, in between: the Pass has started failing but
+    /// the 90-second hold has not run out, so what is on screen is still the
+    /// Pass's own last good model, just not fresh.
     private var sourceBadge: some View {
         HStack(spacing: 4) {
             Circle()
-                .fill(controller.model.source == .pass ? Color.green : Color.secondary.opacity(0.5))
+                .fill(sourceDotColor)
                 .frame(width: 6, height: 6)
             Text("Pass")
                 .font(.system(size: 11))
@@ -562,19 +565,34 @@ struct MenuView: View {
         .help(sourceTooltip)
     }
 
+    private var sourceDotColor: Color {
+        if controller.model.source == .pass {
+            return controller.model.passReachable ? .green : .orange
+        }
+        return .secondary.opacity(0.5)
+    }
+
     /// Which feed is live, and where the widget is looking for The Pass. The
     /// resolved URL is in here because "the Pass is not answering" reads very
     /// differently depending on whether the widget guessed port 8811 or read a
     /// live URL out of the hub's `.pass-url`.
     private var sourceTooltip: String {
         var lines: [String] = []
-        if controller.model.source == .pass {
-            let statusURL = URL(string: controller.model.passURL)?
+        let model = controller.model
+        if model.source == .pass && model.passReachable {
+            let statusURL = URL(string: model.passURL)?
                 .appendingPathComponent("status.json").absoluteString
-            lines.append("Live from \(statusURL ?? controller.model.passURL)")
+            lines.append("Live from \(statusURL ?? model.passURL)")
+        } else if model.source == .pass {
+            // Held: still the Pass's own last good model, not yet the file
+            // ledgers. `refreshedAt` is untouched by a held poll, so it is
+            // still the time that model actually came from the Pass.
+            let since = model.passStaleSince.map { Self.clock.string(from: $0) } ?? "just now"
+            let asOf = Self.clock.string(from: model.refreshedAt)
+            lines.append("Pass unreachable since \(since) \u{00B7} showing \(asOf)")
         } else {
             lines.append("Reading the ledgers off disk: "
-                         + (controller.model.passError ?? "the Pass feed is off"))
+                         + (model.passError ?? "the Pass feed is off"))
         }
         lines.append("Looking at \(controller.config.pass.describe)")
         if let problem = controller.config.pass.fileProblem {

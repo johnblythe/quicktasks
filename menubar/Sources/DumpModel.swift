@@ -35,6 +35,12 @@ import Foundation
 
 enum DumpModel {
     static func run(args: [String]) -> Int32 {
+        // `--poll-sequence` replaces the rest of this function with a replay
+        // of several simulated polls in one process, so a test can drive the
+        // hold-timer lifecycle deterministically. See `runPollSequence`.
+        if let sequence = value(args, "--poll-sequence") {
+            return runPollSequence(sequence, args: args)
+        }
         // No --limit means the settings window's row limit, the same number the
         // running widget uses. An explicit one wins, so the seam stays
         // deterministic whatever is stored.
@@ -57,7 +63,9 @@ enum DumpModel {
             "source": model.source.rawValue,
             "pass_url": model.passURL,
             "pass_url_source": config.pass.source.rawValue,
-            "pass_reachable": model.source == .pass,
+            "pass_reachable": model.passReachable,
+            "pass_stale_since": stamp(model.passStaleSince),
+            "held_until": stamp(model.heldUntil),
             "pass_error": model.passError ?? NSNull(),
             "item_url_template": model.itemURLTemplate ?? NSNull(),
             "counts": model.counts,
@@ -87,7 +95,7 @@ enum DumpModel {
             "headline_preview": model.headlinePreview(limit: 3, now: now),
             "visible_sections": Array(model.visibleSections).sorted(),
             "aggregate": aggregateJSON(model.aggregate),
-            "headline": model.aggregate.headline,
+            "headline": model.headlineText,
             "badge": model.aggregate.badge,
             "refreshed_at": iso.string(from: model.refreshedAt),
             "warning": model.warning ?? NSNull(),
@@ -256,7 +264,7 @@ enum DumpModel {
             "matched_suggestions": filtered.suggestions.map { $0.itemID },
             // The aggregate is deliberately untouched by the filter: the header
             // keeps counting the feed while the list shows the matches.
-            "headline": filtered.aggregate.headline,
+            "headline": filtered.headlineText,
             "sections": filtered.sections(now: now).map { entry in
                 ["key": entry.section.rawValue, "count": entry.records.count] as [String: Any]
             },
@@ -287,9 +295,65 @@ enum DumpModel {
             "file_url": pass.fileURL ?? NSNull(),
             "file_problem": pass.fileProblem ?? NSNull(),
             "fallback": pass.fallback ?? NSNull(),
+            "rejected": pass.rejected ?? NSNull(),
             "hub_dir": config.hubDir?.path ?? NSNull(),
             "describe": pass.describe,
         ])
+    }
+
+    /// `--dump-model --poll-sequence ok,fail,fail,...`: replays a run of polls
+    /// through the real `Feed.load`/`held` pipeline inside one process,
+    /// carrying the hold-timer state (`previous`) from one simulated poll to
+    /// the next exactly the way `StatusController.refresh()` does. `ok`
+    /// steps make the same real request a live poll would, against whatever
+    /// `config.passURL` is (a test's own fixture); `fail` steps skip the
+    /// network call entirely and inject a synthetic timeout, so a test can
+    /// drive the whole "good poll, Pass goes quiet, held stale, hold runs
+    /// out, falls back to files, Pass recovers, snaps back" lifecycle in one
+    /// deterministic invocation instead of eighteen real 5-second polls.
+    /// `--poll-interval-seconds` (default: the settings window's own default)
+    /// is how far the simulated clock advances between steps.
+    private static func runPollSequence(_ raw: String, args: [String]) -> Int32 {
+        let steps = raw.split(separator: ",", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard !steps.isEmpty, steps.allSatisfy({ $0 == "ok" || $0 == "fail" }) else {
+            return fail("--poll-sequence wants a comma-separated list of ok/fail steps")
+        }
+        let interval = value(args, "--poll-interval-seconds").flatMap(Double.init)
+            ?? Settings.defaultPollInterval
+        let limit = value(args, "--limit").flatMap { Int($0) }
+        let config = StoreConfig.resolve(limit: limit)
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        func stamp(_ d: Date?) -> Any { d.map { iso.string(from: $0) } ?? NSNull() }
+
+        var now = Date()
+        var previous: MenuModel?
+        var results: [[String: Any]] = []
+        for (i, step) in steps.enumerated() {
+            let model: MenuModel
+            if step == "ok" {
+                model = Feed.load(config: config, now: now, previous: previous)
+            } else {
+                model = Feed.pollFailed(config: config, now: now, previous: previous,
+                                        problem: Problem("simulated poll failure"))
+            }
+            results.append([
+                "step": i,
+                "outcome": step,
+                "at": iso.string(from: now),
+                "source": model.source.rawValue,
+                "pass_reachable": model.passReachable,
+                "pass_stale_since": stamp(model.passStaleSince),
+                "held_until": stamp(model.heldUntil),
+                "headline": model.headlineText,
+                "record_count": model.records.count,
+            ])
+            previous = model
+            now = now.addingTimeInterval(interval)
+        }
+        return emit(["poll_sequence": results])
     }
 
     /// `--dump-restart`: the exact request `restart()` would send -- method,

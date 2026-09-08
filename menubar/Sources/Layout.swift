@@ -111,7 +111,7 @@ enum LayoutProbe {
             "section_counts": sectionCounts,
             "visible_ids": visibleIDs,
             "source": model.source.rawValue,
-            "headline": model.aggregate.headline,
+            "headline": model.headlineText,
         ]
 
         return emit(payload)

@@ -61,6 +61,13 @@ enum PassEndpoint {
         /// default port was used instead. nil the rest of the time, including
         /// when probing never ran at all.
         let fallback: String?
+        /// Set only when a probed `.pass-url` target answered, but for a
+        /// different hub checkout than the one this widget is configured for
+        /// -- so it was stepped over rather than trusted. nil the rest of the
+        /// time, including when probing never ran at all. Surfaced by
+        /// `--dump-endpoint` so a v6 test (and a confused John) can see why a
+        /// live Pass was not used.
+        let rejected: String?
 
         init(url: URL?,
              source: Source,
@@ -68,7 +75,8 @@ enum PassEndpoint {
              fileURL: String?,
              fileProblem: String?,
              settingProblem: String? = nil,
-             fallback: String? = nil) {
+             fallback: String? = nil,
+             rejected: String? = nil) {
             self.url = url
             self.source = source
             self.file = file
@@ -76,6 +84,7 @@ enum PassEndpoint {
             self.fileProblem = fileProblem
             self.settingProblem = settingProblem
             self.fallback = fallback
+            self.rejected = rejected
         }
 
         /// One line for the footer tooltip: where the widget is looking, and why.
@@ -91,23 +100,36 @@ enum PassEndpoint {
         }
     }
 
-    /// Discovery order: QT_PASS_URL, then the settings window's Pass URL, then
-    /// the hub checkout's `.pass-url`, then port 8811. An empty QT_PASS_URL
-    /// disables the Pass feed entirely and pins the widget to the file ledgers,
-    /// which is also how the tests keep the file-feed cases deterministic on a
-    /// machine where the Pass is up.
+    /// Discovery order (LD-201 v6): QT_PASS_URL, then the settings window's
+    /// Pass URL, then port 8811 when it answers, then the hub checkout's
+    /// `.pass-url` when it answers AND names this same hub, then the file
+    /// ledgers. An empty QT_PASS_URL disables the Pass feed entirely and pins
+    /// the widget to the file ledgers, which is also how the tests keep the
+    /// file-feed cases deterministic on a machine where the Pass is up.
     ///
     /// The environment stays ahead of the setting on purpose: QT_PASS_URL is
     /// how a test points the widget at an ephemeral port, and a stored
     /// preference that could shadow it would make the widget's behaviour depend
     /// on which of two places was written last.
     ///
-    /// Only the configured hub's `.pass-url` is read -- `~/code/hub`'s when no
-    /// hub is configured -- so the widget never discovers a Pass belonging to a
-    /// checkout it was not pointed at.
-    /// `probe` gates a live reachability check on a `.file`-sourced result --
-    /// off by default, so most callers still make no request at all. See
-    /// `reachable(_:timeout:)`.
+    /// 8811 outranks `.pass-url` now, not the other way around: `.pass-url` is
+    /// rewritten by every server that ever binds in the hub checkout, tests
+    /// included, and a restart race or a leftover test server can leave it
+    /// pointing at 8812 while the real Pass sits on 8811 the whole time. A
+    /// `.pass-url` target is still worth trusting when 8811 itself is down --
+    /// that is the case it exists for, a Pass that lost the port -- but only
+    /// for the hub this widget is configured for (`~/code/hub` when none is
+    /// configured): its `instance.hub_dir`, resolved and compared against the
+    /// configured hub dir, has to match, or an absent `instance` on an older
+    /// Pass is accepted as "unknown, not different". A mismatch is reported in
+    /// `rejected` and stepped over rather than trusted.
+    ///
+    /// `probe` gates all of this -- off by default, so most callers (the CLI
+    /// dump seams that just need *a* URL to talk to, not a verified one) still
+    /// make no request at all and keep the pre-v6 behaviour of trusting a
+    /// present `.pass-url` outright. It is on for the live poll and for
+    /// `--dump-endpoint`. See `standardURL(env:)` for how a test redirects the
+    /// 8811 probe without touching the real port.
     static func resolution(env: [String: String] = ProcessInfo.processInfo.environment,
                            hubDir: URL? = nil,
                            settings: Settings = .load(),
@@ -139,18 +161,57 @@ enum PassEndpoint {
         case nil:
             break
         }
+
+        let standard = standardURL(env: env)
+
+        guard probe else {
+            // Unprobed: the pre-v6 behaviour, unchanged. Trust a present
+            // `.pass-url` outright and fall back to the default port when
+            // there is none -- no network call either way.
+            switch read(file: file) {
+            case .success(let url)?:
+                return Resolution(url: url, source: .file, file: file,
+                                  fileURL: url.absoluteString, fileProblem: nil,
+                                  settingProblem: settingProblem)
+            case .failure(let problem)?:
+                return Resolution(url: standard, source: .standard, file: file,
+                                  fileURL: nil, fileProblem: problem.message,
+                                  settingProblem: settingProblem)
+            case nil:
+                return Resolution(url: standard, source: .standard, file: file,
+                                  fileURL: nil, fileProblem: nil,
+                                  settingProblem: settingProblem)
+            }
+        }
+
+        // Probed: 8811 first. A Pass that is actually up on the default port
+        // answers here and nothing else gets consulted.
+        if probeStatus(standard) != nil {
+            return Resolution(url: standard, source: .standard, file: file,
+                              fileURL: nil, fileProblem: nil,
+                              settingProblem: settingProblem)
+        }
+
         switch read(file: file) {
         case .success(let url)?:
-            if probe, !reachable(url) {
-                // The file said something, but nothing answers there -- the
-                // Pass that wrote it is gone, and polling a dead port forever
-                // is worse than falling back to the port a fresh serve.py
-                // would have bound. The raw file contents are still kept in
-                // `fileURL` so Settings can show what was found.
-                return Resolution(url: URL(string: defaultURL), source: .standard, file: file,
+            guard let status = probeStatus(url) else {
+                // The file said something, but nothing answers there either --
+                // the Pass that wrote it is gone too. The raw file contents
+                // are still kept in `fileURL` so Settings can show what was
+                // found.
+                return Resolution(url: standard, source: .standard, file: file,
                                   fileURL: url.absoluteString, fileProblem: nil,
                                   settingProblem: settingProblem,
                                   fallback: "8811 (pass-url target unreachable)")
+            }
+            if let other = hubMismatch(status.instance, configuredHubDir: hubDir) {
+                // Answers, but for a checkout this widget was not pointed at
+                // -- exactly the stray-test-server case this order exists to
+                // guard against. Reported, then stepped over.
+                return Resolution(url: standard, source: .standard, file: file,
+                                  fileURL: url.absoluteString, fileProblem: nil,
+                                  settingProblem: settingProblem,
+                                  rejected: "\(url.absoluteString) serves \(other)")
             }
             return Resolution(url: url, source: .file, file: file,
                               fileURL: url.absoluteString, fileProblem: nil,
@@ -158,14 +219,53 @@ enum PassEndpoint {
         case .failure(let problem)?:
             // A malformed or non-loopback file is reported and then ignored, so
             // a half-written file cannot take the feed down with it.
-            return Resolution(url: URL(string: defaultURL), source: .standard, file: file,
+            return Resolution(url: standard, source: .standard, file: file,
                               fileURL: nil, fileProblem: problem.message,
                               settingProblem: settingProblem)
         case nil:
-            return Resolution(url: URL(string: defaultURL), source: .standard, file: file,
+            return Resolution(url: standard, source: .standard, file: file,
                               fileURL: nil, fileProblem: nil,
                               settingProblem: settingProblem)
         }
+    }
+
+    /// The default-port candidate discovery probes first. `QT_PASS_DEFAULT_URL`
+    /// wins when a test set it, so a discovery test can simulate "8811
+    /// answered" or "8811 is down" against an ephemeral fixture; production
+    /// behaviour is unchanged -- the env var is never set outside a test, so
+    /// this always resolves to the literal `defaultURL`. Internal test seam
+    /// only; not documented as a user-facing setting.
+    static func standardURL(env: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+        if let raw = env["QT_PASS_DEFAULT_URL"]?.trimmingCharacters(in: .whitespaces),
+           !raw.isEmpty, let url = URL(string: raw) {
+            return url
+        }
+        return URL(string: defaultURL)!
+    }
+
+    /// The decoded payload when `url` answers with something Pass-shaped, nil
+    /// otherwise. Needs the payload itself, not just a Bool, because the
+    /// `.pass-url` step has to see `instance.hub_dir` to decide whether the
+    /// answer is even for the right checkout.
+    private static func probeStatus(_ url: URL, timeout: TimeInterval = 1.0) -> PassStatus? {
+        switch PassClient(base: url, statusTimeout: timeout).status() {
+        case .success(let status): return status
+        case .failure: return nil
+        }
+    }
+
+    /// nil when `instance` is absent (an older Pass -- read as "unknown", not
+    /// "different") or its `hub_dir` resolves to the same directory as the one
+    /// this widget is configured for. Otherwise the other Pass's hub_dir, as
+    /// it reported it, for the rejection message.
+    private static func hubMismatch(_ instance: PassInstance?, configuredHubDir: URL?) -> String? {
+        guard let theirs = instance?.hubDir else { return nil }
+        let ours = configuredHubDir
+            ?? URL(fileURLWithPath: (defaultHubDir as NSString).expandingTildeInPath)
+        let theirsResolved = URL(fileURLWithPath: (theirs as NSString).expandingTildeInPath)
+            .resolvingSymlinksInPath().path
+        let oursResolved = ours.resolvingSymlinksInPath().path
+        return theirsResolved == oursResolved ? nil : theirs
     }
 
     static func resolve(env: [String: String] = ProcessInfo.processInfo.environment,
@@ -173,19 +273,6 @@ enum PassEndpoint {
                         settings: Settings = .load(),
                         probe: Bool = false) -> URL? {
         resolution(env: env, hubDir: hubDir, settings: settings, probe: probe).url
-    }
-
-    /// Whether a discovered `.pass-url` target is worth trusting: reuses
-    /// `status()` rather than a bespoke probe, since a target that answers
-    /// with something that is not Pass JSON is exactly as useless as one that
-    /// does not answer at all. Timeout is short -- this runs inline in
-    /// discovery, so it costs a poll or a `--dump-endpoint` call at most one
-    /// extra second, not the ~1.5s `PassClient.status()` allows a live feed.
-    static func reachable(_ url: URL, timeout: TimeInterval = 1.0) -> Bool {
-        switch PassClient(base: url, statusTimeout: timeout).status() {
-        case .success: return true
-        case .failure: return false
-        }
     }
 
     static func urlFile(hubDir: URL?) -> URL {

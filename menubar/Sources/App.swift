@@ -135,6 +135,11 @@ final class StatusController: ObservableObject {
     var hasLiveRows: Bool { model.records.contains { $0.status.isActive } }
 
     func refresh() {
+        // Snapshotted on the main thread before the hop to background, so the
+        // hold-timer logic sees exactly what the last poll left on screen,
+        // with no race against this same property being read or written back
+        // on the main thread while the background block is in flight.
+        let previous = model
         // Feed.load blocks on a loopback request, so it must never run on the
         // main thread: a wedged Pass would freeze the open menu. The config is
         // resolved out here too, so re-reading .pass-url and the settings costs
@@ -145,7 +150,7 @@ final class StatusController: ObservableObject {
             // behind by a Pass that has since died, rather than polling a
             // dead port until the app is relaunched.
             let config = StoreConfig.resolve(probeDiscovery: true)
-            let fresh = Feed.load(config: config)
+            let fresh = Feed.load(config: config, previous: previous)
             DispatchQueue.main.async {
                 self?.config = config
                 self?.model = fresh

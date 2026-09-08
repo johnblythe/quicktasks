@@ -162,14 +162,18 @@ class ModelCase(unittest.TestCase):
 
     def endpoint(self, extra_env=None):
         """`--dump-endpoint` with QT_PASS_URL *absent*, so the rest of the
-        discovery order is actually reachable. Makes no request, which is the
-        point: a discovery test must not depend on what is really listening on
-        8811, and must never poll John's live Pass."""
+        discovery order is actually reachable. QT_PASS_DEFAULT_URL is pinned
+        to a closed port by default: LD-201 v6 probes that slot (port 8811 in
+        production) before anything else, and a discovery test must not
+        depend on what is really listening on 8811, and must never poll
+        John's live Pass. A case that wants to exercise "8811 answers" passes
+        its own QT_PASS_DEFAULT_URL, pointed at a fixture, in extra_env."""
         env = dict(os.environ)
         env.pop("QT_PASS_URL", None)
         env["QT_DATA"] = str(self.qt_data)
         env["QT_HUB"] = str(self.hub)
         env["QT_MENUBAR_AGENT_PLIST"] = str(self.tmp / "agents" / "never-written.plist")
+        env["QT_PASS_DEFAULT_URL"] = DEAD_DEFAULT_URL
         env.update(extra_env or {})
         proc = subprocess.run([str(BINARY), "--dump-endpoint"], capture_output=True,
                               text=True, timeout=60, env=env)
@@ -547,7 +551,7 @@ def need(item_id, reason, **fields):
 
 
 def status_fixture(jobs=(), needs=(), groups=None, counts=None, pass_url=None,
-                   item_url_template=None):
+                   item_url_template=None, instance=None):
     payload = {
         "generated_at": _iso(datetime.now()),
         "groups": groups if groups is not None else [
@@ -563,7 +567,22 @@ def status_fixture(jobs=(), needs=(), groups=None, counts=None, pass_url=None,
         payload["pass_url"] = pass_url
     if item_url_template is not None:
         payload["item_url_template"] = item_url_template
+    # (LD-201 v6) Who answered, and which hub checkout they serve. Omitted
+    # by default -- most fixtures are testing something else entirely, and
+    # a payload with no "instance" key at all is exactly how a Pass that
+    # predates this field looks.
+    if instance is not None:
+        payload["instance"] = instance
     return payload
+
+
+# A guaranteed-closed loopback port, standing in for "port 8811 does not
+# answer" via QT_PASS_DEFAULT_URL (LD-201 v6 always probes that slot first).
+# Kept distinct from the plain 127.0.0.1:1 used elsewhere in this file for an
+# unreachable *.pass-url file* target, so a failure message says which one
+# was closed. Never the real 8811: a discovery test must not depend on what
+# is really listening there, and must never poll John's live Pass.
+DEAD_DEFAULT_URL = "http://127.0.0.1:2"
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1616,14 +1635,19 @@ class TestItemDeepLink(PassCase):
 
 
 class TestPassDiscovery(PassCase):
-    """Where the widget looks for The Pass: QT_PASS_URL, then the hub
-    checkout's .pass-url, then port 8811. Driven through --dump-endpoint.
-    Every case that never reaches a `.file`-sourced success (env, setting, no
-    file, a malformed or non-loopback file, the feed switched off) makes no
-    request. A case that does reach one now probes it with a single loopback
-    GET /status.json -- the same request a live poll makes -- so a
-    `.pass-url` naming a fixture that actually answers is used as-is, and one
-    naming a dead port falls back to 8811 instead of being trusted blindly."""
+    """Where the widget looks for The Pass: QT_PASS_URL, then port 8811 (via
+    QT_PASS_DEFAULT_URL in these tests, so a real Pass on 8811 is never
+    touched), then the hub checkout's .pass-url, then port 8811 again as the
+    fallback. Driven through --dump-endpoint. Every case that never reaches a
+    `.file`-sourced success (env, setting, no file, a malformed or
+    non-loopback file, the feed switched off) makes no request beyond the
+    one 8811 probe every probed resolution makes. A case that does reach a
+    `.pass-url` candidate probes it too with a single loopback GET
+    /status.json -- the same request a live poll makes -- so one naming a
+    fixture that actually answers is used as-is, and one naming a dead port
+    falls back to 8811 instead of being trusted blindly. See
+    TestPassDiscoveryHubIdentity for the LD-201 v6 8811-vs-.pass-url
+    precedence and hub-identity checks specifically."""
 
     def test_the_env_override_wins(self):
         self.write_pass_url("http://127.0.0.1:8877/\n")
@@ -1659,7 +1683,7 @@ class TestPassDiscovery(PassCase):
         what was actually found there."""
         self.write_pass_url("http://127.0.0.1:1/\n")
         e = self.endpoint()
-        self.assertEqual(e["pass_url"], "http://127.0.0.1:8811")
+        self.assertEqual(e["pass_url"], DEAD_DEFAULT_URL)
         self.assertEqual(e["source"], "default")
         self.assertEqual(e["file_url"], "http://127.0.0.1:1/")
         self.assertIsNone(e["file_problem"])
@@ -1678,14 +1702,14 @@ class TestPassDiscovery(PassCase):
         """The normal state when The Pass is down: it removes the file on a
         graceful shutdown, and that is not an error."""
         e = self.endpoint()
-        self.assertEqual(e["pass_url"], "http://127.0.0.1:8811")
+        self.assertEqual(e["pass_url"], DEAD_DEFAULT_URL)
         self.assertEqual(e["source"], "default")
         self.assertIsNone(e["file_problem"])
 
     def test_a_malformed_file_is_ignored_and_reported(self):
         self.write_pass_url("not a url at all\n")
         e = self.endpoint()
-        self.assertEqual(e["pass_url"], "http://127.0.0.1:8811")
+        self.assertEqual(e["pass_url"], DEAD_DEFAULT_URL)
         self.assertEqual(e["source"], "default")
         self.assertIn("not a URL", e["file_problem"])
 
@@ -1701,7 +1725,7 @@ class TestPassDiscovery(PassCase):
         not get to choose the host."""
         self.write_pass_url("http://evil.example.com:8811/\n")
         e = self.endpoint()
-        self.assertEqual(e["pass_url"], "http://127.0.0.1:8811")
+        self.assertEqual(e["pass_url"], DEAD_DEFAULT_URL)
         self.assertIn("loopback", e["file_problem"])
 
     def test_a_non_http_file_is_refused(self):
@@ -1746,6 +1770,180 @@ class TestPassDiscovery(PassCase):
         self.assertEqual(m["source"], "pass")
         self.assertEqual(m["pass_url_source"], "file")
         self.assertEqual(self.ids(m), ["alpha"])
+
+
+class TestPassDiscoveryHubIdentity(PassCase):
+    """LD-201 v6: port 8811 is checked before `.pass-url`, and a `.pass-url`
+    target is trusted only when its own /status.json says it is serving the
+    same hub checkout the widget is configured for -- a Pass serving some
+    other checkout answers just fine, it is just not the one this widget
+    should show. Driven through --dump-endpoint, which is the seam that
+    actually probes; --dump-model's own discovery stays unprobed and
+    untouched by any of this (see test_the_discovered_url_is_actually_used
+    above), which is why the hold-timer tests use QT_PASS_URL directly
+    instead of relying on this precedence at all."""
+
+    def test_8811_wins_over_a_pass_url_naming_something_that_also_answers(self):
+        """A .pass-url naming something that answers is not enough any more
+        -- if port 8811 also answers, 8811 wins outright, with no hub-dir
+        check at all: it is the port this widget's own Pass binds to."""
+        default = self.serve(payload=status_fixture())
+        other = self.serve(payload=status_fixture())
+        self.write_pass_url(other + "/\n")
+        e = self.endpoint(extra_env={"QT_PASS_DEFAULT_URL": default})
+        self.assertEqual(e["pass_url"], default)
+        self.assertEqual(e["source"], "default")
+        self.assertIsNone(e["rejected"])
+
+    def test_pass_url_naming_a_different_hub_is_rejected_even_with_8811_down(self):
+        """Answers just fine, just not for this checkout -- must not be
+        trusted no matter what 8811 is doing."""
+        other_hub = str(self.tmp / "someone-elses-hub")
+        base = self.serve(payload=status_fixture(instance={"hub_dir": other_hub}))
+        self.write_pass_url(base + "/\n")
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], DEAD_DEFAULT_URL)
+        self.assertEqual(e["source"], "default")
+        self.assertIsNotNone(e["rejected"])
+        self.assertIn(base, e["rejected"])
+        self.assertIn(other_hub, e["rejected"])
+
+    def test_pass_url_naming_the_same_hub_is_used_when_8811_is_down(self):
+        base = self.serve(payload=status_fixture(instance={"hub_dir": str(self.hub)}))
+        self.write_pass_url(base + "/\n")
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], base + "/")
+        self.assertEqual(e["source"], "file")
+        self.assertIsNone(e["rejected"])
+
+    def test_hub_identity_match_is_realpath_resolved_not_string_equality(self):
+        """A checkout reached through a symlink must not be treated as a
+        different hub than the one the Pass itself reports serving."""
+        real_hub = self.tmp / "real-hub"
+        real_hub.mkdir()
+        link = self.tmp / "hub-link"
+        link.symlink_to(real_hub)
+        base = self.serve(payload=status_fixture(instance={"hub_dir": str(real_hub)}))
+        (link / ".pass-url").write_text(base + "/\n")
+        e = self.endpoint(extra_env={"QT_HUB": str(link)})
+        self.assertEqual(e["pass_url"], base + "/")
+        self.assertEqual(e["source"], "file")
+        self.assertIsNone(e["rejected"])
+
+    def test_no_instance_field_is_accepted_only_once_8811_is_down(self):
+        """A Pass that predates the instance field reads as "unknown", not
+        "different" -- but that leniency only ever kicks in once 8811 has
+        already been checked and found wanting."""
+        base = self.serve(payload=status_fixture())  # no "instance" key at all
+        self.write_pass_url(base + "/\n")
+        e = self.endpoint()
+        self.assertEqual(e["pass_url"], base + "/")
+        self.assertEqual(e["source"], "file")
+        self.assertIsNone(e["rejected"])
+
+    def test_no_instance_field_still_loses_to_a_live_8811(self):
+        default = self.serve(payload=status_fixture())
+        other = self.serve(payload=status_fixture())  # also no "instance"
+        self.write_pass_url(other + "/\n")
+        e = self.endpoint(extra_env={"QT_PASS_DEFAULT_URL": default})
+        self.assertEqual(e["pass_url"], default)
+        self.assertEqual(e["source"], "default")
+
+    def test_qt_pass_url_never_falls_back_even_with_8811_and_the_file_both_live(self):
+        """The env override stays authoritative even when both a live 8811
+        stand-in and a live .pass-url target would otherwise win."""
+        default = self.serve(payload=status_fixture())
+        self.write_pass_url(default + "/\n")
+        e = self.endpoint(extra_env={
+            "QT_PASS_DEFAULT_URL": default,
+            "QT_PASS_URL": "http://127.0.0.1:1",
+        })
+        self.assertEqual(e["pass_url"], "http://127.0.0.1:1")
+        self.assertEqual(e["source"], "env")
+
+
+class TestHoldLastGoodModel(PassCase):
+    """LD-201 v6: a Pass that stops answering keeps showing its last good
+    model for Feed.holdWindow (90s) before the widget gives up and falls
+    back to the file ledgers, so the headline count never alternates between
+    a Pass number and a file-feed number on consecutive 5-second polls.
+    Driven through --dump-model --poll-sequence, which replays a run of polls
+    through the real Feed/held pipeline inside one process rather than
+    waiting out ninety real seconds. QT_PASS_URL points straight at the
+    fixture, so none of this depends on discovery at all."""
+
+    HOLD_WINDOW = 90  # Feed.holdWindow, seconds -- see Feed.swift.
+
+    def poll_sequence(self, base, steps, interval=5, limit=50, extra_env=None):
+        env = dict(os.environ)
+        env["QT_DATA"] = str(self.qt_data)
+        env["QT_HUB"] = ""
+        env["QT_PASS_URL"] = base
+        env["QT_MENUBAR_AGENT_PLIST"] = str(self.tmp / "agents" / "never-written.plist")
+        env.update(extra_env or {})
+        proc = subprocess.run(
+            [str(BINARY), "--dump-model", "--poll-sequence", steps,
+             "--poll-interval-seconds", str(interval), "--limit", str(limit)],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, f"poll-sequence failed: {proc.stderr}")
+        return json.loads(proc.stdout)["poll_sequence"]
+
+    def test_a_single_failure_holds_the_pass_model(self):
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        steps = self.poll_sequence(base, "ok,fail", interval=5)
+        self.assertEqual(steps[0]["source"], "pass")
+        self.assertTrue(steps[0]["pass_reachable"])
+        self.assertIsNone(steps[0]["pass_stale_since"])
+        # One failed poll, well inside the 90s hold: still the Pass's own
+        # model, not a flip to the (empty) file feeds.
+        self.assertEqual(steps[1]["source"], "pass")
+        self.assertFalse(steps[1]["pass_reachable"])
+        self.assertIsNotNone(steps[1]["pass_stale_since"])
+        self.assertIsNotNone(steps[1]["held_until"])
+        self.assertEqual(steps[1]["record_count"], steps[0]["record_count"])
+
+    def test_counts_never_alternate_across_consecutive_failing_polls(self):
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        steps = self.poll_sequence(base, "ok,fail,fail,fail", interval=5)
+        for s in steps[1:]:
+            self.assertEqual(s["source"], "pass")
+            self.assertEqual(s["record_count"], steps[0]["record_count"])
+            self.assertEqual(s["headline"], steps[0]["headline"])
+
+    def test_the_hold_expires_and_falls_back_to_files(self):
+        """90s hold, 5s apart: the 19th consecutive failing poll after the
+        first success is the first to land past the deadline, and from
+        there it must stay given up, not waver, while still failing."""
+        self.write_task("t-local", status="done")
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        steps = self.poll_sequence(base, "ok," + ",".join(["fail"] * 20), interval=5)
+        self.assertEqual(steps[-1]["source"], "files")
+        self.assertIn("file feeds only, Pass down", steps[-1]["headline"])
+        self.assertIsNotNone(steps[-1]["pass_stale_since"])
+        gave_up_at = next(i for i, s in enumerate(steps) if s["source"] == "files")
+        self.assertGreater(gave_up_at, 0)
+        self.assertTrue(all(s["source"] == "files" for s in steps[gave_up_at:]))
+
+    def test_recovery_snaps_back_immediately_even_mid_hold(self):
+        """The very next successful poll after the Pass answers again must
+        show the fresh model right away, not keep holding the old one."""
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        steps = self.poll_sequence(base, "ok,fail,fail,ok", interval=5)
+        self.assertEqual(steps[3]["source"], "pass")
+        self.assertTrue(steps[3]["pass_reachable"])
+        self.assertIsNone(steps[3]["pass_stale_since"])
+        self.assertIsNone(steps[3]["held_until"])
+
+    def test_recovery_snaps_back_even_after_the_hold_already_expired(self):
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        steps = self.poll_sequence(
+            base, "ok," + ",".join(["fail"] * 20) + ",ok", interval=5)
+        self.assertEqual(steps[-2]["source"], "files")
+        self.assertEqual(steps[-1]["source"], "pass")
+        self.assertTrue(steps[-1]["pass_reachable"])
+        self.assertIsNone(steps[-1]["pass_stale_since"])
+        self.assertIsNone(steps[-1]["held_until"])
 
 
 class TestRestart(PassCase):

@@ -298,33 +298,72 @@ still falls back to the item id -- a blank row is worse than an ugly one.
 Timestamps arrive as UTC with six fractional digits and a `+00:00` offset.
 
 **Finding The Pass.** It walks `PORT..PORT+9` looking for a free port, so where
-it is listening is not something the widget can assume. Three sources, in order:
+it is listening is not something the widget can assume. Four sources, in order:
 
 | Order | Source | Notes |
 | --- | --- | --- |
-| 1 | `QT_PASS_URL` | Taken as given. Empty pins the widget to the file ledgers. |
-| 2 | `<hub>/.pass-url` | Written by `serve.py` on bind, removed on a graceful shutdown. |
-| 3 | `http://127.0.0.1:8811` | The default port. |
+| 1 | `QT_PASS_URL` | Taken as given, and never falls back past it -- an override or a test pins an address the widget should not second-guess. Empty pins the widget to the file ledgers. |
+| 2 | `http://127.0.0.1:8811` | The default port, tried before the `.pass-url` file. |
+| 3 | `<hub>/.pass-url` | Written by `serve.py` on bind, removed on a graceful shutdown. Only trusted for the *same* hub this widget is configured for. |
+| 4 | file feeds | The v1 model: `qt` and hub ledgers read straight off disk. |
 
-Discovery re-runs on every poll rather than only at launch, so a Pass that
-restarts on another port is followed without relaunching the widget. Only the
-configured hub's `.pass-url` is read (`~/code/hub`'s when no hub is
-configured), so the widget never discovers a Pass belonging to a checkout it
-was not pointed at. A discovered URL has to be `http` on `127.0.0.1` or
+8811 now outranks `.pass-url`: a restart race or a stray test server can leave
+the file pointing at some other port (commonly 8812) well after the real Pass
+has come back up on the default one, and a widget that trusted the file over a
+live 8811 would show that stale target's numbers as if they were the hub's own.
+Trying 8811 first means a healthy default-port Pass is never shadowed by a
+leftover file.
+
+`.pass-url` is only trusted once its own `/status.json` says it is answering
+for *this* hub: the payload's `instance.hub_dir`, realpath-resolved, has to
+match the widget's own configured hub dir (`~/code/hub` when none is set). A
+mismatch is not treated as "unreachable" -- it is reported by name, because a
+different Pass answering is a more specific problem than one not answering at
+all:
+
+```
+rejected: "http://127.0.0.1:8812 serves /Users/john/code/other-hub"
+```
+
+An older Pass whose payload has no `instance` field at all cannot make this
+claim either way, so it is accepted only once 8811 has already failed to
+answer -- exactly the case that predates this check, never as a way to shadow
+a live default-port Pass. Discovery re-runs on every poll rather than only at
+launch, so a Pass that restarts on another port is followed without
+relaunching the widget. A discovered URL has to be `http` on `127.0.0.1` or
 `localhost`: this is a file read without anyone asking, so it does not get to
 choose the host. A malformed, empty, or non-loopback file is reported in the
 footer tooltip and then ignored, so a file caught mid-write cannot take the feed
 down with it. An absent file is not a problem at all -- it is the normal state
 when The Pass is down.
 
-A `.pass-url` naming a target that does not answer is treated the same way: a
-single loopback `GET /status.json`, given about a second to respond, decides
-whether the file is trusted or a stale one is falling back to the default port
-instead. `QT_PASS_URL` skips this probe and is always taken as given, since it
-is how a test or an override pins down an address the widget should not
-second-guess. The footer tooltip and `--dump-endpoint` both still show the raw
-file contents alongside whichever address was actually used, so a fallback
-never looks identical to a live read.
+A `.pass-url` naming a target that does not answer is treated the same way as
+a rejected one: a single loopback `GET /status.json`, given about a second to
+respond, decides whether the file is trusted or the widget falls through to
+the files instead. The footer tooltip and `--dump-endpoint` both still show the
+raw file contents alongside whichever address was actually used, so a fallback
+or a rejection never looks identical to a live read.
+
+**Holding the last good model.** The Pass server is single-threaded and stalls
+occasionally; without this, a single slow poll would flip the headline from a
+Pass count to a file count and back on the very next 5-second tick. Instead, a
+failed poll after at least one Pass success keeps rendering the last
+successful Pass model, unchanged, for up to 90 seconds -- the footer dot turns
+amber and its tooltip reads `Pass unreachable since HH:MM · showing HH:MM`
+(the last good refresh time). Only once that window runs out does the model
+fall back to the files, and the headline then says so:
+`<headline> · file feeds only, Pass down`. The very first poll after The Pass
+answers again snaps back immediately, whether that recovery lands mid-hold or
+after the window has already expired and the widget is already showing files.
+Counts never alternate between the two sources on consecutive polls.
+
+Three states, visible in both the footer and `--dump-model`:
+
+| State | Footer dot | `source` | `pass_reachable` | `pass_stale_since` | `held_until` |
+| --- | --- | --- | --- | --- | --- |
+| Pass live | green | `pass` | `true` | `null` | `null` |
+| Pass held (stale) | amber | `pass` | `false` | set | set |
+| Files only | grey | `files` | `false` | set once The Pass has gone down, else `null` | `null` |
 
 Even in Pass mode the qt ledger is still read and merged. A task fired with `qt`
 (or with this widget's quick-fire) does not reach The Pass until it finishes,
@@ -404,12 +443,21 @@ the result: both a test seam and a read-only way to inspect live state without
 opening the menu. The three `--dump-*` payload flags print request bodies
 without sending them, because payload construction is the part of an HTTP client
 most worth pinning down and the part least worth a live server to check.
-`--dump-endpoint` prints the resolved base URL, which of the three sources it
-came from, and why a `.pass-url` was ignored if it was. A result sourced from
-the file is probed with one loopback `GET /status.json` and reports the
-fallback if that target did not answer; every other source still makes no
-request, so most of discovery stays testable without depending on what is
-really listening. `--dump-keys` walks the highlight over the visible rows
+`--dump-endpoint` prints the resolved base URL, which of the four sources it
+came from, and why a `.pass-url` was ignored if it was -- either `fallback`
+(did not answer) or `rejected` (answered, but for a different hub). 8811 is
+probed first via `QT_PASS_DEFAULT_URL` (default `http://127.0.0.1:8811`, a
+seam so a test can point the probe at a guaranteed-closed loopback address
+instead of ever depending on, or touching, a real Pass on the real port); a
+`.pass-url` target is probed only when that fails, with one loopback
+`GET /status.json` each, so most of discovery stays testable without
+depending on what is really listening. `--dump-model --poll-sequence
+ok,fail,fail` replays a whole run of polls -- `ok` makes a real call against
+whatever `QT_PASS_URL` points at, `fail` synthesizes a timeout with no network
+call at all -- each one `--poll-interval-seconds` (default 5) apart on a
+synthetic clock, and prints a `poll_sequence` array with each step's `source`,
+`pass_reachable`, `pass_stale_since`, `held_until`, `headline`, and
+`record_count`: the seam the hold-timer tests drive. `--dump-keys` walks the highlight over the visible rows
 (default collapse, as a freshly opened menu would show them) and prints where
 it lands and what return would do there; `tab`, `cmd-1`, `cmd-2`, and
 `cmd-return` drive the same mode flip and one-shot other-mode fire the field's
@@ -440,8 +488,9 @@ Environment:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `QT_DATA` | `~/.quicktasks` | quicktasks data dir |
-| `QT_HUB` | `config.json`'s `hub_dir` | hub checkout; empty means the hub feed is off. Also where `.pass-url` is read from |
-| `QT_PASS_URL` | `<hub>/.pass-url`, else `http://127.0.0.1:8811` | The Pass's base URL; empty pins the widget to the file ledgers |
+| `QT_HUB` | `config.json`'s `hub_dir` | hub checkout; empty means the hub feed is off. Also where `.pass-url` is read from, and the hub dir `.pass-url` targets are checked against |
+| `QT_PASS_URL` | discovery: 8811, else `.pass-url` for this hub, else the file ledgers | The Pass's base URL; taken as given and never falls back past it. Empty pins the widget to the file ledgers |
+| `QT_PASS_DEFAULT_URL` | `http://127.0.0.1:8811` | The address discovery probes first; a test seam so 8811-probing never has to touch a real Pass |
 | `QT_BIN` | `~/.local/bin/qt` and friends | path to the `qt` script |
 | `QT_MENUBAR_FIRE_DIR` | the directory chip's own choice, else `$HOME` | working directory for quick-fired tasks; outranks the chip, loses to a typed `--in`/`@` prefix |
 | `QT_MENUBAR_AGENT_PLIST` | `~/Library/LaunchAgents/…` | LaunchAgent path the login switch reads and writes |
@@ -456,9 +505,9 @@ the remembered settings without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-215 tests in `tests/test_menubar_model.py` (227 across the whole suite, 25 of
-them new for the mode hotkeys, the summon hotkey, and the fire directory).
-They build the app and drive the
+227 tests in `tests/test_menubar_model.py` (239 across the whole suite, 12 of
+them new for the v6 discovery precedence and the last-good-model hold). They
+build the app and drive the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in
@@ -467,9 +516,15 @@ by `finished` (and the v1 reconstruction it falls back to), report URL
 construction, the deep link's substitution and its two fallbacks, the job
 booleans outranking the status string, `can_run` and the `POST /run` body, the
 409 wordings and the 400 that is not dressed up as one, Pass discovery in all
-three orders including a malformed, empty, non-loopback, or non-http
-`.pass-url`, falling back to the default port when a discovered file names a
-target that does not answer, `POST /restart`'s supervised, unsupervised, 404,
+four orders including a malformed, empty, non-loopback, or non-http
+`.pass-url`, falling back to the files when a discovered file names a target
+that does not answer, `.pass-url` rejected by a mismatched `instance.hub_dir`
+even with 8811 down, realpath-resolved hub-dir equality rather than string
+equality, a payload with no `instance` field accepted only once 8811 has
+failed, `QT_PASS_URL` never falling back even with both 8811 and the file
+live, the full hold-timer lifecycle from a good poll through a run of failures
+to the fallback and an immediate snap-back on recovery (mid-hold and after the
+window has already expired), `POST /restart`'s supervised, unsupervised, 404,
 and 403 outcomes, the keyboard highlight's walk and its clamped ends, fallback to
 the files when The Pass is unreachable or answers garbage or answers something
 that is not a status payload, the Pass/ledger merge in both directions, capture

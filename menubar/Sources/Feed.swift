@@ -17,8 +17,23 @@
 import Foundation
 
 enum Feed {
+    /// How long a Pass that stops answering keeps showing its last successful
+    /// model before the widget gives up and falls back to the file ledgers.
+    /// Long enough to ride out one wedged poll (the Pass server is
+    /// single-threaded and does stall) or a restart without the header
+    /// flapping between two different counts every 5 seconds; short enough
+    /// that a Pass that is actually down for a while still says so.
+    static let holdWindow: TimeInterval = 90
+
+    /// `previous` is the model this same feed returned last poll -- the
+    /// widget's own memory of "the last thing that actually worked", not
+    /// anything re-derived here. Nil on the very first poll, and whenever a
+    /// caller (a one-shot `--dump-*` seam) has nothing to carry forward;
+    /// either way a failure then falls straight to the files, same as before
+    /// the hold existed.
     static func load(config: StoreConfig,
                      now: Date = Date(),
+                     previous: MenuModel? = nil,
                      client: PassClient? = nil) -> MenuModel {
         guard let passURL = config.passURL else {
             return Store.load(config: config, now: now)
@@ -26,6 +41,55 @@ enum Feed {
         let pass = client ?? PassClient(base: passURL)
         switch pass.status() {
         case .failure(let problem):
+            return held(problem: problem, config: config, now: now,
+                       previous: previous, passURL: passURL)
+        case .success(let status):
+            return merge(status: status, config: config, now: now)
+        }
+    }
+
+    /// What a failed poll shows: the last successful Pass model, unchanged,
+    /// for up to `holdWindow` seconds past the *first* failure in a run of
+    /// them -- so the count on screen never alternates between a Pass number
+    /// and a file-feed number from one 5-second poll to the next. Falls back
+    /// to the file ledgers once the window runs out, and marks the fallback
+    /// so the headline can say the Pass is the reason.
+    private static func held(problem: Problem,
+                             config: StoreConfig,
+                             now: Date,
+                             previous: MenuModel?,
+                             passURL: URL) -> MenuModel {
+        if let previous, previous.source == .pass {
+            // `previous` is either the last live poll (passStaleSince nil --
+            // this is the first failure) or itself already a held model
+            // (passStaleSince set -- carry the *original* failure time
+            // forward rather than resetting the clock on every subsequent
+            // failed poll).
+            let staleSince = previous.passStaleSince ?? now
+            let deadline = previous.heldUntil ?? staleSince.addingTimeInterval(holdWindow)
+            if now < deadline {
+                return MenuModel(records: previous.records,
+                                 aggregate: previous.aggregate,
+                                 refreshedAt: previous.refreshedAt,
+                                 warning: previous.warning,
+                                 source: .pass,
+                                 passURL: passURL.absoluteString,
+                                 passError: problem.message,
+                                 groups: previous.groups,
+                                 itemURLTemplate: previous.itemURLTemplate,
+                                 counts: previous.counts,
+                                 truncated: previous.truncated,
+                                 suggestions: previous.suggestions,
+                                 suggestionsAvailable: previous.suggestionsAvailable,
+                                 visibleSections: config.settings.visibleSections,
+                                 passReachable: false,
+                                 passStaleSince: staleSince,
+                                 heldUntil: deadline)
+            }
+            // The window ran out and the Pass is still not answering: give up
+            // and show the files, but keep `passStaleSince` so the headline
+            // can say file feeds are standing in for a Pass that went down,
+            // not that no Pass was ever configured.
             let files = Store.load(config: config, now: now)
             return MenuModel(records: files.records,
                              aggregate: files.aggregate,
@@ -35,12 +99,62 @@ enum Feed {
                              passURL: passURL.absoluteString,
                              passError: problem.message,
                              groups: [],
-                             // No Pass, no suggestions: the engine lives there,
-                             // and the ledgers have never heard of it.
-                             visibleSections: config.settings.visibleSections)
-        case .success(let status):
-            return merge(status: status, config: config, now: now)
+                             visibleSections: config.settings.visibleSections,
+                             passReachable: false,
+                             passStaleSince: staleSince)
         }
+        if let previous, previous.source == .files, let staleSince = previous.passStaleSince {
+            // Already gave up on a Pass that went down and still is not
+            // answering. Once the fallback above fires once, `previous.source`
+            // is `.files` forever after, so without this branch every
+            // following failed poll would fall into the "never had a Pass"
+            // case below and silently drop `passStaleSince` -- erasing the
+            // "Pass down" suffix from the headline on the very next poll
+            // after the fallback happened. Keep saying why.
+            let files = Store.load(config: config, now: now)
+            return MenuModel(records: files.records,
+                             aggregate: files.aggregate,
+                             refreshedAt: files.refreshedAt,
+                             warning: files.warning,
+                             source: .files,
+                             passURL: passURL.absoluteString,
+                             passError: problem.message,
+                             groups: [],
+                             visibleSections: config.settings.visibleSections,
+                             passReachable: false,
+                             passStaleSince: staleSince)
+        }
+        // Nothing successful to hold onto, ever -- straight to the files,
+        // same as every poll before this feature existed.
+        let files = Store.load(config: config, now: now)
+        return MenuModel(records: files.records,
+                         aggregate: files.aggregate,
+                         refreshedAt: files.refreshedAt,
+                         warning: files.warning,
+                         source: .files,
+                         passURL: passURL.absoluteString,
+                         passError: problem.message,
+                         groups: [],
+                         // No Pass, no suggestions: the engine lives there,
+                         // and the ledgers have never heard of it.
+                         visibleSections: config.settings.visibleSections,
+                         passReachable: false)
+    }
+
+    /// Test-only entry point for `--dump-model --poll-sequence`: runs exactly
+    /// the failure path `load()` runs when a poll times out, without making
+    /// any network call, so a test can simulate "the Pass did not answer"
+    /// deterministically rather than depending on a fixture actually being
+    /// unreachable. `problem` is never shown; it only becomes `passError`.
+    static func pollFailed(config: StoreConfig,
+                           now: Date,
+                           previous: MenuModel?,
+                           problem: Problem) -> MenuModel {
+        guard let passURL = config.passURL else {
+            return Store.load(config: config, now: now)
+        }
+        return held(problem: problem, config: config, now: now,
+                   previous: previous, passURL: passURL)
     }
 
     /// Pass rows, with the qt ledger folded in on the shared dedup key.
@@ -78,7 +192,10 @@ enum Feed {
             truncated: status.truncated,
             suggestions: status.suggestions,
             suggestionsAvailable: status.suggestionsAvailable,
-            visibleSections: config.settings.visibleSections
+            visibleSections: config.settings.visibleSections,
+            // A poll that got this far reached the Pass; nothing to hold,
+            // whether or not the last one did.
+            passReachable: true
         ).trimmed(to: config.limit)
     }
 
