@@ -641,7 +641,7 @@ class FixturePass:
 
     def __init__(self, payload=None, raw=None, status_code=200,
                  post_body=None, post_code=200, post_text=None,
-                 post_codes=None):
+                 post_codes=None, payloads=None):
         self.payload = payload
         self.raw = raw
         self.status_code = status_code
@@ -654,6 +654,18 @@ class FixturePass:
         # feature-detects against. Falls back to post_code for any path not
         # named here.
         self.post_codes = dict(post_codes or {})
+        # LD-201 v9: a list of payloads served one per GET, in order, holding
+        # on the last once exhausted -- lets a test change what /status.json
+        # says between one real poll and the next (a job present, then
+        # absent, then present again with a different status), the only way
+        # to make a job actually vanish from a fresh MenuModel's records:
+        # Feed.held's hold-last-good-model path always carries `previous`'s
+        # records forward unchanged, so a "fail" step alone can never do
+        # this -- only a genuinely different successful response can.
+        # Mutually exclusive with `payload`/`raw`; ignored if neither is None
+        # so existing single-payload fixtures are unaffected.
+        self.payloads = list(payloads) if payloads is not None else None
+        self._payload_index = 0
         self.gets = []
         self.posts = []
         self._srv = None
@@ -664,6 +676,10 @@ class FixturePass:
     def status_bytes(self):
         if self.raw is not None:
             return self.raw.encode() if isinstance(self.raw, str) else self.raw
+        if self.payloads is not None:
+            i = min(self._payload_index, len(self.payloads) - 1)
+            self._payload_index += 1
+            return json.dumps(self.payloads[i]).encode()
         return json.dumps(self.payload or {}).encode()
 
     def start(self):
@@ -3278,3 +3294,212 @@ class TestRejectedHubExactWording(PassCase):
         e = self.endpoint()
         self.assertEqual(e["rejected"],
                          f"Found a Pass on {base}/ serving {other_hub}; ignoring it")
+
+
+class TestHealthEpisodeNotifications(PassCase):
+    """LD-201 v9: v8 posted a "Pass isn't answering"/"Pass is back" pair on
+    every raw held-stale/files-only/normal transition, unconditionally --
+    overnight, ordinary load-induced blips (one slow poll, nowhere near an
+    actual outage) read as a notification storm even though the Pass server
+    itself never restarted. HealthEpisodeTracker (Transitions.swift) instead
+    tracks one continuous run of not-normal polls as a single episode, and
+    only tells the notifier once it has run at least `healthNotifyAfter`
+    (45s) or degraded all the way to files-only, then rate-limits to at most
+    one down/back pair every `notifyRateLimit` (10 minutes). Driven through
+    --dump-notifications, the standalone-tracker sibling of --poll-sequence:
+    it replays the same ok/fail vocabulary through the real Feed pipeline
+    and a real HealthEpisodeTracker, but on a simulated clock, so a 45-second
+    gate and a 10-minute rate limit can be proven in a single fast process
+    rather than actually waiting them out."""
+
+    NOTIFY_AFTER = 45     # HealthEpisodeTracker.healthNotifyAfter, seconds.
+    RATE_LIMIT = 600      # HealthEpisodeTracker.notifyRateLimit, seconds.
+
+    def notify_sequence(self, base, steps, interval=5, hold_window=None, extra_env=None):
+        env = dict(os.environ)
+        env["QT_DATA"] = str(self.qt_data)
+        env["QT_HUB"] = ""
+        env["QT_PASS_URL"] = base
+        env["QT_MENUBAR_AGENT_PLIST"] = str(self.tmp / "agents" / "never-written.plist")
+        env.update(extra_env or {})
+        args = [str(BINARY), "--dump-notifications", steps,
+                "--poll-interval-seconds", str(interval)]
+        if hold_window is not None:
+            args += ["--hold-window-seconds", str(hold_window)]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(proc.returncode, 0, f"dump-notifications failed: {proc.stderr}")
+        return json.loads(proc.stdout)
+
+    def test_a_lone_blip_produces_no_notification_and_one_seen_outcome(self):
+        """A single failed poll that recovers on the very next one -- an
+        ordinary network hiccup -- must never reach the notifier, and must
+        land in the outcome queue already marked seen: it is history the
+        moment it is recorded, not news worth an unread banner."""
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        result = self.notify_sequence(base, "ok,fail,ok", interval=5)
+        self.assertEqual(result["notified"], [])
+        self.assertEqual(len(result["outcomes"]), 1)
+        outcome = result["outcomes"][0]
+        self.assertEqual(outcome["kind"], "info")
+        self.assertEqual(outcome["title"], "Pass blipped for 5s")
+        self.assertTrue(outcome["seen"])
+
+    def test_ten_fails_spanning_45s_then_recovery_notifies_once_each_way(self):
+        """Ten consecutive 5-second-spaced failures cross the 45-second
+        gate on the tenth; the very next successful poll must send exactly
+        one "Pass is back" to match the one "Pass isn't answering" that
+        already went out -- never zero, never a second pair for the same
+        episode."""
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        steps = "ok," + ",".join(["fail"] * 10) + ",ok"
+        result = self.notify_sequence(base, steps, interval=5)
+        self.assertEqual(len(result["notified"]), 2)
+        down, back = result["notified"]
+        self.assertEqual(down, {"title": "Pass isn't answering",
+                                "body": "Holding the last update."})
+        self.assertEqual(back, {"title": "Pass is back", "body": None})
+        self.assertEqual([o["title"] for o in result["outcomes"]],
+                         ["Pass isn't answering", "Pass is back"])
+        self.assertFalse(result["outcomes"][0]["seen"])
+        self.assertFalse(result["outcomes"][1]["seen"])
+
+    def test_nine_fails_under_45s_then_recovery_is_still_just_a_blip(self):
+        """Nine 5-second-spaced failures reach only 40s elapsed at the ninth
+        (still under the 45s gate) before the very next poll recovers --
+        the gate is checked once per failing poll, so a recovery that lands
+        one poll short of it must still read as a blip, never a down/back
+        pair, whatever the episode's total span reports."""
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        steps = "ok," + ",".join(["fail"] * 9) + ",ok"
+        result = self.notify_sequence(base, steps, interval=5)
+        self.assertEqual(result["notified"], [])
+        self.assertEqual(len(result["outcomes"]), 1)
+        outcome = result["outcomes"][0]
+        self.assertEqual(outcome["kind"], "info")
+        self.assertTrue(outcome["title"].startswith("Pass blipped for "))
+        self.assertTrue(outcome["seen"])
+        # None of the nine failing polls ever flipped notifiedDown -- the
+        # 40s-elapsed ninth fail stayed under the 45s gate every time it was
+        # checked, which is the actual behavior under test.
+        for step in result["notifications"][1:10]:
+            self.assertFalse(step["notified_down"])
+
+    def test_a_second_episode_inside_the_rate_limit_records_but_does_not_notify(self):
+        """12 fails, 3 oks, 12 fails, all inside ten minutes: the first
+        episode's down/back pair reaches the notifier, and the second
+        episode's own down still lands in outcome history -- so it is not
+        silently dropped -- but must not reach the notifier a second time
+        inside the ten-minute rate limit."""
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        steps = ("ok," + ",".join(["fail"] * 12) + ","
+                 + ",".join(["ok"] * 3) + ","
+                 + ",".join(["fail"] * 12))
+        result = self.notify_sequence(base, steps, interval=5)
+        self.assertEqual(len(result["notified"]), 2)
+        self.assertEqual(result["notified"][0]["title"], "Pass isn't answering")
+        self.assertEqual(result["notified"][1]["title"], "Pass is back")
+        # The second episode's own down is recorded for history...
+        titles = [o["title"] for o in result["outcomes"]]
+        self.assertEqual(titles,
+                         ["Pass isn't answering", "Pass is back", "Pass isn't answering"])
+        # ...but the bookkeeping shows it was rate-limited, not re-notified:
+        # notified_down flips true again (a decision was made) while
+        # last_pair_at stays pinned to the first pair, never a second one.
+        last = result["notifications"][-1]
+        self.assertTrue(last["notified_down"])
+        self.assertEqual(last["last_pair_at"], result["notifications"][12]["last_pair_at"])
+
+    def test_degrading_to_files_only_notifies_even_under_45_seconds(self):
+        """A short hold window forces the files-only fallback well inside
+        45 seconds; the down notification must still fire on that
+        transition -- degrading all the way to files-only is itself proof
+        enough that this is a real outage, not a blip, whatever the elapsed
+        clock says."""
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="running")]))
+        result = self.notify_sequence(base, "ok,fail,fail,fail,fail",
+                                      interval=5, hold_window=10)
+        self.assertEqual(len(result["notified"]), 1)
+        self.assertEqual(result["notified"][0],
+                         {"title": "Pass is down",
+                          "body": "Showing file feeds until it answers again."})
+        self.assertEqual(len(result["outcomes"]), 1)
+        self.assertEqual(result["outcomes"][0]["title"], "Pass is down")
+        last = result["notifications"][-1]
+        self.assertEqual(last["source"], "files")
+        self.assertTrue(last["notified_down"])
+
+
+class TestJobTransitionDedup(PassCase):
+    """LD-201 v9: JobTransition.detect only ever compares a poll's rows
+    against the *immediately preceding* poll's -- a job that drops out of
+    one poll's payload (a ledger-read race, or any other one-poll blip) and
+    reappears the next reads as a brand-new row with "no prior data",
+    firing nothing for the transition that actually happened. And because
+    the same status could otherwise fire once per stray reappearance,
+    nothing previously stopped the same verdict firing twice for one job.
+    JobTransitionTracker (Transitions.swift) fixes both: a persistent
+    last-known-status map survives a job's disappearance, and firing is
+    deduped by the combination of job id and landed-on status. Driven
+    through --dump-notifications with FixturePass's `payloads` list, which
+    serves a different /status.json body on each successive real poll --
+    the only way to make a job actually vanish from a fresh model at all,
+    since Feed.held's hold-last-good-model path always carries the
+    previous poll's records forward unchanged on a `fail` step."""
+
+    def notify_sequence(self, base, steps, interval=5, extra_env=None):
+        env = dict(os.environ)
+        env["QT_DATA"] = str(self.qt_data)
+        env["QT_HUB"] = ""
+        env["QT_PASS_URL"] = base
+        env["QT_MENUBAR_AGENT_PLIST"] = str(self.tmp / "agents" / "never-written.plist")
+        env.update(extra_env or {})
+        proc = subprocess.run(
+            [str(BINARY), "--dump-notifications", steps,
+             "--poll-interval-seconds", str(interval)],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, f"dump-notifications failed: {proc.stderr}")
+        return json.loads(proc.stdout)
+
+    def test_a_job_that_vanishes_and_reappears_finished_fires_exactly_once(self):
+        server = FixturePass(payloads=[
+            status_fixture(jobs=[job("gate1", status="running")]),
+            status_fixture(jobs=[]),
+            status_fixture(jobs=[job("gate1", status="done")]),
+        ])
+        base = server.start()
+        self.addCleanup(server.stop)
+        result = self.notify_sequence(base, "ok,ok,ok", interval=5)
+        job_outcomes = [o for step in result["notifications"] for o in step["job_outcomes"]]
+        self.assertEqual(job_outcomes, ["Job finished: title for gate1"])
+        self.assertEqual(result["notifications"][0]["record_count"], 1)
+        self.assertEqual(result["notifications"][1]["record_count"], 0)
+        self.assertEqual(result["notifications"][2]["record_count"], 1)
+        self.assertIn({"title": "Job finished: title for gate1", "body": None},
+                      result["notified"])
+
+    def test_the_same_status_never_fires_twice_for_one_job(self):
+        """A job that reads as done, then (a second blip) briefly vanishes
+        and reappears still done, must not fire "Job finished" a second
+        time for a status it already reported."""
+        server = FixturePass(payloads=[
+            status_fixture(jobs=[job("gate1", status="running")]),
+            status_fixture(jobs=[job("gate1", status="done")]),
+            status_fixture(jobs=[]),
+            status_fixture(jobs=[job("gate1", status="done")]),
+        ])
+        base = server.start()
+        self.addCleanup(server.stop)
+        result = self.notify_sequence(base, "ok,ok,ok,ok", interval=5)
+        job_outcomes = [o for step in result["notifications"] for o in step["job_outcomes"]]
+        self.assertEqual(job_outcomes, ["Job finished: title for gate1"])
+
+    def test_a_cold_launch_never_treats_already_finished_jobs_as_new(self):
+        """The very first poll ever made has no real previous to diff
+        against -- every row already on the board at launch must report
+        nothing, matching JobTransition's own cold-launch rule, just
+        extended across JobTransitionTracker's persistent map."""
+        base = self.serve(payload=status_fixture(jobs=[job("alpha", status="done")]))
+        result = self.notify_sequence(base, "ok,ok", interval=5)
+        job_outcomes = [o for step in result["notifications"] for o in step["job_outcomes"]]
+        self.assertEqual(job_outcomes, [])

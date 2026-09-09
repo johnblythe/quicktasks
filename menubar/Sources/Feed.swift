@@ -58,7 +58,8 @@ enum Feed {
                              config: StoreConfig,
                              now: Date,
                              previous: MenuModel?,
-                             passURL: URL) -> MenuModel {
+                             passURL: URL,
+                             holdWindow: TimeInterval = Feed.holdWindow) -> MenuModel {
         if let previous, previous.source == .pass {
             // `previous` is either the last live poll (passStaleSince nil --
             // this is the first failure) or itself already a held model
@@ -146,15 +147,22 @@ enum Feed {
     /// any network call, so a test can simulate "the Pass did not answer"
     /// deterministically rather than depending on a fixture actually being
     /// unreachable. `problem` is never shown; it only becomes `passError`.
+    /// `holdWindow` is a second test-only override, on top of the seam's own
+    /// deterministic clock: it lets `--dump-notifications` manufacture a
+    /// files-only fallback inside a few simulated seconds, to prove the
+    /// health-episode notification fires on that transition even when it
+    /// lands well under `HealthEpisodeTracker.healthNotifyAfter` -- real
+    /// polls always use the real `Feed.holdWindow` (90s), unchanged.
     static func pollFailed(config: StoreConfig,
                            now: Date,
                            previous: MenuModel?,
-                           problem: Problem) -> MenuModel {
+                           problem: Problem,
+                           holdWindow: TimeInterval = Feed.holdWindow) -> MenuModel {
         guard let passURL = config.passURL else {
             return Store.load(config: config, now: now)
         }
         return held(problem: problem, config: config, now: now,
-                   previous: previous, passURL: passURL)
+                   previous: previous, passURL: passURL, holdWindow: holdWindow)
     }
 
     /// Pass rows, with the qt ledger folded in on the shared dedup key.

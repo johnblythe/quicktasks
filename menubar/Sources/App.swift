@@ -66,6 +66,22 @@ final class StatusController: ObservableObject {
     /// one banner on screen, so a second call before the first fires just
     /// restarts the same wait rather than stacking two.
     private var markSeenTimer: Timer?
+    /// Set for the duration of one `refresh()`'s background hop, so a poll
+    /// timer tick that fires while the previous poll is still waiting on
+    /// the network (a slow Pass, up to PassClient.statusTimeout) skips that
+    /// tick outright rather than starting a second, overlapping request --
+    /// LD-201 v9: requests must never stack, whatever the Pass's mood.
+    private var pollInFlight = false
+    /// Debounces raw health-icon transitions into episodes -- see
+    /// HealthEpisodeTracker in Transitions.swift -- so a Pass that answers
+    /// slow under load, rather than actually going down, never earns a
+    /// notification. Lives for the controller's whole life, same as `poll`.
+    private let healthTracker = HealthEpisodeTracker()
+    /// Cross-poll job-transition dedup -- see JobTransitionTracker in
+    /// Transitions.swift -- so a job that is briefly absent from one poll's
+    /// records (a blip) and then reappears finished is still caught,
+    /// instead of reading as "no prior data, nothing to report".
+    private let jobTracker = JobTransitionTracker()
 
     enum Keys {
         static let collapsed = "menubar.collapsedSections"
@@ -191,6 +207,13 @@ final class StatusController: ObservableObject {
     var hasLiveRows: Bool { model.records.contains { $0.status.isActive } }
 
     func refresh() {
+        // LD-201 v9: never let requests stack. A poll timer tick that lands
+        // while the previous poll is still waiting on the network (a slow
+        // Pass, up to PassClient.statusTimeout) is skipped outright rather
+        // than starting a second, overlapping request -- the next tick five
+        // seconds later gets its own chance instead.
+        guard !pollInFlight else { return }
+        pollInFlight = true
         // Snapshotted on the main thread before the hop to background, so the
         // hold-timer logic sees exactly what the last poll left on screen,
         // with no race against this same property being read or written back
@@ -208,19 +231,23 @@ final class StatusController: ObservableObject {
             let config = StoreConfig.resolve(probeDiscovery: true)
             let fresh = Feed.load(config: config, previous: previous)
             DispatchQueue.main.async {
+                self?.pollInFlight = false
                 self?.config = config
                 self?.model = fresh
                 self?.now = Date()
-                // Health and job transitions are diffed against the exact
-                // `previous` snapshotted above, on the main thread, so a
-                // transition can never be detected twice or missed between
-                // two polls.
-                if let transition = HealthTransition.detect(previous: previous, fresh: fresh) {
-                    let (title, detail) = transition.outcome
-                    self?.post(kind: transition == .recovered ? .ok : .info,
-                              title: title, detail: detail, notify: true)
+                // Health is diffed as an episode, not a raw transition: see
+                // HealthEpisodeTracker for the 45-second-or-files-only gate
+                // and the ten-minute down/back rate limit. Job transitions
+                // are diffed against a persistent last-known-status map, not
+                // just the exact `previous` snapshotted above, so a job that
+                // is briefly absent from one poll's records and reappears
+                // finished still fires -- see JobTransitionTracker.
+                if let result = self?.healthTracker.process(previous: previous, fresh: fresh,
+                                                            now: fresh.refreshedAt) {
+                    self?.post(kind: result.kind, title: result.title, detail: result.detail,
+                              notify: result.notify, seen: result.seen)
                 }
-                for job in JobTransition.detect(previous: previous.records, fresh: fresh.records) {
+                for job in self?.jobTracker.detect(fresh: fresh.records) ?? [] {
                     // Notification-only -- see JobTransition's own doc
                     // comment -- so straight to notifyIfHidden, never post.
                     self?.notifyIfHidden(title: job.outcomeTitle, detail: nil)
@@ -312,15 +339,19 @@ final class StatusController: ObservableObject {
 
     /// Every producer's single writing point -- quick-fire, a row action,
     /// the login-item toggle, a Restart Pass verdict, Settings Apply, and a
-    /// Pass health transition all call this instead of poking MenuView's
+    /// Pass health episode all call this instead of poking MenuView's
     /// old `flash` @State, so what happened survives the dropdown tearing
     /// down and a relaunch. `notify: true` additionally offers it to
     /// `notifier`, gated on neither window being visible and the Settings
-    /// toggle being on -- see `notifyIfHidden`. A job transition calls
+    /// toggle being on -- see `notifyIfHidden`. `seen: true` (LD-201 v9,
+    /// HealthEpisodeTracker's blip outcome) inserts it already read: a
+    /// Pass blip that resolved in under 45 seconds is history the moment it
+    /// is recorded, never an unread banner. A job transition calls
     /// `notifyIfHidden` directly instead, since a job finishing does not
     /// belong in the persistent queue -- see JobTransition's doc comment.
-    func post(kind: Outcome.Kind, title: String, detail: String? = nil, notify: Bool = false) {
-        outcomes.insert(Outcome(kind: kind, title: title, detail: detail), at: 0)
+    func post(kind: Outcome.Kind, title: String, detail: String? = nil,
+             notify: Bool = false, seen: Bool = false) {
+        outcomes.insert(Outcome(kind: kind, title: title, detail: detail, seen: seen), at: 0)
         outcomes = Array(outcomes.prefix(OutcomeStore.limit))
         OutcomeStore.save(outcomes, defaults)
         if notify { notifyIfHidden(title: title, detail: detail) }
@@ -687,6 +718,13 @@ enum Entry {
                                       post-info, notify-ok, notify-error, dismiss-newest) on a
                                       headless controller and print the resulting outcome
                                       queue and injected notifier state
+              --dump-notifications <seq> [--poll-interval-seconds <s>]
+                                      [--hold-window-seconds <s>]
+                                      replay a comma-separated ok/fail poll sequence through
+                                      a standalone health-episode/job tracker (not a live
+                                      controller); print each step's outcome plus the
+                                      episode_started/notified_down/last_pair_at bookkeeping,
+                                      and the cumulative outcomes/notified queues
               --dump-recent-dirs      print the directory chip's recent-directory list
               --dump-decide <id> <confirm|deny|go|snooze> [comment]
                                       print the POST /decide body and exit
@@ -746,6 +784,9 @@ enum Entry {
         }
         if args.contains("--dump-outcomes") {
             exit(DumpModel.runOutcomes(args: args))
+        }
+        if args.contains("--dump-notifications") {
+            exit(DumpModel.runNotifications(args: args))
         }
         if args.contains("--dump-recent-dirs") {
             exit(DumpModel.runRecentDirs())

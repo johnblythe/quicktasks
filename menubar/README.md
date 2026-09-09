@@ -283,16 +283,33 @@ last 20, oldest dropped first, and survives a relaunch: it lives in
 `UserDefaults` next to Settings, not in a `@State` that
 `MenuBarExtra(.window)` would throw away with the view on close.
 
-**Notifications** (LD-201 v8). Settings has a "Notify me when the dropdown
-is closed" toggle, on by default. When it is on, and only while neither the
-real dropdown nor the summon panel is on screen, the same outcomes that
-would draw a banner also post a macOS notification: a job finishing or
-failing, a Pass health change, a Restart Pass verdict, or a quick-fire
-failure. Flipping the toggle from off to on asks macOS for permission once;
-flipping it off again never re-asks. Clicking a notification shows the
-dropdown. All of this goes through one `Notifier` protocol, so a test can
-inject a recorder and prove what *would* have gone to Notification Center
-without a real notification ever reaching the sandbox that runs the suite.
+**Notifications** (LD-201 v8, health rules revised in v9). Settings has a
+"Notify me when the dropdown is closed" toggle, on by default. When it is
+on, and only while neither the real dropdown nor the summon panel is on
+screen, the same outcomes that would draw a banner also post a macOS
+notification: a job finishing or failing, a Pass health change, a Restart
+Pass verdict, or a quick-fire failure. Flipping the toggle from off to on
+asks macOS for permission once; flipping it off again never re-asks.
+Clicking a notification shows the dropdown. All of this goes through one
+`Notifier` protocol, so a test can inject a recorder and prove what *would*
+have gone to Notification Center without a real notification ever reaching
+the sandbox that runs the suite.
+
+Pass health notifications are episode-based, not raw-transition-based (LD-
+201 v9). v8 posted a "Pass isn't answering" / "Pass is back" pair on every
+single transition, which meant an ordinary slow-under-load stretch -- one
+skipped poll, nothing actually wrong -- read as a notification storm.
+Instead, one continuous run of not-normal polls is treated as a single
+episode: the "Pass isn't answering" notification fires only once that
+episode has run for at least 45 seconds, or the widget has fallen all the
+way back to file feeds, whichever comes first. "Pass is back" fires only if
+a "down" notification actually went out earlier in that same episode. An
+episode that resolves before ever crossing the 45-second line still shows up
+in the outcome history, as an already-seen "Pass blipped for N s" entry --
+it never draws an unread banner and never reaches the notifier. On top of
+that, at most one down/back pair reaches Notification Center every ten
+minutes: a second outage that starts inside that window still records its
+own history-only outcomes, it just does not interrupt anyone a second time.
 
 **The dot's health** (LD-201 v8). Independent of the blue/orange/grey
 busy-versus-attention colour above, the same dot carries a second signal for
@@ -471,8 +488,12 @@ The hub location follows `qt`'s own `resolve_hub_dir()`: `QT_HUB` overrides
 
 Polling is every 5 seconds with a 2.5s tolerance so the system can coalesce the
 wakeups, plus an immediate read whenever the menu opens. Reads and posts happen
-off the main thread, and the poll gives up after 1.5 seconds: a hung request is
-indistinguishable from a Pass that is down, so it may as well fall back.
+off the main thread, and the status fetch gives up after 8 seconds (loosened
+from 1.5s in LD-201 v9, to stop an ordinary slow response under load from
+reading as a Pass that is down); the lighter reachability probe gives up after
+3 seconds (loosened from 1.0s the same release). If a poll is still in flight
+when the next 5-second tick fires, that tick is skipped outright rather than
+starting a second request on top of the first -- requests never stack.
 
 **No `Origin` header is sent.** `serve.py`'s `_origin_blocked()` lets a request
 through when `Origin` is absent (browsers always send one cross-origin, CLIs
@@ -504,6 +525,8 @@ QuicktaskStatus --post-run <id>                  # really fire an item through P
 QuicktaskStatus --dump-restart                   # the POST /restart request: method, path, Origin
 QuicktaskStatus --post-restart                   # really POST /restart and print the outcome
 QuicktaskStatus --dump-outcomes show,login-on,restart,dismiss-newest   # drive outcome/notification producers headless
+QuicktaskStatus --dump-notifications ok,fail,fail,ok \
+  --poll-interval-seconds 5 --hold-window-seconds 10   # replay a poll sequence through the health-episode/job trackers
 QuicktaskStatus --snapshot out.png               # render the dropdown to a PNG
 QuicktaskStatus --snapshot-settings out.png      # render the settings window to a PNG
 QuicktaskStatus --help
@@ -576,7 +599,18 @@ the resulting `tokens`, `login_item`, `notify_when_hidden`, `dropdown_visible`,
 Always constructed with `activatesGlobalHotkey: false`, which is what pins it
 to a `RecordingNotifier` rather than the real `SystemNotifier` -- the
 structural guarantee that nothing this seam does can ever post a real
-notification. `--snapshot` and `--snapshot-settings` render the real view
+notification. `--dump-notifications <seq> [--poll-interval-seconds <s>]
+[--hold-window-seconds <s>]` (LD-201 v9) replays a comma-separated ok/fail
+poll sequence through the same `Feed.load`/`Feed.pollFailed` pipeline a real
+poll uses, on a simulated clock, driving one standalone
+`HealthEpisodeTracker` and one `JobTransitionTracker` across the whole
+sequence -- not a live controller, so it needs no display and posts nothing
+real either way. `--hold-window-seconds` overrides `Feed.holdWindow` (90s in
+production) so a test can force the files-only fallback within a few
+simulated seconds instead of waiting out the real window. Prints each
+step's outcome plus that step's `episode_started`/`notified_down`/
+`last_pair_at` bookkeeping, and the cumulative `outcomes`/`notified` queues.
+`--snapshot` and `--snapshot-settings` render the real view
 against the real feeds using the view's own `cacheDisplay`, so neither needs
 Screen Recording permission and both work over SSH.
 
@@ -605,7 +639,7 @@ settings, all without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-278 tests in `tests/test_menubar_model.py` (290 across the whole suite, 38 of
+286 tests in `tests/test_menubar_model.py` (298 across the whole suite, 38 of
 them new for LD-201 v8: the persistent outcome queue's insert/cap/dismiss/
 mark-seen behaviour, the login-item and Restart Pass outcomes in both their
 success and forced-failure shapes, Settings Apply's outcome, the notification
@@ -614,7 +648,13 @@ every direction (dropdown open, panel open, toggle off, both clear), the
 "asked exactly once" authorization guarantee across an off-to-on edge and a
 re-apply of unchanged settings, the dot's three `IconHealth` states and the
 freshness line's three text forms via `--dump-model --poll-sequence`, and the
-rejected-hub message's exact wording). They build the
+rejected-hub message's exact wording; a further 8 new for LD-201 v9, via
+`--dump-notifications`: a lone blip producing no notification and one seen
+history-only outcome, ten sustained failures producing exactly one down/back
+pair, a second episode inside the ten-minute rate-limit window recording its
+own outcomes without notifying again, a files-only fallback notifying even
+under the 45-second threshold, and a job that vanishes mid-blip and
+reappears finished firing its outcome exactly once). They build the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in
@@ -688,11 +728,11 @@ The module skips rather than fails when `swiftc` is unavailable.
 | `Sources/MenuView.swift` | The dropdown, including the outcome banner |
 | `Sources/MenuBarIcon.swift` | The menu-bar dot, its busy/attention/idle colour, and its `IconHealth` (normal/held-stale/files-only) shape |
 | `Sources/Outcome.swift` | The persistent outcome queue: `Outcome`, `OutcomeStore` |
-| `Sources/Transitions.swift` | Turns a model change into an outcome: `HealthTransition`, `JobTransition` |
+| `Sources/Transitions.swift` | Turns a model change into an outcome: `HealthTransition`, `JobTransition`, and the cross-poll trackers behind them, `HealthEpisodeTracker` and `JobTransitionTracker` (LD-201 v9) |
 | `Sources/Notifier.swift` | The `Notifier` protocol; `SystemNotifier` (real) and `RecordingNotifier` (tests, snapshots, every headless seam) |
 | `Sources/Freshness.swift` | The footer's always-on freshness line |
 | `Sources/App.swift` | Entry point, polling controller, `MenuBarExtra` scene |
-| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--dump-restart`, `--post-restart`, `--dump-outcomes` |
+| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--dump-restart`, `--post-restart`, `--dump-outcomes`, `--dump-notifications` (LD-201 v9) |
 | `Sources/Snapshot.swift` | `--snapshot`, `--snapshot-settings` |
 | `Sources/Hotkey.swift` | Carbon global hotkey registration, the mode-swap keys, the recorder control in Settings |
 | `Sources/FireResolve.swift` | What a fire actually does: directory precedence, `--in`/`@` prefix parsing, the recent-dirs list, and the shared description `--dump-fire` and ⌘⏎ both call |

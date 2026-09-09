@@ -377,6 +377,133 @@ enum DumpModel {
         return emit(["poll_sequence": results])
     }
 
+    /// `--dump-notifications <seq> [--poll-interval-seconds <s>]
+    /// [--hold-window-seconds <s>]`: LD-201 v9. Replays the same
+    /// comma-separated ok/fail vocabulary --poll-sequence does, through the
+    /// same Feed.load/Feed.pollFailed pipeline and simulated clock, but also
+    /// drives a standalone HealthEpisodeTracker and JobTransitionTracker --
+    /// not a real StatusController, which always ticks on the real wall
+    /// clock and a real 5-second Timer, incompatible with proving a
+    /// 45-second-or-more gate and a ten-minute rate limit inside one fast,
+    /// deterministic run. `previous` and the two trackers all carry state
+    /// forward step to step exactly the way StatusController's own `model`/
+    /// `healthTracker`/`jobTracker` do across real polls.
+    ///
+    /// `--hold-window-seconds` overrides Feed.holdWindow for this seam's
+    /// `fail` steps only (real polls are untouched), so a test can reach
+    /// files-only in a handful of simulated seconds instead of the real 90
+    /// -- proving the down notification fires on that transition even when
+    /// it lands under HealthEpisodeTracker.healthNotifyAfter (45s).
+    ///
+    /// Per-step fields mirror --poll-sequence's (source, pass_reachable,
+    /// pass_stale_since, held_until, headline, record_count, icon_state,
+    /// freshness) plus this seam's own bookkeeping: `episode_started`,
+    /// `notified_down`, `last_pair_at` (HealthEpisodeTracker's state right
+    /// after this step, the three fields the brief asks this seam to
+    /// surface), `health_outcome` (nil, or what this step's health poll
+    /// reported), and `job_outcomes` (titles any job transitions fired this
+    /// step). The top-level payload additionally rolls those per-step
+    /// outcomes up into `outcomes` (every health Result, in step order --
+    /// what would have reached the persistent queue) and `notified` (every
+    /// health Result with `notify: true`, plus every job transition, in the
+    /// same {title, body} shape --dump-outcomes already uses).
+    static func runNotifications(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--dump-notifications"), i + 1 < args.count,
+              !args[i + 1].hasPrefix("--") else {
+            return fail("--dump-notifications needs a comma-separated list of ok/fail steps")
+        }
+        let steps = args[i + 1].split(separator: ",", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard !steps.isEmpty, steps.allSatisfy({ $0 == "ok" || $0 == "fail" }) else {
+            return fail("--dump-notifications wants a comma-separated list of ok/fail steps")
+        }
+        let interval = value(args, "--poll-interval-seconds").flatMap(Double.init)
+            ?? Settings.defaultPollInterval
+        let holdWindow = value(args, "--hold-window-seconds").flatMap(Double.init)
+            ?? Feed.holdWindow
+        let limit = value(args, "--limit").flatMap { Int($0) }
+        let config = StoreConfig.resolve(limit: limit)
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        func stamp(_ d: Date?) -> Any { d.map { iso.string(from: $0) } ?? NSNull() }
+
+        var now = Date()
+        var previous: MenuModel?
+        let healthTracker = HealthEpisodeTracker()
+        let jobTracker = JobTransitionTracker()
+        var results: [[String: Any]] = []
+        var outcomes: [[String: Any]] = []
+        var notified: [[String: Any]] = []
+
+        for (i, step) in steps.enumerated() {
+            let model: MenuModel
+            if step == "ok" {
+                model = Feed.load(config: config, now: now, previous: previous)
+            } else {
+                model = Feed.pollFailed(config: config, now: now, previous: previous,
+                                        problem: Problem("simulated poll failure"),
+                                        holdWindow: holdWindow)
+            }
+
+            let healthResult = healthTracker.process(previous: previous, fresh: model, now: now)
+            if let healthResult {
+                outcomes.append([
+                    "kind": healthResult.kind.rawValue,
+                    "title": healthResult.title,
+                    "detail": healthResult.detail ?? NSNull(),
+                    "seen": healthResult.seen,
+                ])
+                if healthResult.notify {
+                    notified.append(["title": healthResult.title,
+                                     "body": healthResult.detail ?? NSNull()])
+                }
+            }
+            let jobOutcomes = jobTracker.detect(fresh: model.records)
+            for job in jobOutcomes {
+                notified.append(["title": job.outcomeTitle, "body": NSNull()])
+            }
+
+            results.append([
+                "step": i,
+                "outcome": step,
+                "at": iso.string(from: now),
+                "source": model.source.rawValue,
+                "pass_reachable": model.passReachable,
+                "pass_stale_since": stamp(model.passStaleSince),
+                "held_until": stamp(model.heldUntil),
+                "headline": model.headlineText,
+                "record_count": model.records.count,
+                "icon_state": IconHealth.of(source: model.source,
+                                           passReachable: model.passReachable,
+                                           passStaleSince: model.passStaleSince).rawValue,
+                "freshness": FreshnessLine.text(for: model, now: now),
+                "episode_started": stamp(healthTracker.episodeStarted),
+                "notified_down": healthTracker.notifiedDown,
+                "last_pair_at": stamp(healthTracker.lastPairAt),
+                "health_outcome": healthResult.map { r -> [String: Any] in
+                    [
+                        "kind": r.kind.rawValue,
+                        "title": r.title,
+                        "detail": r.detail ?? NSNull(),
+                        "notify": r.notify,
+                        "seen": r.seen,
+                    ]
+                } ?? NSNull(),
+                "job_outcomes": jobOutcomes.map { $0.outcomeTitle },
+            ])
+
+            previous = model
+            now = now.addingTimeInterval(interval)
+        }
+
+        return emit([
+            "notifications": results,
+            "outcomes": outcomes,
+            "notified": notified,
+        ])
+    }
+
     /// `--dump-restart`: the exact request `restart()` would send -- method,
     /// path, and the Origin header the gate requires -- without sending it.
     static func runDumpRestart() -> Int32 {

@@ -247,7 +247,7 @@ enum PassEndpoint {
     /// otherwise. Needs the payload itself, not just a Bool, because the
     /// `.pass-url` step has to see `instance.hub_dir` to decide whether the
     /// answer is even for the right checkout.
-    private static func probeStatus(_ url: URL, timeout: TimeInterval = 1.0) -> PassStatus? {
+    private static func probeStatus(_ url: URL, timeout: TimeInterval = 3.0) -> PassStatus? {
         switch PassClient(base: url, statusTimeout: timeout).status() {
         case .success(let status): return status
         case .failure: return nil
@@ -310,9 +310,13 @@ enum PassEndpoint {
 
 struct PassClient {
     let base: URL
-    /// Poll budget. One second is generous for loopback and short enough that
-    /// a wedged server costs the widget one skipped refresh, not a stall.
-    var statusTimeout: TimeInterval = 1.5
+    /// Poll budget. Loose enough that a Pass under load (a slow ledger read,
+    /// a burst of concurrent requests) gets to answer rather than being
+    /// treated as down -- a wedged server still costs at most one skipped
+    /// refresh, not a stall, and health episodes (see HealthEpisodeTracker
+    /// in Transitions.swift) absorb the occasional slow poll without
+    /// notifying anyone.
+    var statusTimeout: TimeInterval = 8.0
     /// Acting on a row is a deliberate click, so it gets longer: /save writes
     /// two files and appends a calibration row before it answers.
     var actionTimeout: TimeInterval = 8
