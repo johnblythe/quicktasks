@@ -42,6 +42,8 @@ import time
 QT_DATA = os.path.expanduser(os.environ.get("QT_DATA", "~/.quicktasks"))
 TASKS_DIR = os.path.join(QT_DATA, "tasks")
 LOGS_DIR = os.path.join(QT_DATA, "logs")
+RESUME_LOG = os.path.join(LOGS_DIR, "resume.log")
+RESUME_LOG_MAX_LINES = 200
 WORKSPACE = os.path.join(QT_DATA, "workspace")
 TMP_DIR = os.path.join(QT_DATA, "tmp")
 CONFIG_PATH = os.path.join(QT_DATA, "config.json")
@@ -138,10 +140,19 @@ def find_bin(name, extra=()):
     return w
 
 
+_CMUX_SHIM_RE = re.compile(r"/cmux(?:[-./]|$)")
+
+
 def find_claude():
-    """Prefer a stable install over session shims (cmux temp dirs)."""
+    """Prefer a stable install over session shims (cmux temp dirs).
+
+    Rejects macOS's system tempdir ("/T/") and paths where "cmux" is its
+    own path segment (".../cmux/bin/claude", ".../cmux-workspace-1/..."),
+    not merely a substring of an unrelated directory name -- a repo
+    checkout named e.g. "quicktasks-cmux-1m" must not trip this.
+    """
     w = shutil.which("claude")
-    if w and "/T/" not in w and "cmux" not in w:
+    if w and "/T/" not in w and not _CMUX_SHIM_RE.search(w):
         return w
     for c in (
         os.path.expanduser("~/.local/bin/claude"),
@@ -215,83 +226,191 @@ def write_command_file(name, argv):
     return cmd_file
 
 
-def _run_quiet(argv, timeout=15):
-    """Run argv, swallowing the ways a launch command can fail to start at
-    all. Returns True on rc 0."""
+def _run_logged(argv, timeout=15, env=None):
+    """Run argv and return (ok, rc, stderr) rather than swallowing the
+    outcome: a caller building a resume.log record or a specific fallback
+    reason needs the rc and stderr, not just a boolean."""
     try:
-        return subprocess.run(argv, capture_output=True, timeout=timeout).returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.returncode == 0, r.returncode, (r.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return False, None, f"timed out after {timeout}s"
+    except (FileNotFoundError, OSError) as e:
+        return False, None, str(e)
+
+
+def _cmux_env():
+    """Env for any subprocess that talks to the cmux CLI or app: CMUX_QUIET
+    suppresses its deprecation/alias notices, which would otherwise print
+    (and get mistaken for a real failure) on every check."""
+    return dict(os.environ, CMUX_QUIET="1")
 
 
 def _cmux_ready(cmux):
-    """Whether the cmux socket is up right now (CMUX_QUIET suppresses its
-    alias notices, which would otherwise print on every check)."""
+    """Whether the cmux socket is up right now."""
     try:
-        env = dict(os.environ, CMUX_QUIET="1")
         return subprocess.run([cmux, "workspace", "list"], capture_output=True,
-                              timeout=3, env=env).returncode == 0
+                              timeout=3, env=_cmux_env()).returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
+
+
+def _log_launch(record):
+    """Append one JSON line to resume.log, rotating (keep-last) at
+    RESUME_LOG_MAX_LINES. A logging failure must never break a launch."""
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        lines = []
+        if os.path.exists(RESUME_LOG):
+            with open(RESUME_LOG) as f:
+                lines = f.readlines()
+        lines.append(json.dumps(record) + "\n")
+        if len(lines) > RESUME_LOG_MAX_LINES:
+            lines = lines[-RESUME_LOG_MAX_LINES:]
+        tmp = RESUME_LOG + ".tmp"
+        with open(tmp, "w") as f:
+            f.writelines(lines)
+        os.replace(tmp, RESUME_LOG)
+    except Exception:
+        pass
 
 
 def _launch_cmux(workspace_name, argv):
     """Try cmux new-workspace with argv as the command. If the socket is
     down (app not running), launch the app and poll for it before retrying
-    once. Returns True only if a new-workspace call actually succeeded."""
+    once. Returns (ok, reason, attempts): ok is True only if a new-workspace
+    call actually succeeded; reason is one of a small set of specific
+    causes ("cmux CLI not found", "cmux socket not answering after 10 s",
+    or "cmux new-workspace failed (rc N): <stderr head>") so a fallback
+    notification never has to say the generic "cmux unreachable"; attempts
+    is every subprocess call actually made, each as
+    {"argv": [...first 3 tokens...], "rc": int|None, "stderr": str}."""
+    attempts = []
     cmux = find_cmux()
     if not cmux:
-        return False
+        return False, "cmux CLI not found", attempts
+
     new_workspace = [cmux, "new-workspace", "--name", workspace_name,
                       "--command", shlex.join(argv), "--focus", "true"]
-    if _run_quiet(new_workspace):
-        return True
-    if not _run_quiet(["open", "-ga", "cmux"]):  # app probably isn't running
-        return False
+    env = _cmux_env()
+
+    ok, rc, stderr = _run_logged(new_workspace, env=env)
+    attempts.append({"argv": new_workspace[:3], "rc": rc, "stderr": stderr[:200]})
+    if ok:
+        return True, None, attempts
+
+    _, open_rc, open_stderr = _run_logged(["open", "-ga", "cmux"], env=env)
+    attempts.append({"argv": ["open", "-ga", "cmux"], "rc": open_rc, "stderr": open_stderr[:200]})
+
     deadline = time.monotonic() + 10
+    became_ready = False
     while time.monotonic() < deadline:
         if _cmux_ready(cmux):
-            return _run_quiet(new_workspace)
+            became_ready = True
+            break
         time.sleep(0.5)
-    return False
+
+    if not became_ready:
+        return False, "cmux socket not answering after 10 s", attempts
+
+    ok, rc, stderr = _run_logged(new_workspace, env=env)
+    attempts.append({"argv": new_workspace[:3], "rc": rc, "stderr": stderr[:200]})
+    if ok:
+        return True, None, attempts
+
+    return False, f"cmux new-workspace failed (rc {rc}): {stderr[:200]}", attempts
 
 
 def _launch_in_terminal(file_stub, workspace_name, argv):
     """Launch `argv` in the user's preferred terminal (config "terminal"),
     following the cmux -> Ghostty -> custom template -> Terminal.app chain.
     Any fallback away from the configured terminal raises a notification
-    instead of failing silently, and an unexpected exception still ends in
-    a Terminal attempt rather than a stack trace: this path runs from
-    notification clicks and Raycast, where stderr is invisible."""
-    try:
-        term = load_config().get("terminal", "Terminal")
+    naming the real reason instead of failing silently, and an unexpected
+    exception still ends in a Terminal attempt rather than a stack trace:
+    this path runs from notification clicks and Raycast, where stderr is
+    invisible. Every call appends exactly one JSON record to resume.log
+    (see _log_launch), whose "outcome" is one of "cmux", "ghostty",
+    "custom" (all launched-as-requested), "terminal-forced" (Terminal was
+    the requested terminal, or the request used something unrecognized
+    that goes straight to `open -a <term>`, no fallback involved), or
+    "terminal-fallback" (a non-Terminal choice failed and Terminal.app was
+    used instead)."""
+    start = time.monotonic()
+    requested = load_config().get("terminal", "Terminal")
+    term = requested
+    branch = requested
+    attempts = []
+    rc = None
+    stderr = ""
+    fell_back = False
 
+    def log(outcome):
+        _log_launch({
+            "ts": now(),
+            "requested_terminal": requested,
+            "branch": branch,
+            "attempts": attempts,
+            "rc": rc,
+            "stderr": (stderr or "")[:200],
+            "elapsed": round(time.monotonic() - start, 3),
+            "outcome": outcome,
+        })
+
+    try:
         if term == "cmux":
-            if _launch_cmux(workspace_name, argv):
+            branch = "cmux"
+            ok, reason, cmux_attempts = _launch_cmux(workspace_name, argv)
+            attempts.extend(cmux_attempts)
+            if ok:
+                log("cmux")
                 return
-            notify("Quicktask resume", workspace_name,
-                   "cmux unreachable, opened in Terminal instead · qt doctor")
+            last = cmux_attempts[-1] if cmux_attempts else {}
+            rc, stderr = last.get("rc"), last.get("stderr", "")
+            notify("Quicktask resume", workspace_name, f"{reason} · qt doctor")
             term = "Terminal"
+            fell_back = True
 
         script = write_command_file(file_stub, argv)
 
         if term == "Ghostty":
-            if _run_quiet(["open", "-na", "Ghostty", "--args", "-e", script]):
+            branch = "ghostty"
+            ghostty_argv = ["open", "-na", "Ghostty", "--args", "-e", script]
+            ok, g_rc, g_stderr = _run_logged(ghostty_argv)
+            attempts.append({"argv": ghostty_argv[:3], "rc": g_rc, "stderr": g_stderr[:200]})
+            if ok:
+                log("ghostty")
                 return
+            rc, stderr = g_rc, g_stderr
             notify("Quicktask resume", workspace_name,
                    "Ghostty unreachable, opened in Terminal instead · qt doctor")
             term = "Terminal"
+            fell_back = True
 
         if "{script}" in term:  # custom command template, tokenized (no shell)
+            branch = "custom"
             custom_argv = [a.replace("{script}", script) for a in shlex.split(term)]
-            if _run_quiet(custom_argv):
+            ok, c_rc, c_stderr = _run_logged(custom_argv)
+            attempts.append({"argv": custom_argv[:3], "rc": c_rc, "stderr": c_stderr[:200]})
+            if ok:
+                log("custom")
                 return
+            rc, stderr = c_rc, c_stderr
             notify("Quicktask resume", workspace_name,
                    "custom terminal command failed, opened in Terminal instead · qt doctor")
             term = "Terminal"
+            fell_back = True
 
-        _run_quiet(["open", "-a", term, script])
-    except Exception:
+        term_argv = ["open", "-a", term, script]
+        ok, t_rc, t_stderr = _run_logged(term_argv)
+        attempts.append({"argv": term_argv[:3], "rc": t_rc, "stderr": t_stderr[:200]})
+        if not fell_back:
+            branch = "terminal"
+            log("terminal-forced")
+        else:
+            if rc is None and not stderr:
+                rc, stderr = t_rc, t_stderr
+            log("terminal-fallback")
+    except Exception as e:
         try:
             script = write_command_file(file_stub, argv)
             subprocess.run(["open", "-a", "Terminal", script], capture_output=True, timeout=15)
@@ -299,6 +418,9 @@ def _launch_in_terminal(file_stub, workspace_name, argv):
             pass
         notify("Quicktask resume", workspace_name,
                "terminal launch failed, opened in Terminal instead · qt doctor")
+        attempts.append({"argv": ["open", "-a", "Terminal"], "rc": None, "stderr": str(e)[:200]})
+        rc, stderr = None, str(e)
+        log("terminal-fallback")
 
 
 def launch_resume_terminal(tid):
@@ -725,6 +847,30 @@ def cmd_log(tid):
         print(f"\nraw log: {log}")
 
 
+def cmd_resume_log(n=10):
+    """Print the last n resume.log records, one per line, newest last."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 10
+    if not os.path.exists(RESUME_LOG):
+        print(f"no resume launches logged yet ({RESUME_LOG} doesn't exist)")
+        return
+    with open(RESUME_LOG) as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    for ln in lines[-n:]:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            print(ln)
+            continue
+        print(f"{rec.get('ts', '?')}  {rec.get('outcome', '?'):<18} "
+              f"requested={rec.get('requested_terminal', '?')} branch={rec.get('branch', '?')} "
+              f"rc={rec.get('rc')} elapsed={rec.get('elapsed')}s")
+        if rec.get("stderr"):
+            print(f"    stderr: {rec['stderr']}")
+
+
 def cmd_resume(tid):
     t = load(tid)
     sid = t.get("session_id")
@@ -857,6 +1003,23 @@ def cmd_setup():
     elif perm_choice == "3":
         cfg["permissions"] = "auto"
 
+    cur_model = cfg.get("model")
+    print(f"\nDefault model for tasks (current: {cur_model or 'unset · inherits the CLI default'}):")
+    print("  1. sonnet[1m] · recommended; Claude Code 2.1.266+'s 1M-context alias,")
+    print("     useful for qt's longer unattended runs")
+    print("  2. unset · inherit whatever the claude CLI defaults to on its own")
+    print("  or type any other model name/alias")
+    model_choice = input("choice [keep current]: ").strip()
+    if model_choice == "1":
+        cfg["model"] = "sonnet[1m]"
+    elif model_choice == "2":
+        cfg.pop("model", None)
+    elif model_choice:
+        cfg["model"] = model_choice
+    # empty input changes nothing: a configured model stays configured,
+    # and staying unset must keep falling through to the CLI's own
+    # default rather than setup quietly forcing sonnet[1m] on everyone
+
     tn = find_notifier()
     print(f"\nNotifications: " + (
         f"terminal-notifier (app-style, click-to-resume) · {tn}" if tn
@@ -865,6 +1028,7 @@ def cmd_setup():
     save_config(cfg)
     print(f"\nsaved → {CONFIG_PATH}")
     print(f"terminal={cfg['terminal']} · permissions={cfg.get('permissions', 'acceptEdits')} "
+          f"· model={cfg.get('model', 'unset · CLI default')} "
           f"· trusted={len(cfg.get('trusted_dirs', []))} dir(s)")
     print("\nnext: qt doctor")
     print("Raycast script commands: Settings → Extensions → + → Add Script Directory → raycast/")
@@ -914,8 +1078,17 @@ end open location
 """
 
 
+HANDLER_EXTRA_PATH = "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"
+
+
 def handler_applescript(qt_bin):
-    cmd = ""
+    # `do shell script` runs with a minimal PATH and a clean env: extend
+    # the PATH so a Homebrew- or ~/.local/bin-installed cmux is findable,
+    # and set CMUX_QUIET so its deprecation notice can't look like a
+    # failure from the very first hop, before qt's own cmux calls (which
+    # already set this too) even run.
+    cmd = f'export PATH="{HANDLER_EXTRA_PATH}:$PATH"; '
+    cmd += "export CMUX_QUIET=1; "
     if QT_DATA != os.path.expanduser("~/.quicktasks"):
         cmd += "export QT_DATA=" + shlex.quote(QT_DATA) + "; "
     # bake the interpreter too: `do shell script` runs with a minimal PATH,
@@ -941,6 +1114,136 @@ LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
 
 def handler_app_path():
     return os.path.join(QT_DATA, "QuicktaskResume.app")
+
+
+RESUME_HANDLER_BUNDLE_ID = "com.quicktasks.resume-handler"
+LSREGISTER_DUMP_ENV = "QT_TEST_LSREGISTER_DUMP"
+
+
+def _lsregister_dump_text():
+    """Read-only dump of the LaunchServices database. Tests point
+    QT_TEST_LSREGISTER_DUMP at a fixture file so this never has to run the
+    real lsregister -dump (or, on a machine without one, just fails
+    closed and returns "")."""
+    fixture = os.environ.get(LSREGISTER_DUMP_ENV)
+    if fixture:
+        try:
+            with open(fixture) as f:
+                return f.read()
+        except OSError:
+            return ""
+    try:
+        r = subprocess.run([LSREGISTER, "-dump"], capture_output=True,
+                            text=True, timeout=30)
+        return r.stdout or ""
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+
+
+def _lsregister_claimants(bundle_id, dump_text=None):
+    """Parse `lsregister -dump` output for every bundle record whose
+    CFBundleIdentifier == bundle_id. Returns a list of
+    {"path": str|None, "name": str|None} dicts, in dump order. A pure
+    parser: never mutates the LaunchServices database, and dump_text can
+    be injected (a fixture, in tests) instead of shelling out at all."""
+    if dump_text is None:
+        dump_text = _lsregister_dump_text()
+    claimants = []
+    for block in dump_text.split("-" * 80):
+        m = re.search(r"^identifier:\s*(\S+)", block, re.MULTILINE)
+        if not m or m.group(1) != bundle_id:
+            continue
+        path_m = re.search(r"^path:\s*(\S+)", block, re.MULTILINE)
+        name_m = re.search(r"^bundle id:\s*(.+?)\s*\(0x[0-9a-fA-F]+\)\s*$", block, re.MULTILINE)
+        claimants.append({
+            "path": path_m.group(1) if path_m else None,
+            "name": name_m.group(1).strip() if name_m else None,
+        })
+    return claimants
+
+
+def _sweep_stale_claimants(bundle_id, keep_path, dump_text=None, run_step=None):
+    """Unregister (`lsregister -u <path>`) every claimant of bundle_id
+    other than keep_path (pass None to sweep everything). Returns a list
+    of {"path", "name", "rc"} for every removal attempted. dump_text and
+    run_step are injectable so this can be exercised in tests against a
+    fixture with a fake runner, never against the real LaunchServices
+    database or a real lsregister invocation."""
+    if run_step is None:
+        run_step = _run_step
+    keep_real = os.path.realpath(keep_path) if keep_path else None
+    removed = []
+    for claimant in _lsregister_claimants(bundle_id, dump_text=dump_text):
+        path = claimant.get("path")
+        if not path:
+            continue
+        if keep_real and os.path.realpath(path) == keep_real:
+            continue
+        rc, _ = run_step([LSREGISTER, "-u", path], 30)
+        removed.append({"path": path, "name": claimant.get("name"), "rc": rc})
+    return removed
+
+
+def _handler_baked_paths(app):
+    """Best-effort read of the interpreter and qt path baked into the
+    installed handler's `do shell script` line. Prefers the plaintext
+    AppleScript source qt writes at install time (QT_DATA/tmp/quicktask-
+    handler.applescript, left in place after osacompile); falls back to
+    decompiling the installed applet's compiled script if that source is
+    gone. Both are read-only inspection, never a mutation or a run of the
+    handler itself. Returns (interpreter, qt_bin), either side None if it
+    can't be determined."""
+    text = None
+    src = os.path.join(TMP_DIR, "quicktask-handler.applescript")
+    if os.path.isfile(src):
+        try:
+            with open(src) as f:
+                text = f.read()
+        except OSError:
+            text = None
+    if text is None:
+        script = os.path.join(app, "Contents", "Resources", "Scripts", "main.scpt")
+        if os.path.isfile(script):
+            try:
+                r = subprocess.run(["osadecompile", script], capture_output=True,
+                                    text=True, timeout=15)
+                text = r.stdout or ""
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                text = ""
+        else:
+            text = ""
+    m = re.search(r'do shell script "((?:[^"\\]|\\.)*)"', text)
+    if not m:
+        return None, None
+    cmd = m.group(1).replace('\\"', '"').replace("\\\\", "\\")
+    # strip any number of leading `export NAME=value; ` segments (PATH,
+    # CMUX_QUIET, QT_DATA) baked in ahead of the interpreter + qt path
+    cmd = re.sub(r'^(?:export\s+[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|\S+);\s*)+', "", cmd)
+    cmd = cmd.split("_resume-launch")[0]
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return None, None
+    interp = tokens[0] if tokens else None
+    qt_bin = tokens[1] if len(tokens) > 1 else None
+    return interp, qt_bin
+
+
+def _find_cmux_under_minimal_path():
+    """What find_cmux() actually resolves to if the calling process has
+    only a bare system PATH to search, the way a LaunchServices `do shell
+    script` does. Temporarily overrides the real PATH and restores it
+    afterward; never leaves the process's PATH changed."""
+    minimal = "/usr/bin:/bin:/usr/sbin:/sbin"
+    old = os.environ.get("PATH")
+    try:
+        os.environ["PATH"] = minimal
+        return find_cmux()
+    finally:
+        if old is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = old
 
 
 def cmd_install_handler():
@@ -988,6 +1291,15 @@ def cmd_install_handler():
         shutil.rmtree(app)
     os.replace(staging, app)
 
+    # a leftover duplicate registration (an old build, a defunct staging
+    # path, anything else still claiming our scheme) is how a resume link
+    # silently opens the wrong app; sweep those before registering the
+    # fresh one so only it is left claiming the identifier
+    swept = _sweep_stale_claimants(RESUME_HANDLER_BUNDLE_ID, app)
+    for s in swept:
+        status = "ok" if s["rc"] == 0 else f"rc {s['rc']}"
+        print(f"removed stale claimant: {s['name'] or '?'} at {s['path']} ({status})")
+
     registered = _run_step([LSREGISTER, "-f", app], 30)[0] == 0
     if not registered:
         registered = _run_step(["open", "-g", app], 30)[0] == 0
@@ -1006,7 +1318,12 @@ def cmd_uninstall_handler():
     app = handler_app_path()
     if not os.path.isdir(app):
         sys.exit("no handler installed")
-    _run_step([LSREGISTER, "-u", app], 30)
+    # sweep every claimant of the identifier, not just this one bundle, so
+    # uninstall actually leaves nothing behind to cause a future mystery
+    swept = _sweep_stale_claimants(RESUME_HANDLER_BUNDLE_ID, None)
+    for s in swept:
+        status = "ok" if s["rc"] == 0 else f"rc {s['rc']}"
+        print(f"removed: {s['name'] or '?'} at {s['path']} ({status})")
     shutil.rmtree(app)
     print(f"removed {app} and its quicktask:// registration")
 
@@ -1134,6 +1451,64 @@ def cmd_doctor():
                                      else "scheme not registered in bundle"),
                    "qt install-handler to rebuild")
 
+    # resume handler: every LaunchServices claimant of the identifier (a
+    # stale duplicate is exactly how a resume link silently opens the
+    # wrong app), the baked interpreter/qt paths, and what a `do shell
+    # script`'s minimal PATH actually sees for cmux.
+    claimants = _lsregister_claimants(RESUME_HANDLER_BUNDLE_ID)
+    installed_real = os.path.realpath(app) if os.path.isdir(app) else None
+    if not claimants:
+        report("warn", "resume handler claimants",
+                f"none found for {RESUME_HANDLER_BUNDLE_ID}",
+                "qt install-handler, or check lsregister -dump is readable")
+    else:
+        extra_count = 0
+        for c in claimants:
+            path = c.get("path")
+            is_installed = bool(path and installed_real and os.path.realpath(path) == installed_real)
+            if is_installed:
+                report("ok", "resume handler claimant", f"{c.get('name') or '?'} · {path} (installed)")
+            else:
+                extra_count += 1
+                report("warn", "resume handler claimant",
+                        f"{c.get('name') or '?'} · {path or '(no path)'} (EXTRA)",
+                        "qt install-handler now sweeps stale claimants automatically; rerun it, or qt uninstall-handler")
+        if extra_count:
+            report("warn", "resume handler claimants",
+                    f"{extra_count} extra beside the installed one")
+
+    interp, qt_bin_baked = _handler_baked_paths(app) if os.path.isdir(app) else (None, None)
+    if interp or qt_bin_baked:
+        interp_ok = bool(interp and os.path.exists(interp))
+        qt_ok = bool(qt_bin_baked and os.path.exists(qt_bin_baked))
+        report("ok" if interp_ok else "warn", "handler baked interpreter",
+                interp or "?", None if interp_ok else "rerun qt install-handler")
+        report("ok" if qt_ok else "warn", "handler baked qt path",
+                qt_bin_baked or "?", None if qt_ok else "rerun qt install-handler")
+    elif os.path.isdir(app):
+        report("warn", "handler baked paths", "could not be determined",
+                "install source/script missing; rerun qt install-handler")
+
+    minimal_cmux = _find_cmux_under_minimal_path()
+    cmux_relevant = term == "cmux"
+    report("ok" if (not cmux_relevant or minimal_cmux) else "warn",
+            "resume terminal",
+            f"configured={term} · find_cmux() under minimal PATH -> {minimal_cmux or 'not found'}",
+            None if (not cmux_relevant or minimal_cmux) else
+            "a resume link's do shell script may not find cmux; put it on a stable PATH "
+            "(e.g. /opt/homebrew/bin) or qt setup to pick a different terminal")
+
+    if os.path.exists(RESUME_LOG):
+        with open(RESUME_LOG) as f:
+            tail = [ln.strip() for ln in f if ln.strip()][-3:]
+        if tail:
+            print()
+            print("last resume launches (qt resume-log for more):")
+            for ln in tail:
+                print("    " + ln)
+    else:
+        report("ok", "resume launches", "none logged yet")
+
     print()
     print("hard failures found; qt cannot run tasks" if hard_fail else "no hard failures")
     if hard_fail:
@@ -1175,6 +1550,7 @@ qt · fire-and-forget quicktasks for Claude Code
   qt -m <model> "..."    override the model for this task
   qt list [n]            recent tasks (default 15)
   qt log <id>            full record + raw log path (id fragments ok)
+  qt resume-log [n]      last n resume-launch records (default 10)
   qt resume <id>         reopen a task as an interactive session
   qt setup               pick terminal, trusted dirs, permission mode
   qt doctor              read-only environment health check
@@ -1215,6 +1591,8 @@ def main():
     elif cmd == "log" and len(args) > 1:
         bootstrap()
         cmd_log(match_id(args[1]))
+    elif cmd == "resume-log":
+        cmd_resume_log(args[1] if len(args) > 1 else 10)
     elif cmd == "resume" and len(args) > 1:
         bootstrap()
         cmd_resume(match_id(args[1]))

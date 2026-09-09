@@ -75,9 +75,10 @@ Shortcuts runs a bare shell, hence the absolute path; `qt` locates `claude` on i
 | `qt list` | recent tasks with status glyphs |
 | `qt log <id>` | full record + raw log path (unique id fragment works) |
 | `qt resume <id>` | reopen a task as an interactive session |
-| `qt setup` | pick terminal, trusted dirs, permission mode |
+| `qt resume-log [n]` | last n resume-launch records (terminal, branch, outcome) |
+| `qt setup` | pick terminal, trusted dirs, permission mode, default model |
 | `qt doctor` | read-only environment health check |
-| `qt install-handler` / `qt uninstall-handler` | register or remove `quicktask://` links (clickable Slack resume) |
+| `qt install-handler` / `qt uninstall-handler` | register or remove `quicktask://` links (clickable Slack resume); sweeps any other bundle already claiming the scheme |
 | `qt trust [dir]` / `qt untrust <dir>` | manage trusted dirs |
 | `qt hub <dir>` / `qt hub off` / `qt hub status` | feed finished tasks into a Pass ledger, or check |
 
@@ -98,7 +99,9 @@ A denied run is marked **blocked** (`⊘` in `qt list`), records the exact denie
 
 ### Resume links in Slack
 
-Tasks that post to Slack end their messages with a resume line: the plain `qt resume <id>` command plus a `quicktask://resume/<id>` link. Run `qt install-handler` once to make that link clickable: it registers a small macOS URL handler (an applet in your qt data dir, with your qt path and any `QT_DATA` override baked in) that opens the task's session in your preferred terminal, with no Dock icon. `qt uninstall-handler` removes the app and its scheme registration. Slack asks for confirmation on the first click of the scheme. Link ids are validated to lowercase letters, digits, and hyphens before anything reaches a shell.
+Tasks that post to Slack end their messages with a resume line: the plain `qt resume <id>` command plus a `quicktask://resume/<id>` link. Run `qt install-handler` once to make that link clickable: it registers a small macOS URL handler (an applet in your qt data dir, with your qt path and any `QT_DATA` override baked in, plus an extended PATH and `CMUX_QUIET=1` so a cmux resume works even from the handler's minimal shell environment) that opens the task's session in your preferred terminal, with no Dock icon. Both `qt install-handler` and `qt uninstall-handler` sweep every other bundle registered under the same identifier first, so a stale duplicate from an old build can't quietly win the click. `qt uninstall-handler` removes the app and its scheme registration. Slack asks for confirmation on the first click of the scheme. Link ids are validated to lowercase letters, digits, and hyphens before anything reaches a shell.
+
+**If a resume link opens Terminal.app instead of your terminal, run `qt doctor`.** Every resume launch is logged to `~/.quicktasks/logs/resume.log` (`qt resume-log` prints recent entries) with the terminal it tried, what actually ran, and why any fallback happened, e.g. "cmux CLI not found" or "cmux new-workspace failed (rc 1): ...". `qt doctor`'s "resume handler" section shows why: every LaunchServices bundle currently claiming the `quicktask://` scheme (and which one is flagged as an extra), the interpreter and qt path baked into the installed handler, and what `find_cmux()` resolves to under the bare PATH a clicked link actually runs with.
 
 Notifications use osascript (shows as Script Editor), which displays reliably without setup. terminal-notifier support exists behind `"notifier": "terminal-notifier"` in config, which makes blocked notifications directly clickable, but on modern macOS its notifications are silently dropped until you authorize the app in System Settings → Notifications; only opt in if you've done that and verified it displays.
 
@@ -106,9 +109,9 @@ Note: your global allowlist is inherited by headless runs, and sandbox-safe read
 
 ## Config
 
-`qt setup` writes `~/.quicktasks/config.json`: `terminal` (cmux | Ghostty | iTerm | Terminal | custom template with `{script}`), `trusted_dirs`, `permissions` (see above, also set by `qt setup`), `trusted_permissions` (mode inside trusted dirs, default `auto`), `model` (default for all tasks), optional `notifier: "osascript"` to force the fallback.
+`qt setup` writes `~/.quicktasks/config.json`: `terminal` (cmux | Ghostty | iTerm | Terminal | custom template with `{script}`), `trusted_dirs`, `permissions` (see above, also set by `qt setup`), `trusted_permissions` (mode inside trusted dirs, default `auto`), `model` (default for all tasks; `qt setup` recommends `sonnet[1m]`, Claude Code 2.1.266+'s 1M-context alias, but leaves it unset unless you pick it), optional `notifier: "osascript"` to force the fallback.
 
-Model resolution per task: `-m` flag > `QT_MODEL` env > config `"model"` > your CLI default.
+Model resolution per task: `-m` flag > `QT_MODEL` env > config `"model"` > your CLI default. Leaving `model` unset (the default if you skip that step in `qt setup`) always falls through to whatever the `claude` CLI itself defaults to; setup never writes a model choice you didn't make.
 
 Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (seconds, default 1800), `QT_MODEL`, `QT_PERMISSIONS`, `QT_HUB` (see below).
 
@@ -118,10 +121,10 @@ Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (secon
 
 ## Troubleshooting
 
-Start with `qt doctor`. It's read-only and checks the whole chain: claude CLI, data dir, config, terminal readiness, notifier, PATH, trusted dirs.
+Start with `qt doctor`. It's read-only and checks the whole chain: claude CLI, data dir, config, terminal readiness, notifier, PATH, trusted dirs, and (see below) the resume handler.
 
 - **Hard failures** (nonzero exit): the `claude` CLI isn't on PATH, or `~/.quicktasks` isn't writable. Everything else prints as a warning with a one-line remedy next to it.
-- **Resume opened Terminal.app instead of my terminal.** Your configured terminal was unreachable at that moment, most often cmux not running yet. qt auto-starts cmux and waits for its socket before falling back, so this should be rare; check the notification qt raised (it names what happened) and run `qt doctor` to confirm the terminal is ready.
+- **Resume opened Terminal.app instead of my terminal.** Run `qt doctor`; it shows why. Every resume launch is logged to `resume.log` with the specific reason for any fallback (e.g. "cmux CLI not found", "cmux socket not answering after 10 s", or a `new-workspace` failure with its exit code and stderr) instead of a generic "unreachable" — `qt doctor`'s "resume handler" section surfaces the last few of those, plus every LaunchServices bundle currently claiming `quicktask://` in case a stale duplicate is the real culprit. qt auto-starts cmux and waits for its socket before falling back, so this should be rare; check the notification qt raised, or run `qt resume-log` for the full history.
 - **Raycast extension isn't showing up.** Re-run `npm run dev` from `raycast-ext/`; it needs to run, even briefly, for Raycast to pick up the local dev extension again.
 
 ## Portability notes
