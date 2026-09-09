@@ -53,10 +53,28 @@ enum LoginItem {
     @discardableResult
     static func set(_ enabled: Bool,
                     env: [String: String] = ProcessInfo.processInfo.environment) -> Result<Void, Problem> {
-        enabled ? enable(env: env) : disable(env: env)
+        // Test-only override: a real failure here means launchctl refused the
+        // agent or the plist could not be written, neither of which a test
+        // can trigger on demand without leaving a real job loaded or a real
+        // file on disk. Set to any non-empty string to force that failure
+        // deterministically, with the string as the reported reason, and
+        // skip both the filesystem write and the launchctl call entirely.
+        if let forced = env["QT_MENUBAR_LOGINITEM_FORCE_FAIL"], !forced.isEmpty {
+            return .failure(Problem(forced))
+        }
+        // Test-only override, the success twin of the one above: a real
+        // success still writes the plist (safe -- the test-overridden
+        // QT_MENUBAR_AGENT_PLIST path, never the real LaunchAgents one) so
+        // isEnabled()'s read-back keeps telling the truth, but skips both
+        // launchctl calls, which use the constant `label` regardless of
+        // plist path and so could otherwise evict or replace a real login
+        // item loaded under the same name.
+        let skipLaunchctl = env["QT_MENUBAR_LOGINITEM_FORCE_OK"].map { !$0.isEmpty } ?? false
+        return enabled ? enable(env: env, skipLaunchctl: skipLaunchctl)
+                       : disable(env: env, skipLaunchctl: skipLaunchctl)
     }
 
-    private static func enable(env: [String: String]) -> Result<Void, Problem> {
+    private static func enable(env: [String: String], skipLaunchctl: Bool = false) -> Result<Void, Problem> {
         let plist = plistPath(env: env)
         let body = template().replacingOccurrences(of: "__EXECUTABLE__",
                                                    with: targetExecutable(env: env).path)
@@ -67,6 +85,7 @@ enum LoginItem {
         } catch {
             return .failure("could not write \(plist.path): \(error.localizedDescription)")
         }
+        guard !skipLaunchctl else { return .success(()) }
         // bootout first, so a re-run picks up the new plist instead of
         // silently keeping the previously loaded definition. It fails when
         // nothing is loaded, which is the normal case and not an error.
@@ -79,9 +98,9 @@ enum LoginItem {
         return .success(())
     }
 
-    private static func disable(env: [String: String]) -> Result<Void, Problem> {
+    private static func disable(env: [String: String], skipLaunchctl: Bool = false) -> Result<Void, Problem> {
         let plist = plistPath(env: env)
-        _ = launchctl(["bootout", "gui/\(getuid())/\(label)"])
+        if !skipLaunchctl { _ = launchctl(["bootout", "gui/\(getuid())/\(label)"]) }
         if FileManager.default.fileExists(atPath: plist.path) {
             do {
                 try FileManager.default.removeItem(at: plist)

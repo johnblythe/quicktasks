@@ -266,6 +266,55 @@ not green.
 Running beats attention in the aggregate, because an in-flight run is the thing
 most likely to change in the next few seconds.
 
+**Outcomes** (LD-201 v8). Every producer of "something just happened" --
+quick-fire, a row action, the login-item toggle, a Restart Pass verdict,
+Settings Apply, a Pass health change -- writes to one persistent queue
+instead of the old `flash` string, which vanished the moment the dropdown
+closed. The newest unseen outcome draws as a banner at the top of the row
+list: "Fired: \<text\>", "Accepted", "Job finished: \<title\>", or an error
+in red with the reason ("Restart failed" / "the Pass is not answering",
+"Couldn't update the login item: …"). Clicking its **✕** dismisses it on the
+spot; left alone, it is marked seen after about two seconds of the dropdown
+being open, which just drops the banner without deleting the entry -- seen
+outcomes still count toward "N earlier" below the banner, so a burst of
+several (a poll that both restarted Pass and finished a job) is never lost
+the moment the newest one is dismissed or ages out. The queue holds the
+last 20, oldest dropped first, and survives a relaunch: it lives in
+`UserDefaults` next to Settings, not in a `@State` that
+`MenuBarExtra(.window)` would throw away with the view on close.
+
+**Notifications** (LD-201 v8). Settings has a "Notify me when the dropdown
+is closed" toggle, on by default. When it is on, and only while neither the
+real dropdown nor the summon panel is on screen, the same outcomes that
+would draw a banner also post a macOS notification: a job finishing or
+failing, a Pass health change, a Restart Pass verdict, or a quick-fire
+failure. Flipping the toggle from off to on asks macOS for permission once;
+flipping it off again never re-asks. Clicking a notification shows the
+dropdown. All of this goes through one `Notifier` protocol, so a test can
+inject a recorder and prove what *would* have gone to Notification Center
+without a real notification ever reaching the sandbox that runs the suite.
+
+**The dot's health** (LD-201 v8). Independent of the blue/orange/grey
+busy-versus-attention colour above, the same dot carries a second signal for
+whether what is on screen is trustworthy: a small notch punched out of its
+upper-right edge means Pass has stopped answering but the widget is still
+holding its last good read (still legitimately Pass data, just delayed); a
+hollow ring instead of a filled dot means the hold window ran out and the
+widget has fallen back to the file ledgers. Hovering names the state outright
+-- "Holding since HH:MM · Pass isn't answering" or "Pass down since HH:MM ·
+file feeds" -- so the shape and the tooltip can never disagree. A files-only
+setup with Pass discovery switched off reads as perfectly healthy: there is
+no Pass to be down, so nothing should look broken.
+
+**The freshness line**, always visible in the footer next to the source
+badge, says how long ago the state above was confirmed: "synced 12 s ago"
+while healthy, ticking every second; "holding since HH:MM" while Pass is
+stale but still trusted; "file feeds · Pass down since HH:MM" once the hold
+window has run out. It is a deliberately separate line from the dot -- the
+dot says *which* state, this says *how long ago that state was confirmed* --
+so it can tick on its own timer without forcing the dot to redraw every
+second too.
+
 ## Where the state comes from
 
 Two feeds, in this order.
@@ -454,7 +503,9 @@ QuicktaskStatus --dump-recent-dirs               # the chip's recency menu, off 
 QuicktaskStatus --post-run <id>                  # really fire an item through POST /run
 QuicktaskStatus --dump-restart                   # the POST /restart request: method, path, Origin
 QuicktaskStatus --post-restart                   # really POST /restart and print the outcome
+QuicktaskStatus --dump-outcomes show,login-on,restart,dismiss-newest   # drive outcome/notification producers headless
 QuicktaskStatus --snapshot out.png               # render the dropdown to a PNG
+QuicktaskStatus --snapshot-settings out.png      # render the settings window to a PNG
 QuicktaskStatus --help
 ```
 
@@ -511,9 +562,23 @@ really posts: it fires an item through `POST /run` against whatever
 the `Origin` header the gate requires -- without sending it; `--post-restart`
 gives that same request the real-round-trip treatment `--post-run` gets, and
 prints whether the Pass reports itself supervised, stopped, too old for the
-route, or refused the Origin. `--snapshot` renders the real view against the
-real feeds using the view's own `cacheDisplay`, so it needs no Screen Recording
-permission and works over SSH.
+route, or refused the Origin. `--dump-outcomes <seq> [--seen-after <s>]`
+(LD-201 v8) drives a real, headless `StatusController` through a
+comma-separated sequence of tokens -- `show`/`hide`/`panel-show`/`panel-hide`
+open and close the two windows the notification gate checks, `mark-seen`
+fires the auto-seen timer early, `login-on`/`login-off`/`restart` exercise
+the real (env-forced) login-item and restart producers, `apply`/
+`apply-notify-on`/`apply-notify-off` commit a Settings change, `post-ok`/
+`post-error`/`post-info`/`notify-ok`/`notify-error` post a synthetic outcome
+directly, and `dismiss-newest` removes the top of the queue -- then prints
+the resulting `tokens`, `login_item`, `notify_when_hidden`, `dropdown_visible`,
+`panel_visible`, `outcomes[]`, `notified[]`, and `authorization_requests`.
+Always constructed with `activatesGlobalHotkey: false`, which is what pins it
+to a `RecordingNotifier` rather than the real `SystemNotifier` -- the
+structural guarantee that nothing this seam does can ever post a real
+notification. `--snapshot` and `--snapshot-settings` render the real view
+against the real feeds using the view's own `cacheDisplay`, so neither needs
+Screen Recording permission and both work over SSH.
 
 Environment:
 
@@ -527,9 +592,12 @@ Environment:
 | `QT_MENUBAR_FIRE_DIR` | the directory chip's own choice, else `$HOME` | working directory for quick-fired tasks; outranks the chip, loses to a typed `--in`/`@` prefix |
 | `QT_MENUBAR_AGENT_PLIST` | `~/Library/LaunchAgents/…` | LaunchAgent path the login switch reads and writes |
 | `QT_MENUBAR_DEFAULTS_SUITE` | the app's own | preferences domain for every stored setting -- the remembered collapse/toggle state, the directory chip's last choice, and the summon hotkey combo |
+| `QT_MENUBAR_LOGINITEM_FORCE_OK` | unset | non-empty skips the real `launchctl` call and reports success, so the login-item outcome (and its Settings toggle) can be tested without touching a real LaunchAgent |
+| `QT_MENUBAR_LOGINITEM_FORCE_FAIL` | unset | non-empty fails the toggle before `launchctl` runs, so the toggle's revert-on-failure path is testable on demand |
 
-The last two exist so a test or a snapshot can exercise the login read-back and
-the remembered settings without touching the real ones.
+The last four exist so a test or a snapshot can exercise the login read-back,
+the login-item toggle's success and failure outcomes, and the remembered
+settings, all without touching the real ones.
 
 ## Tests
 
@@ -537,10 +605,16 @@ the remembered settings without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-240 tests in `tests/test_menubar_model.py` (252 across the whole suite, 13 of
-them new for LD-201 v7: focus landing on every summon rather than only the
-first, and the quick-fire field's firing/fired/failed states). They build the
-app and drive the
+278 tests in `tests/test_menubar_model.py` (290 across the whole suite, 38 of
+them new for LD-201 v8: the persistent outcome queue's insert/cap/dismiss/
+mark-seen behaviour, the login-item and Restart Pass outcomes in both their
+success and forced-failure shapes, Settings Apply's outcome, the notification
+gate's "only while hidden, only when the toggle is on" rule exercised from
+every direction (dropdown open, panel open, toggle off, both clear), the
+"asked exactly once" authorization guarantee across an off-to-on edge and a
+re-apply of unchanged settings, the dot's three `IconHealth` states and the
+freshness line's three text forms via `--dump-model --poll-sequence`, and the
+rejected-hub message's exact wording). They build the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in
@@ -590,8 +664,13 @@ happens to be up, and most of the discovery cases go through `--dump-endpoint`
 in a way that still makes no request. The cases proving the fallback instead
 point `--dump-endpoint` at a real fixture or a deliberately closed port, so the
 probe itself is exercised rather than assumed. Nothing in the suite writes a
-LaunchAgent, calls `launchctl`, posts to a real Pass, or touches the app's real
-preferences.
+LaunchAgent, calls `launchctl`, posts to a real Pass, touches the app's real
+preferences, or posts a real macOS notification: `--dump-outcomes` always
+builds its `StatusController` the same way `--snapshot` does, which is what
+pins it to the `RecordingNotifier` double rather than `SystemNotifier`, and
+the login-item and restart outcome tests force their result through
+`QT_MENUBAR_LOGINITEM_FORCE_OK`/`_FORCE_FAIL` rather than a real `launchctl`
+round trip.
 
 The module skips rather than fails when `swiftc` is unavailable.
 
@@ -606,10 +685,14 @@ The module skips rather than fails when `swiftc` is unavailable.
 | `Sources/Store.swift` | Reads and deduplicates the two file ledgers |
 | `Sources/Actions.swift` | Fire, capture, run, resume, open a report or an item, post a verdict |
 | `Sources/LoginItem.swift` | The "Start at login" switch |
-| `Sources/MenuView.swift` | The dropdown |
-| `Sources/MenuBarIcon.swift` | The menu-bar dot and count |
+| `Sources/MenuView.swift` | The dropdown, including the outcome banner |
+| `Sources/MenuBarIcon.swift` | The menu-bar dot, its busy/attention/idle colour, and its `IconHealth` (normal/held-stale/files-only) shape |
+| `Sources/Outcome.swift` | The persistent outcome queue: `Outcome`, `OutcomeStore` |
+| `Sources/Transitions.swift` | Turns a model change into an outcome: `HealthTransition`, `JobTransition` |
+| `Sources/Notifier.swift` | The `Notifier` protocol; `SystemNotifier` (real) and `RecordingNotifier` (tests, snapshots, every headless seam) |
+| `Sources/Freshness.swift` | The footer's always-on freshness line |
 | `Sources/App.swift` | Entry point, polling controller, `MenuBarExtra` scene |
-| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--dump-restart`, `--post-restart` |
+| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--dump-restart`, `--post-restart`, `--dump-outcomes` |
 | `Sources/Snapshot.swift` | `--snapshot`, `--snapshot-settings` |
 | `Sources/Hotkey.swift` | Carbon global hotkey registration, the mode-swap keys, the recorder control in Settings |
 | `Sources/FireResolve.swift` | What a fire actually does: directory precedence, `--in`/`@` prefix parsing, the recent-dirs list, and the shared description `--dump-fire` and ⌘⏎ both call |

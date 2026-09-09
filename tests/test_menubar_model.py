@@ -2923,3 +2923,358 @@ class TestFireOutcome(PassCase):
         self.assertTrue(result["is_error"])
         self.assertFalse(result["hides_panel"])
         self.assertEqual(result["message"], "the Pass is not answering")
+
+
+# ---------------------------------------------------------------------------
+# LD-201 v8: persistent outcome queue, notifications, dot health, freshness.
+# ---------------------------------------------------------------------------
+
+class TestOutcomeQueue(SettingsSuiteCase):
+    """`--dump-outcomes <tokens>`: drives StatusController.post/
+    dismissOutcome/scheduleMarkOutcomesSeen directly, the same calls every
+    real producer (quick-fire, a row action, the login-item toggle, Restart
+    Pass, Settings Apply, a Pass health transition) makes, so "a banner
+    survives the dropdown tearing down and a relaunch" is proven against
+    the real queue rather than reimplemented here. `post-ok`/`-error`/
+    `-info` stand in for an arbitrary producer when only the queue's own
+    mechanics (ordering, cap, persistence, dismiss, seen-timing) are under
+    test; the producers themselves are covered by the classes below."""
+
+    def outcomes(self, sequence, seen_after=None, extra_env=None):
+        args = ["--dump-outcomes", sequence]
+        if seen_after is not None:
+            args += ["--seen-after", str(seen_after)]
+        return json.loads(self.run_binary(*args, extra_env=extra_env).stdout)
+
+    # --- mechanics -----------------------------------------------------
+
+    def test_a_fresh_widget_has_no_outcomes(self):
+        result = self.outcomes("show")
+        self.assertEqual(result["outcomes"], [])
+
+    def test_posts_are_recorded_newest_first_with_kind_and_title(self):
+        result = self.outcomes("post-ok,post-error")
+        self.assertEqual(len(result["outcomes"]), 2)
+        self.assertEqual(result["outcomes"][0]["kind"], "error")
+        self.assertEqual(result["outcomes"][1]["kind"], "ok")
+        self.assertEqual(result["outcomes"][0]["title"], "Test outcome")
+        self.assertFalse(result["outcomes"][0]["seen"])
+        self.assertFalse(result["outcomes"][1]["seen"])
+
+    def test_the_queue_is_capped_at_twenty(self):
+        result = self.outcomes(",".join(["post-ok"] * 25))
+        self.assertEqual(len(result["outcomes"]), 20)
+
+    def test_dismiss_newest_removes_only_the_top_outcome(self):
+        result = self.outcomes("post-ok,post-error,dismiss-newest")
+        self.assertEqual(len(result["outcomes"]), 1)
+        self.assertEqual(result["outcomes"][0]["kind"], "ok")
+
+    def test_outcomes_survive_a_simulated_relaunch(self):
+        """Two separate subprocess invocations sharing one
+        QT_MENUBAR_DEFAULTS_SUITE -- the same isolation a real relaunch
+        gets from a real ~/Library/Preferences plist -- prove persistence
+        without ever touching John's real com.quicktasks.menubar domain."""
+        self.outcomes("post-ok,post-error")
+        result = self.outcomes("show")  # a fresh process, no post- token at all
+        self.assertEqual(len(result["outcomes"]), 2)
+        self.assertEqual(result["outcomes"][0]["kind"], "error")
+        self.assertEqual(result["outcomes"][1]["kind"], "ok")
+
+    # --- mark-seen timing ------------------------------------------------
+
+    def test_without_mark_seen_a_banner_stays_unseen(self):
+        result = self.outcomes("post-ok")
+        self.assertFalse(result["outcomes"][0]["seen"])
+
+    def test_mark_seen_marks_it_seen_once_its_wait_is_up(self):
+        result = self.outcomes("post-ok,mark-seen", seen_after=0.2)
+        self.assertTrue(result["outcomes"][0]["seen"])
+
+    def test_mark_seen_marks_every_currently_unseen_outcome_not_just_the_newest(self):
+        result = self.outcomes("post-ok,post-error,mark-seen", seen_after=0.2)
+        self.assertTrue(result["outcomes"][0]["seen"])
+        self.assertTrue(result["outcomes"][1]["seen"])
+
+    def test_an_outcome_posted_after_a_mark_seen_cycle_starts_unseen_again(self):
+        result = self.outcomes("post-ok,mark-seen,post-error", seen_after=0.2)
+        self.assertFalse(result["outcomes"][0]["seen"])  # post-error, newest
+        self.assertTrue(result["outcomes"][1]["seen"])   # post-ok, marked earlier
+
+
+class TestLoginItemOutcome(SettingsSuiteCase):
+    """`login-on`/`login-off` drive StatusController.setLoginItem exactly as
+    the Settings window's "Start at login" toggle does.
+    QT_MENUBAR_LOGINITEM_FORCE_OK/_FAIL keep both the plist write and the
+    launchctl call away from anything real -- see LoginItem.swift."""
+
+    def outcomes(self, sequence, extra_env=None):
+        return json.loads(
+            self.run_binary("--dump-outcomes", sequence, extra_env=extra_env).stdout)
+
+    def test_a_successful_login_on_flips_the_toggle_and_posts_info(self):
+        result = self.outcomes("login-on", extra_env={"QT_MENUBAR_LOGINITEM_FORCE_OK": "1"})
+        self.assertTrue(result["login_item"])
+        self.assertEqual(len(result["outcomes"]), 1)
+        self.assertEqual(result["outcomes"][0]["kind"], "info")
+        self.assertEqual(result["outcomes"][0]["title"], "Start at login on")
+
+    def test_a_successful_login_off_flips_the_toggle_and_posts_info(self):
+        result = self.outcomes("login-off", extra_env={"QT_MENUBAR_LOGINITEM_FORCE_OK": "1"})
+        self.assertFalse(result["login_item"])
+        self.assertEqual(result["outcomes"][0]["kind"], "info")
+        self.assertEqual(result["outcomes"][0]["title"], "Start at login off")
+
+    def test_a_failed_login_on_leaves_the_toggle_off_and_posts_the_exact_error(self):
+        result = self.outcomes("login-on",
+                               extra_env={"QT_MENUBAR_LOGINITEM_FORCE_FAIL": "disk full"})
+        self.assertFalse(result["login_item"])
+        self.assertEqual(result["outcomes"][0]["kind"], "error")
+        self.assertEqual(result["outcomes"][0]["title"],
+                         "Couldn't update the login item: disk full")
+
+    def test_a_failed_login_off_reverts_the_toggle_back_to_on(self):
+        """Two invocations sharing one test-overridden plist path: a real
+        (test-safe) success turns it on, then a forced failure on the next
+        launch must leave that plist alone and report the toggle reverted
+        back to on, not left off."""
+        plist = str(self.tmp / "agents" / "test.plist")
+        on = self.outcomes("login-on", extra_env={"QT_MENUBAR_LOGINITEM_FORCE_OK": "1",
+                                                   "QT_MENUBAR_AGENT_PLIST": plist})
+        self.assertTrue(on["login_item"])
+        off = self.outcomes("login-off",
+                            extra_env={"QT_MENUBAR_LOGINITEM_FORCE_FAIL": "network down",
+                                       "QT_MENUBAR_AGENT_PLIST": plist})
+        self.assertTrue(off["login_item"])
+        self.assertEqual(off["outcomes"][0]["title"],
+                         "Couldn't update the login item: network down")
+
+    def test_login_item_outcomes_never_reach_the_notifier(self):
+        """Not in the LD-201 v8 notify list (job/health/restart/quick-fire
+        only) -- a login-item outcome only ever reaches the persistent
+        queue, even while the dropdown is hidden."""
+        result = self.outcomes("login-on",
+                               extra_env={"QT_MENUBAR_LOGINITEM_FORCE_FAIL": "disk full"})
+        self.assertEqual(result["notified"], [])
+
+
+class TestRestartOutcome(SettingsSuiteCase):
+    """The `restart` token drives StatusController.restartPass exactly as
+    Settings' confirmation-sheet button does. Only the failure verdict is
+    exercised here: a supervised success requires a real launchd-managed
+    Pass to answer /status.json again within the poll budget, which is not
+    something safe to construct deterministically in this suite -- see
+    TestRestart above for the POST /restart round trip itself, already
+    covered directly. Every case below pins QT_PASS_URL to a guaranteed-
+    refused loopback port -- never John's real Pass on 8811 -- per the
+    discipline runOutcomes's own doc comment calls out for this token."""
+
+    DEAD = "http://127.0.0.1:1"
+
+    def outcomes(self, sequence, extra_env=None):
+        env = {"QT_PASS_URL": self.DEAD}
+        env.update(extra_env or {})
+        return json.loads(self.run_binary("--dump-outcomes", sequence, extra_env=env).stdout)
+
+    def test_restart_failure_posts_the_exact_error_outcome(self):
+        result = self.outcomes("restart")
+        self.assertEqual(len(result["outcomes"]), 1)
+        self.assertEqual(result["outcomes"][0]["kind"], "error")
+        self.assertEqual(result["outcomes"][0]["title"], "Restart failed")
+        self.assertEqual(result["outcomes"][0]["detail"], "the Pass is not answering")
+
+    def test_restart_failure_notifies_while_hidden(self):
+        result = self.outcomes("restart")
+        self.assertEqual(len(result["notified"]), 1)
+        self.assertEqual(result["notified"][0]["title"], "Restart failed")
+        self.assertEqual(result["notified"][0]["body"], "the Pass is not answering")
+
+    def test_restart_failure_does_not_notify_while_the_dropdown_is_visible(self):
+        result = self.outcomes("show,restart")
+        self.assertEqual(len(result["outcomes"]), 1)  # still queued
+        self.assertEqual(result["notified"], [])       # but not notified
+
+    def test_restart_failure_does_not_notify_while_the_panel_is_visible(self):
+        result = self.outcomes("panel-show,restart")
+        self.assertEqual(result["notified"], [])
+
+
+class TestSettingsApplyOutcome(SettingsSuiteCase):
+    """The `apply` token drives StatusController.apply(settings) unchanged,
+    exactly the re-commit every field's Apply button and every toggle in
+    Settings performs."""
+
+    def outcomes(self, sequence, extra_env=None):
+        return json.loads(
+            self.run_binary("--dump-outcomes", sequence, extra_env=extra_env).stdout)
+
+    def test_apply_posts_settings_applied(self):
+        result = self.outcomes("apply")
+        self.assertEqual(len(result["outcomes"]), 1)
+        self.assertEqual(result["outcomes"][0]["kind"], "ok")
+        self.assertEqual(result["outcomes"][0]["title"], "Settings applied")
+
+    def test_apply_never_notifies(self):
+        result = self.outcomes("apply")
+        self.assertEqual(result["notified"], [])
+
+
+class TestNotificationGating(SettingsSuiteCase):
+    """`notify-ok`/`notify-error` post through `StatusController.post(...,
+    notify: true)` -- the exact call every real notify-worthy producer (a
+    Pass health transition, a job finishing/failing/blocked, a Restart Pass
+    verdict, quick-fire's failure) makes -- so the visibility and on/off
+    gating below is proven once, for the single shared mechanism every one
+    of those funnels through via `notifyIfHidden`."""
+
+    def outcomes(self, sequence, extra_env=None):
+        return json.loads(
+            self.run_binary("--dump-outcomes", sequence, extra_env=extra_env).stdout)
+
+    def test_default_hidden_posts_reach_the_notifier(self):
+        result = self.outcomes("notify-ok")
+        self.assertEqual(len(result["notified"]), 1)
+        self.assertEqual(result["notified"][0]["title"], "Test notify")
+
+    def test_the_dropdown_open_suppresses_it(self):
+        result = self.outcomes("show,notify-ok")
+        self.assertEqual(result["notified"], [])
+
+    def test_the_summon_panel_open_suppresses_it(self):
+        result = self.outcomes("panel-show,notify-ok")
+        self.assertEqual(result["notified"], [])
+
+    def test_closing_the_dropdown_again_lets_it_through(self):
+        result = self.outcomes("show,hide,notify-ok")
+        self.assertEqual(len(result["notified"]), 1)
+
+    def test_turning_the_toggle_off_suppresses_it_even_while_hidden(self):
+        result = self.outcomes("apply-notify-off,notify-ok")
+        self.assertEqual(result["notified"], [])
+        # Still queued -- the toggle only gates the notifier, not the banner.
+        self.assertEqual(len(result["outcomes"]), 2)  # "Settings applied" + "Test notify"
+
+    def test_a_plain_post_never_reaches_the_notifier_regardless_of_kind(self):
+        result = self.outcomes("post-ok,post-error,post-info")
+        self.assertEqual(result["notified"], [])
+        self.assertEqual(len(result["outcomes"]), 3)
+
+    def test_error_and_ok_kinds_both_notify_when_asked_to(self):
+        result = self.outcomes("notify-ok,notify-error")
+        self.assertEqual(len(result["notified"]), 2)
+
+
+class TestNotificationAuthorization(SettingsSuiteCase):
+    """StatusController requests authorization once at launch (the toggle
+    defaults on), never again on a no-op Apply, and exactly once more on
+    each off -> on edge -- see StatusController.init and .apply's own
+    comment on why the edge check matters for "requested exactly once"."""
+
+    def outcomes(self, sequence, extra_env=None):
+        return json.loads(
+            self.run_binary("--dump-outcomes", sequence, extra_env=extra_env).stdout)
+
+    def test_a_fresh_launch_with_the_default_on_toggle_requests_once(self):
+        result = self.outcomes("show")
+        self.assertTrue(result["notify_when_hidden"])
+        self.assertEqual(result["authorization_requests"], 1)
+
+    def test_a_no_op_apply_never_re_requests(self):
+        result = self.outcomes("apply,apply,apply")
+        self.assertEqual(result["authorization_requests"], 1)
+
+    def test_turning_it_off_never_requests(self):
+        result = self.outcomes("apply-notify-off")
+        self.assertEqual(result["authorization_requests"], 1)  # just the launch-time one
+
+    def test_turning_it_off_then_on_requests_exactly_once_more(self):
+        result = self.outcomes("apply-notify-off,apply-notify-on")
+        self.assertEqual(result["authorization_requests"], 2)
+
+    def test_two_off_on_edges_add_two_more_requests_not_three(self):
+        result = self.outcomes(
+            "apply-notify-off,apply-notify-on,apply-notify-off,apply-notify-on")
+        self.assertEqual(result["authorization_requests"], 3)  # 1 launch + 2 edges
+
+
+class TestIconHealthAndFreshness(PassCase):
+    """`icon_state`/`freshness` in `--dump-model --poll-sequence`'s per-step
+    payload -- the exact IconHealth.of/FreshnessLine.text calls the menu-bar
+    dot, its tooltip, and the footer's freshness line all make (see
+    MenuBarIcon.swift and Freshness.swift) -- driven through the same
+    deterministic poll-sequence seam TestHoldLastGoodModel above already
+    uses to build hold-timer states without waiting out real seconds. A
+    single one-shot --dump-model can never reach held-stale/files-only:
+    Feed.load's cold-start path (previous == nil) always falls straight to
+    files with passStaleSince left nil, so these states only exist across a
+    sequence of polls sharing an in-process `previous` model."""
+
+    def poll_sequence(self, base, steps, interval=5, limit=50, extra_env=None):
+        env = dict(os.environ)
+        env["QT_DATA"] = str(self.qt_data)
+        env["QT_HUB"] = ""
+        env["QT_PASS_URL"] = base
+        env["QT_MENUBAR_AGENT_PLIST"] = str(self.tmp / "agents" / "never-written.plist")
+        env.update(extra_env or {})
+        proc = subprocess.run(
+            [str(BINARY), "--dump-model", "--poll-sequence", steps,
+             "--poll-interval-seconds", str(interval), "--limit", str(limit)],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, f"poll-sequence failed: {proc.stderr}")
+        return json.loads(proc.stdout)["poll_sequence"]
+
+    def test_a_live_pass_is_normal_and_synced(self):
+        base = self.serve(payload=status_fixture())
+        steps = self.poll_sequence(base, "ok", interval=5)
+        self.assertEqual(steps[0]["icon_state"], "normal")
+        self.assertTrue(steps[0]["freshness"].startswith("synced "))
+        self.assertTrue(steps[0]["freshness"].endswith(" s ago"))
+
+    def test_a_single_failure_is_held_stale(self):
+        base = self.serve(payload=status_fixture())
+        steps = self.poll_sequence(base, "ok,fail", interval=5)
+        self.assertEqual(steps[1]["icon_state"], "held-stale")
+        self.assertTrue(steps[1]["freshness"].startswith("holding since "))
+
+    def test_the_hold_expiring_flips_to_files_only(self):
+        """Same 20-consecutive-failure sequence TestHoldLastGoodModel's own
+        test_the_hold_expires_and_falls_back_to_files uses to clear the 90s/
+        5s hold window."""
+        base = self.serve(payload=status_fixture())
+        steps = self.poll_sequence(base, "ok," + ",".join(["fail"] * 20), interval=5)
+        self.assertEqual(steps[-1]["icon_state"], "files-only")
+        self.assertTrue(steps[-1]["freshness"].startswith("file feeds · Pass down since "))
+
+    def test_recovery_snaps_back_to_normal_mid_hold(self):
+        base = self.serve(payload=status_fixture())
+        steps = self.poll_sequence(base, "ok,fail,ok", interval=5)
+        self.assertEqual(steps[2]["icon_state"], "normal")
+        self.assertTrue(steps[2]["freshness"].startswith("synced "))
+
+    def test_recovery_snaps_back_to_normal_even_after_the_hold_expired(self):
+        base = self.serve(payload=status_fixture())
+        steps = self.poll_sequence(
+            base, "ok," + ",".join(["fail"] * 20) + ",ok", interval=5)
+        self.assertEqual(steps[-1]["icon_state"], "normal")
+        self.assertTrue(steps[-1]["freshness"].startswith("synced "))
+
+
+class TestRejectedHubExactWording(PassCase):
+    """Closes a gap in TestPassDiscoveryHubIdentity above, which only ever
+    substring-checks `rejected`: the footer and Settings' resolved line
+    read this verbatim, so its exact wording -- "Found a Pass on <url>
+    serving <dir>; ignoring it", worded as "found and stepped over" rather
+    than "no Pass" -- is worth pinning down exactly once. See
+    PassClient.swift's Resolution.rejected. Driven through --dump-endpoint
+    (via the inherited endpoint() helper), which already pins
+    QT_PASS_DEFAULT_URL to a dead port so this can never race John's real
+    Pass on 8811."""
+
+    def test_the_exact_wording_names_the_url_and_the_other_checkout(self):
+        other_hub = str(self.tmp / "someone-elses-hub")
+        base = self.serve(payload=status_fixture(instance={"hub_dir": other_hub}))
+        self.write_pass_url(base + "/\n")
+        e = self.endpoint()
+        self.assertEqual(e["rejected"],
+                         f"Found a Pass on {base}/ serving {other_hub}; ignoring it")

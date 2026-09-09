@@ -34,16 +34,25 @@ struct SettingsView: View {
     @State private var hubDir: String = ""
     @State private var showRestartConfirm = false
     @State private var restartMessage: StatusController.RestartMessage?
+    /// Which field's Apply button most recently committed, nil once its
+    /// checkmark's 1.5s is up. Restart Pass's own verdict already survives
+    /// this window closing (StatusController posts it as an outcome), but a
+    /// checkmark right on the button is still the fastest confirmation that
+    /// a plain field commit landed while this window is still open.
+    @State private var appliedField: String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 section("The Pass") {
-                    field("Base URL",
+                    field("passURL", "Base URL",
                           text: $passURL,
                           placeholder: "discover it",
                           commit: { commit { $0.passURLOverride = passURL } })
                     resolved(controller.config.pass.describe)
+                    if let rejected = controller.config.pass.rejected {
+                        note(rejected)
+                    }
                     if let problem = controller.config.pass.settingProblem {
                         problemLine(problem)
                     }
@@ -91,7 +100,7 @@ struct SettingsView: View {
                 }
 
                 section("Hub checkout") {
-                    field("Directory",
+                    field("hubDir", "Directory",
                           text: $hubDir,
                           placeholder: "from config.json",
                           commit: { commit { $0.hubDirOverride = hubDir } })
@@ -158,6 +167,20 @@ struct SettingsView: View {
                          + "not fall back to the default.")
                 }
 
+                section("Notifications") {
+                    Toggle(isOn: Binding(
+                        get: { controller.settings.notifyWhenHidden },
+                        set: { on in commit { $0.notifyWhenHidden = on } }
+                    )) {
+                        Text("Notify me when the dropdown is closed").font(.system(size: 12))
+                    }
+                    .toggleStyle(.checkbox)
+                    note("Only while neither the dropdown nor the summon panel is open: a "
+                         + "job finishing or failing, a Pass health change, a Restart Pass "
+                         + "verdict, or a quick-fire failure. Turning this on for the first "
+                         + "time asks macOS for permission once.")
+                }
+
                 section("Launch") {
                     Toggle(isOn: Binding(
                         get: { controller.loginItem },
@@ -191,6 +214,18 @@ struct SettingsView: View {
         controller.apply(next)
     }
 
+    /// Flashes the checkmark next to one field's Apply button for 1.5s.
+    /// Purely a same-window confirmation that the click landed -- Restart
+    /// Pass's own verdict already survives this window closing by going
+    /// through the outcome queue instead, which ephemeral SwiftUI state
+    /// like this one cannot do.
+    private func showApplied(_ id: String) {
+        appliedField = id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            if appliedField == id { appliedField = nil }
+        }
+    }
+
     private var passNote: String {
         "QT_PASS_URL overrides this. Has to be http on 127.0.0.1 or localhost -- "
         + "the widget only ever talks to loopback. Leave it empty to use port "
@@ -213,7 +248,8 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func field(_ label: String,
+    private func field(_ id: String,
+                       _ label: String,
                        text: Binding<String>,
                        placeholder: String,
                        commit: @escaping () -> Void) -> some View {
@@ -224,9 +260,14 @@ struct SettingsView: View {
             TextField(placeholder, text: text)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 12))
-                .onSubmit(commit)
-            Button("Apply", action: commit)
+                .onSubmit { commit(); showApplied(id) }
+            Button("Apply") { commit(); showApplied(id) }
                 .controlSize(.small)
+            if appliedField == id {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.green)
+            }
         }
     }
 

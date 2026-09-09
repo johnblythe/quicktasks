@@ -32,6 +32,14 @@ final class StatusController: ObservableObject {
     /// the real dropdown's own MenuView, harmlessly: writing that view's
     /// @FocusState while its window is not key has no visible effect.
     @Published private(set) var summonTick: Int = 0
+    /// The persistent record of "what just happened" -- quick-fire, a row
+    /// action, the login-item toggle, a Restart Pass verdict, Settings
+    /// Apply, and a Pass health transition all write here instead of
+    /// MenuView's old `flash` @State, so a banner survives the dropdown
+    /// tearing down (MenuBarExtra(.window) discards its view on close) and
+    /// a relaunch (reloaded from `defaults` in init). Newest first, capped
+    /// at OutcomeStore.limit by `post`. See Outcome.swift.
+    @Published private(set) var outcomes: [Outcome]
 
     /// Re-resolved on every poll, not just at launch: a Pass that restarted on
     /// another port rewrites `.pass-url`, and the widget should follow it
@@ -41,6 +49,23 @@ final class StatusController: ObservableObject {
     private let defaults: UserDefaults
     private var poll: Timer?
     private var ticker: Timer?
+    /// Whether the real MenuBarExtra dropdown is currently on screen.
+    /// Tracked separately from the summon panel's own `hotkeyPanel.isVisible`
+    /// because a notification must stay silent while *either* window is up,
+    /// and there is no AppKit-level query for a MenuBarExtra(.window)'s
+    /// window the way there is for `hotkeyPanel` -- only MenuView's own
+    /// `.onAppear`/`.onDisappear` can say when the dropdown itself is one of
+    /// them. See `dropdownDidAppear`/`dropdownDidDisappear`/`anyWindowVisible`.
+    private(set) var dropdownVisible = false
+    /// Where a background outcome goes when neither window is on screen.
+    /// `SystemNotifier` for the real, running widget; `RecordingNotifier`
+    /// for every headless/CLI use, keyed off the same `activatesGlobalHotkey`
+    /// flag that already distinguishes "a real widget" from "a seam" below.
+    let notifier: Notifier
+    /// Re-armed by `scheduleMarkOutcomesSeen`, not queued: there is only ever
+    /// one banner on screen, so a second call before the first fires just
+    /// restarts the same wait rather than stacking two.
+    private var markSeenTimer: Timer?
 
     enum Keys {
         static let collapsed = "menubar.collapsedSections"
@@ -85,7 +110,8 @@ final class StatusController: ObservableObject {
     init(config: StoreConfig = .resolve(),
          interval: TimeInterval? = nil,
          defaults: UserDefaults = Keys.store(),
-         activatesGlobalHotkey: Bool = true) {
+         activatesGlobalHotkey: Bool = true,
+         notifier: Notifier? = nil) {
         self.config = config
         self.defaults = defaults
         // The settings window's poll interval, unless a caller pinned one --
@@ -99,6 +125,12 @@ final class StatusController: ObservableObject {
         self.fireToPass = defaults.bool(forKey: Keys.fireToPass)
         self.suggestionsCollapsed = defaults.bool(forKey: Keys.suggestionsCollapsed)
         self.loginItem = LoginItem.isEnabled()
+        self.outcomes = OutcomeStore.load(defaults)
+        // A real, running widget gets the real notification center; every
+        // headless use (a CLI seam, a snapshot, a test) gets a recorder --
+        // keyed off the same flag that already distinguishes the two, so a
+        // caller never has to remember to pass a notifier just to stay safe.
+        self.notifier = notifier ?? (activatesGlobalHotkey ? SystemNotifier() : RecordingNotifier())
         // The first read is the *file* model, synchronously: it is a handful
         // of small JSON files, so the menu-bar dot is right the moment the
         // icon appears. Asking The Pass first would put a network timeout
@@ -133,12 +165,27 @@ final class StatusController: ObservableObject {
             hotkey.register(config.settings.hotkeyCombo)
             globalHotkey = hotkey
         }
+        // Clicking a notification shows the dropdown "if achievable" -- for
+        // this app that is the summon panel, since a MenuBarExtra's own
+        // dropdown cannot be opened from code at all (see `showHotkeyPanel`'s
+        // own doc comment); the panel hosts the identical MenuView, so this
+        // is the closest thing to "shows the dropdown" that actually exists.
+        if let system = self.notifier as? SystemNotifier {
+            system.onClicked = { [weak self] in self?.showHotkeyPanel() }
+        }
+        // Asked once here if the toggle is already on at launch; `apply`
+        // asks again only on an off-to-on flip, so "requested on first
+        // enable" holds whichever of the two ways the toggle got there.
+        if config.settings.notifyWhenHidden {
+            self.notifier.requestAuthorizationIfNeeded()
+        }
     }
 
     deinit {
         poll?.invalidate()
         ticker?.invalidate()
         globalHotkey?.unregister()
+        markSeenTimer?.invalidate()
     }
 
     var hasLiveRows: Bool { model.records.contains { $0.status.isActive } }
@@ -164,6 +211,20 @@ final class StatusController: ObservableObject {
                 self?.config = config
                 self?.model = fresh
                 self?.now = Date()
+                // Health and job transitions are diffed against the exact
+                // `previous` snapshotted above, on the main thread, so a
+                // transition can never be detected twice or missed between
+                // two polls.
+                if let transition = HealthTransition.detect(previous: previous, fresh: fresh) {
+                    let (title, detail) = transition.outcome
+                    self?.post(kind: transition == .recovered ? .ok : .info,
+                              title: title, detail: detail, notify: true)
+                }
+                for job in JobTransition.detect(previous: previous.records, fresh: fresh.records) {
+                    // Notification-only -- see JobTransition's own doc
+                    // comment -- so straight to notifyIfHidden, never post.
+                    self?.notifyIfHidden(title: job.outcomeTitle, detail: nil)
+                }
             }
         }
     }
@@ -200,11 +261,16 @@ final class StatusController: ObservableObject {
     func apply(_ new: Settings) {
         let oldInterval = config.settings.pollInterval
         let oldCombo = config.settings.hotkeyCombo
+        let oldNotify = config.settings.notifyWhenHidden
         new.save(defaults)
         config = StoreConfig.resolve(settings: new)
         if abs(new.pollInterval - oldInterval) > 0.01 { restartPoll(new.pollInterval) }
         if new.hotkeyCombo != oldCombo { globalHotkey?.register(new.hotkeyCombo) }
+        // Only on the off -> on edge, so re-applying unchanged settings never
+        // re-asks: the "requested exactly once" guarantee depends on that.
+        if new.notifyWhenHidden && !oldNotify { notifier.requestAuthorizationIfNeeded() }
         refresh()
+        post(kind: .ok, title: "Settings applied")
     }
 
     private func restartPoll(_ interval: TimeInterval) {
@@ -240,6 +306,76 @@ final class StatusController: ObservableObject {
         settingsWindow = window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: - outcomes
+
+    /// Every producer's single writing point -- quick-fire, a row action,
+    /// the login-item toggle, a Restart Pass verdict, Settings Apply, and a
+    /// Pass health transition all call this instead of poking MenuView's
+    /// old `flash` @State, so what happened survives the dropdown tearing
+    /// down and a relaunch. `notify: true` additionally offers it to
+    /// `notifier`, gated on neither window being visible and the Settings
+    /// toggle being on -- see `notifyIfHidden`. A job transition calls
+    /// `notifyIfHidden` directly instead, since a job finishing does not
+    /// belong in the persistent queue -- see JobTransition's doc comment.
+    func post(kind: Outcome.Kind, title: String, detail: String? = nil, notify: Bool = false) {
+        outcomes.insert(Outcome(kind: kind, title: title, detail: detail), at: 0)
+        outcomes = Array(outcomes.prefix(OutcomeStore.limit))
+        OutcomeStore.save(outcomes, defaults)
+        if notify { notifyIfHidden(title: title, detail: detail) }
+    }
+
+    /// The one place `notifier.post` is called from, so "only while hidden,
+    /// only with the toggle on" cannot be reimplemented two different ways
+    /// by two call sites.
+    func notifyIfHidden(title: String, detail: String?) {
+        guard settings.notifyWhenHidden, !anyWindowVisible else { return }
+        notifier.post(title: title, body: detail)
+    }
+
+    /// "Neither the dropdown nor the summon panel is visible" -- the gate
+    /// every notification goes through.
+    var anyWindowVisible: Bool { dropdownVisible || (hotkeyPanel?.isVisible ?? false) }
+
+    /// Called from MenuView's `.onAppear` for the real dropdown only -- the
+    /// summon panel's own visibility is already tracked through
+    /// `hotkeyPanel`, so this only needs to cover the one window AppKit has
+    /// no query for.
+    func dropdownDidAppear() { dropdownVisible = true }
+
+    func dropdownDidDisappear() { dropdownVisible = false }
+
+    /// Marks every currently unseen outcome seen after `after` seconds --
+    /// "banner marks seen after ~2s visible" -- rather than the instant the
+    /// dropdown opens, so a banner that opens and closes again in a
+    /// heartbeat still had a moment to actually be read. Re-armed on every
+    /// call rather than queued, since there is only ever one banner on
+    /// screen to mark.
+    func scheduleMarkOutcomesSeen(after seconds: TimeInterval = 2) {
+        markSeenTimer?.invalidate()
+        guard outcomes.contains(where: { !$0.seen }) else { return }
+        let timer = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in
+            self?.markOutcomesSeen()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        markSeenTimer = timer
+    }
+
+    private func markOutcomesSeen() {
+        guard outcomes.contains(where: { !$0.seen }) else { return }
+        outcomes = outcomes.map { outcome in
+            var seen = outcome
+            seen.seen = true
+            return seen
+        }
+        OutcomeStore.save(outcomes, defaults)
+    }
+
+    /// The banner's dismiss control.
+    func dismissOutcome(_ id: String) {
+        outcomes.removeAll { $0.id == id }
+        OutcomeStore.save(outcomes, defaults)
     }
 
     // MARK: - global summon
@@ -346,7 +482,17 @@ final class StatusController: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let outcome = LoginItem.set(on)
             DispatchQueue.main.async {
+                // Re-reads the real state regardless of outcome, which is
+                // what reverts the toggle on failure: nothing was written,
+                // so isEnabled() still reports whatever it said before.
                 self?.loginItem = LoginItem.isEnabled()
+                switch outcome {
+                case .success:
+                    self?.post(kind: .info, title: "Start at login \(on ? "on" : "off")")
+                case .failure(let problem):
+                    self?.post(kind: .error,
+                              title: "Couldn't update the login item: \(problem.message)")
+                }
                 report(outcome)
             }
         }
@@ -413,17 +559,30 @@ final class StatusController: ObservableObject {
                 DispatchQueue.main.async {
                     self?.busy.remove(Self.restartBusyKey)
                     report(backUp ? .backUp : .stillDown)
-                    if backUp { self?.refresh() }
+                    // The final verdict, in addition to the inline message
+                    // above: an outcome so it survives Settings closing
+                    // mid-restart.
+                    if backUp {
+                        self?.refresh()
+                        self?.post(kind: .ok, title: "Pass restarted", notify: true)
+                    } else {
+                        self?.post(kind: .error, title: "Pass didn't come back",
+                                  detail: "Restarted, but it hasn't answered yet.", notify: true)
+                    }
                 }
             case .success:
                 DispatchQueue.main.async {
                     self?.busy.remove(Self.restartBusyKey)
                     report(.stopped)
+                    self?.post(kind: .ok, title: "Pass stopped",
+                              detail: "Not supervised, so it will stay down.", notify: true)
                 }
             case .failure(let failure):
                 DispatchQueue.main.async {
                     self?.busy.remove(Self.restartBusyKey)
                     report(.problem(failure.problem.message))
+                    self?.post(kind: .error, title: "Restart failed",
+                              detail: failure.problem.message, notify: true)
                 }
             }
         }
@@ -449,11 +608,39 @@ final class StatusController: ObservableObject {
 struct QuicktaskStatusApp: App {
     @StateObject private var controller = StatusController()
 
+    /// Mirrors IconHealth.of's own inputs exactly, the same rule the dot,
+    /// the tooltip below, and the footer's freshness line all read off of.
+    private var iconHealth: IconHealth {
+        IconHealth.of(source: controller.model.source,
+                      passReachable: controller.model.passReachable,
+                      passStaleSince: controller.model.passStaleSince)
+    }
+
+    /// "Tooltip must name the state" -- distinct wording per health, so
+    /// hovering the dot answers the question the dot's own shape only hints
+    /// at.
+    private var iconTooltip: String {
+        switch iconHealth {
+        case .normal:
+            return controller.model.headlineText
+        case .heldStale:
+            return "Holding since \(sinceStale) \u{00B7} Pass isn't answering"
+        case .filesOnly:
+            return "Pass down since \(sinceStale) \u{00B7} file feeds"
+        }
+    }
+
+    private var sinceStale: String {
+        guard let stale = controller.model.passStaleSince else { return "recently" }
+        return MenuView.clock.string(from: stale)
+    }
+
     var body: some Scene {
         MenuBarExtra {
             MenuView(controller: controller)
         } label: {
-            Image(nsImage: MenuBarIcon.image(for: controller.model.aggregate))
+            Image(nsImage: MenuBarIcon.image(for: controller.model.aggregate, health: iconHealth))
+                .help(iconTooltip)
         }
         // Window style rather than a classic NSMenu: a real text field for
         // quick-fire is the requirement an NSMenu cannot satisfy.
@@ -492,6 +679,14 @@ enum Entry {
               --dump-summon <seq>     drive summon/escape (comma-separated) on a headless
                                       panel and print {panel_visible, is_key,
                                       first_responder_is_field, focused_field, mode}
+              --dump-outcomes <seq> [--seen-after <s>]
+                                      drive outcome/notification producers (comma-separated:
+                                      show, hide, panel-show, panel-hide, mark-seen, login-on,
+                                      login-off, restart, apply, apply-notify-on,
+                                      apply-notify-off, refresh, post-ok, post-error,
+                                      post-info, notify-ok, notify-error, dismiss-newest) on a
+                                      headless controller and print the resulting outcome
+                                      queue and injected notifier state
               --dump-recent-dirs      print the directory chip's recent-directory list
               --dump-decide <id> <confirm|deny|go|snooze> [comment]
                                       print the POST /decide body and exit
@@ -548,6 +743,9 @@ enum Entry {
         }
         if args.contains("--dump-summon") {
             exit(DumpModel.runSummon(args: args))
+        }
+        if args.contains("--dump-outcomes") {
+            exit(DumpModel.runOutcomes(args: args))
         }
         if args.contains("--dump-recent-dirs") {
             exit(DumpModel.runRecentDirs())

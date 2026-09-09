@@ -98,6 +98,10 @@ enum DumpModel {
             "aggregate": aggregateJSON(model.aggregate),
             "headline": model.headlineText,
             "badge": model.aggregate.badge,
+            "icon_state": IconHealth.of(source: model.source,
+                                       passReachable: model.passReachable,
+                                       passStaleSince: model.passStaleSince).rawValue,
+            "freshness": FreshnessLine.text(for: model, now: now),
             "refreshed_at": iso.string(from: model.refreshedAt),
             "warning": model.warning ?? NSNull(),
             "count": model.records.count,
@@ -173,7 +177,10 @@ enum DumpModel {
     /// order is the only way to check that QT_PASS_URL still wins.
     static func runSettings() -> Int32 {
         let settings = Settings.load()
-        let config = StoreConfig.resolve()
+        // Probed, like the live poll, so `rejected` is populated the same
+        // way it would be for a real settings window rather than reading
+        // nil just because this seam skipped the probe.
+        let config = StoreConfig.resolve(probeDiscovery: true)
         return emit([
             "pass_url_override": settings.passURLOverride ?? NSNull(),
             "hub_dir_override": settings.hubDirOverride ?? NSNull(),
@@ -188,6 +195,11 @@ enum DumpModel {
             "resolved_limit": config.limit,
             "setting_problem": config.pass.settingProblem ?? NSNull(),
             "describe": config.pass.describe,
+            // A probed `.pass-url` that named a different hub than this
+            // widget is configured for -- surfaced in the settings window so
+            // "no Pass" and "found one, but it's not mine" don't read alike.
+            "rejected": config.pass.rejected ?? NSNull(),
+            "notify_when_hidden": settings.notifyWhenHidden,
             // POST /restart exists now (LD-201). Unlike /decide there is no
             // per-Pass feature detection to report here -- the button is
             // simply on, and a test can pin that.
@@ -350,6 +362,14 @@ enum DumpModel {
                 "held_until": stamp(model.heldUntil),
                 "headline": model.headlineText,
                 "record_count": model.records.count,
+                // LD-201 v8: the same two functions the dot, its tooltip, and
+                // the footer read off of, so the hold-timer lifecycle this
+                // seam already drives can prove the dot/freshness states
+                // (held-stale, files-only) without a live server to flip.
+                "icon_state": IconHealth.of(source: model.source,
+                                           passReachable: model.passReachable,
+                                           passStaleSince: model.passStaleSince).rawValue,
+                "freshness": FreshnessLine.text(for: model, now: now),
             ])
             previous = model
             now = now.addingTimeInterval(interval)
@@ -531,6 +551,130 @@ enum DumpModel {
             "first_responder_is_field": isField,
             "focused_field": isField ? "quick_fire" : NSNull(),
             "mode": controller.fireToPass ? "pass" : "run",
+        ])
+    }
+
+    /// `--dump-outcomes <sequence> [--seen-after <seconds>]`: drives the real
+    /// producers LD-201 v8 wired to `post`/`notifyIfHidden` -- the login-item
+    /// toggle, a Restart Pass verdict, Settings Apply, a manual poll, and the
+    /// dropdown/panel visibility gate itself -- on a headless, real
+    /// `StatusController`, then reads back the persistent outcome queue and
+    /// the injected notifier's state. `activatesGlobalHotkey: false` (below)
+    /// always resolves to a `RecordingNotifier` -- see `StatusController.init`
+    /// -- so nothing this seam does can ever reach the real Notification
+    /// Center, exactly like `--dump-summon` never reaches Carbon's real
+    /// global hotkey table.
+    ///
+    /// Tokens, comma-separated:
+    ///   show / hide              dropdownDidAppear / dropdownDidDisappear
+    ///   panel-show / panel-hide  toggleHotkeyPanel / hideHotkeyPanel
+    ///   mark-seen                scheduleMarkOutcomesSeen(after: --seen-after,
+    ///                            default 2) -- settles past it automatically
+    ///   login-on / login-off     setLoginItem(true/false) -- pair with
+    ///                            QT_MENUBAR_LOGINITEM_FORCE_OK or
+    ///                            QT_MENUBAR_LOGINITEM_FORCE_FAIL so nothing
+    ///                            real is ever touched
+    ///   restart                  restartPass -- pair with an explicit
+    ///                            QT_PASS_URL (a fixture or a dead loopback
+    ///                            port), the same discipline every other
+    ///                            restart/fire test in this file already
+    ///                            follows, since an unset QT_PASS_URL falls
+    ///                            back to the real default
+    ///   apply                    apply(settings) unchanged, to re-commit
+    ///   apply-notify-on/-off     apply(settings) with notifyWhenHidden
+    ///                            flipped first
+    ///   refresh                  refresh() -- a real Feed.load/Store.load
+    ///                            against whatever QT_DATA/QT_HUB/QT_PASS_URL
+    ///                            point at
+    ///   post-ok/-error/-info     post(kind:, title: "Test outcome") -- no
+    ///                            notify
+    ///   notify-ok/-error         post(kind:, title: "Test notify",
+    ///                            notify: true)
+    ///   dismiss-newest           dismissOutcome(outcomes.first's id)
+    static func runOutcomes(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--dump-outcomes"), i + 1 < args.count,
+              !args[i + 1].hasPrefix("--") else {
+            return fail("--dump-outcomes needs a comma-separated token sequence")
+        }
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let controller = StatusController(interval: 3600, activatesGlobalHotkey: false)
+        let seenAfter = value(args, "--seen-after").flatMap(Double.init) ?? 2
+
+        func settle(_ seconds: TimeInterval = 0.3) {
+            RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+        }
+
+        var seen: [String] = []
+        for token in args[i + 1].split(separator: ",") {
+            let name = token.trimmingCharacters(in: .whitespaces).lowercased()
+            guard !name.isEmpty else { continue }
+            switch name {
+            case "show": controller.dropdownDidAppear()
+            case "hide": controller.dropdownDidDisappear()
+            case "panel-show": controller.toggleHotkeyPanel(); settle()
+            case "panel-hide": controller.hideHotkeyPanel(); settle(0.1)
+            case "mark-seen":
+                controller.scheduleMarkOutcomesSeen(after: seenAfter)
+                settle(seenAfter + 0.3)
+            // 0.8s rather than the bare 0.3s default: both hop to a
+            // background queue and back (LoginItem.set / PassClient.restart)
+            // before posting their outcome, and under the load a full test
+            // suite run puts on the machine 0.3s was occasionally not enough,
+            // making these two tokens flaky in exactly that circumstance.
+            case "login-on": controller.setLoginItem(true) { _ in }; settle(0.8)
+            case "login-off": controller.setLoginItem(false) { _ in }; settle(0.8)
+            case "restart": controller.restartPass { _ in }; settle(0.8)
+            case "apply": controller.apply(controller.settings); settle(0.1)
+            case "apply-notify-on":
+                var s = controller.settings
+                s.notifyWhenHidden = true
+                controller.apply(s)
+                settle(0.1)
+            case "apply-notify-off":
+                var s = controller.settings
+                s.notifyWhenHidden = false
+                controller.apply(s)
+                settle(0.1)
+            case "refresh": controller.refresh(); settle(0.5)
+            case "post-ok": controller.post(kind: .ok, title: "Test outcome"); settle(0.05)
+            case "post-error": controller.post(kind: .error, title: "Test outcome"); settle(0.05)
+            case "post-info": controller.post(kind: .info, title: "Test outcome"); settle(0.05)
+            case "notify-ok":
+                controller.post(kind: .ok, title: "Test notify", notify: true); settle(0.05)
+            case "notify-error":
+                controller.post(kind: .error, title: "Test notify", notify: true); settle(0.05)
+            case "dismiss-newest":
+                if let id = controller.outcomes.first?.id { controller.dismissOutcome(id) }
+                settle(0.05)
+            default:
+                return fail("unknown token: \(name)")
+            }
+            seen.append(name)
+        }
+
+        let recorder = controller.notifier as? RecordingNotifier
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        return emit([
+            "tokens": seen,
+            "login_item": controller.loginItem,
+            "notify_when_hidden": controller.settings.notifyWhenHidden,
+            "dropdown_visible": controller.dropdownVisible,
+            "panel_visible": controller.summonPanel?.isVisible ?? false,
+            "outcomes": controller.outcomes.map { o in
+                [
+                    "id": o.id,
+                    "kind": o.kind.rawValue,
+                    "title": o.title,
+                    "detail": o.detail ?? NSNull(),
+                    "seen": o.seen,
+                    "at": iso.string(from: o.at),
+                ] as [String: Any]
+            },
+            "notified": (recorder?.posted ?? []).map { p in
+                ["title": p.title, "body": p.body ?? NSNull()] as [String: Any]
+            },
+            "authorization_requests": recorder?.authorizationRequests ?? 0,
         ])
     }
 

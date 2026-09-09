@@ -65,6 +65,14 @@ enum Snapshot {
                               defer: false)
         window.contentView = hosting
         window.backgroundColor = .windowBackgroundColor
+        window.isOpaque = true
+        // Pin a concrete appearance rather than leaving it nil: off any real
+        // screen, with no active app to inherit from, SwiftUI's semantic
+        // foreground styles (.primary/.secondary/.tertiary) and any vibrancy
+        // resolve their alpha against *something*, and an unset appearance
+        // here made every one of them render at near-zero opacity -- legible
+        // colored glyphs (status dots, the busy pill) but invisible text.
+        window.appearance = NSAppearance(named: .aqua)
         // Positioned off any screen so a visible flash is impossible.
         window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
         window.orderBack(nil)
@@ -73,8 +81,15 @@ enum Snapshot {
         // Let SwiftUI finish layout, and let the first Pass poll land: the
         // synchronous load in init() is only the file model, so measuring
         // once would render the widget as it looks before it has heard from
-        // The Pass.
-        RunLoop.main.run(until: Date().addingTimeInterval(2))
+        // The Pass. Kept under 2s deliberately: MenuView's own .onAppear
+        // schedules an unseen outcome banner's auto-seen timer at exactly
+        // 2s (LD-201 v8), and a full 2s wait here used to run past it,
+        // silently marking the banner seen -- and persisting that -- as a
+        // side effect of nothing more than taking its picture. 1.5s is
+        // still generous for a loopback poll and renders before that timer
+        // can fire, so a snapshot shows the widget as it looks at that
+        // instant without mutating it.
+        RunLoop.main.run(until: Date().addingTimeInterval(1.5))
         hosting.layoutSubtreeIfNeeded()
         // Re-measure, because rows arriving from the poll changed the height.
         let settled = max(hosting.fittingSize.height, minHeight)

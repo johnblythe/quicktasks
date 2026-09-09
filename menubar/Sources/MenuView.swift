@@ -20,11 +20,11 @@ import SwiftUI
 import AppKit
 
 /// What quick-fire's own field is doing right now, driving both its
-/// disabled state and the line drawn under it. Kept apart from `flash`
-/// (the header's own message, for every other action -- resume, run,
-/// decide): a failure here has to leave the typed text on screen rather
-/// than clearing it the way every other action's flash does, and there is
-/// no header equivalent of the field itself being re-enabled.
+/// disabled state and the line drawn under it. Kept apart from the shared
+/// outcome queue (`StatusController.post`, used by every other action --
+/// resume, run, decide): a failure here has to leave the typed text on
+/// screen rather than clearing it, and there is no queue-driven equivalent
+/// of the field itself being re-enabled.
 enum FireFieldState: Equatable {
     case idle
     case firing(toPass: Bool)
@@ -67,12 +67,11 @@ enum FireFieldOutcome {
 struct MenuView: View {
     @ObservedObject var controller: StatusController
     @State private var draft: String = ""
-    @State private var flash: String?
     /// What quick-fire's own field is doing right now -- idle, firing,
-    /// landed, or refused. Separate from `flash`, which every other action
-    /// (resume, run, decide) still uses: a refusal here has to leave `draft`
-    /// on screen, which `flash`'s always-clears-after-a-timer behaviour
-    /// cannot do.
+    /// landed, or refused. Separate from the outcome queue, which every
+    /// other action (resume, run, decide) posts to instead: a refusal here
+    /// has to leave `draft` on screen, which the queue's own
+    /// clears-after-being-seen behaviour cannot do.
     @State private var fireState: FireFieldState = .idle
     /// Row id the keyboard highlight sits on, nil when nothing is highlighted.
     @State private var highlighted: String?
@@ -136,6 +135,12 @@ struct MenuView: View {
                 searchField
             }
             Divider()
+            if let latest = controller.outcomes.first, !latest.seen {
+                OutcomeBanner(outcome: latest,
+                             earlier: Array(controller.outcomes.dropFirst()),
+                             onDismiss: { controller.dismissOutcome(latest.id) })
+                Divider()
+            }
             if controller.model.records.isEmpty {
                 Text(emptyText)
                     .font(.system(size: 12))
@@ -262,6 +267,17 @@ struct MenuView: View {
             // activate the app on its own -- see `focusQuickFireField`.
             NSApp.activate(ignoringOtherApps: true)
             focusQuickFireField()
+            // Only the real dropdown: the summon panel's own visibility is
+            // tracked separately (StatusController.hotkeyPanel), and
+            // `anyWindowVisible` already reads that directly.
+            if onEscapeExhausted == nil { controller.dropdownDidAppear() }
+            // Unconditional for both hosts: whichever one just opened, a
+            // fresh banner in it still deserves its ~2s look before it
+            // collapses into "N earlier".
+            controller.scheduleMarkOutcomesSeen()
+        }
+        .onDisappear {
+            if onEscapeExhausted == nil { controller.dropdownDidDisappear() }
         }
         .onChange(of: controller.summonTick) { _, _ in
             // A cached, reused panel (StatusController.showHotkeyPanel keeps
@@ -512,7 +528,7 @@ struct MenuView: View {
                 Circle()
                     .fill(Color(StatusPalette.color(for: controller.model.aggregate)))
                     .frame(width: 8, height: 8)
-                Text(flash ?? controller.model.headlineText)
+                Text(controller.model.headlineText)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
                 Spacer(minLength: 6)
@@ -544,10 +560,8 @@ struct MenuView: View {
     /// know what it means. When the list is short, they cost one line and make
     /// the header readable without moving the eye. Once the list is long and
     /// open, the rows are right there and a preview is a second copy of the
-    /// top of it -- so it is left off. A flash message owns the header while
-    /// it is up, so nothing is drawn under it either.
+    /// top of it -- so it is left off.
     private var headlinePreview: String? {
-        guard flash == nil else { return nil }
         // Nothing to preview when nothing needs him.
         if case .idle = controller.model.aggregate { return nil }
         let titles = controller.model.headlinePreview(limit: 3, now: controller.now)
@@ -592,7 +606,7 @@ struct MenuView: View {
                           + "Open the Pass for the full history.")
             }
             HStack(spacing: 8) {
-                Text("Refreshed \(Self.clock.string(from: controller.model.refreshedAt))")
+                Text(FreshnessLine.text(for: controller.model, now: controller.now))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 sourceBadge
@@ -612,16 +626,10 @@ struct MenuView: View {
             }
             Toggle(isOn: Binding(
                 get: { controller.loginItem },
-                set: { on in
-                    controller.setLoginItem(on) { outcome in
-                        switch outcome {
-                        case .success:
-                            show(on ? "Starts at login" : "Login item removed")
-                        case .failure(let problem):
-                            show(problem.message)
-                        }
-                    }
-                }
+                // The outcome -- success or failure -- is StatusController's
+                // to post now: it has to survive this dropdown closing
+                // mid-toggle the same way a Restart Pass verdict does.
+                set: { on in controller.setLoginItem(on) { _ in } }
             )) {
                 Text("Start at login").font(.system(size: 11))
             }
@@ -681,6 +689,9 @@ struct MenuView: View {
                          + (model.passError ?? "the Pass feed is off"))
         }
         lines.append("Looking at \(controller.config.pass.describe)")
+        if let rejected = controller.config.pass.rejected {
+            lines.append(rejected)
+        }
         if let problem = controller.config.pass.fileProblem {
             lines.append("Ignored \(problem)")
         }
@@ -732,6 +743,7 @@ struct MenuView: View {
             controller.perform(key: "capture", { Actions.capture(text: rawText, base: base) }) { outcome in
                 let (state, hidesPanel) = FireFieldOutcome.describe(
                     result: outcome, toPass: true, displayText: rawText, isPanel: isPanel)
+                postFireOutcome(state)
                 settle(state, hidesPanel: hidesPanel)
             }
         } else {
@@ -742,8 +754,24 @@ struct MenuView: View {
             }) { outcome in
                 let (state, hidesPanel) = FireFieldOutcome.describe(
                     result: outcome, toPass: false, displayText: stripped, isPanel: isPanel)
+                postFireOutcome(state)
                 settle(state, hidesPanel: hidesPanel)
             }
+        }
+    }
+
+    /// Quick-fire posts to the shared outcome queue in addition to its own
+    /// inline field message -- the inline message is instant feedback right
+    /// where John typed; the queue is what a banner or a background
+    /// notification draws from once the field itself is gone. Only a
+    /// failure notifies: "quick-fire failure" is one of the few event
+    /// types worth a real notification, a success is not, since the
+    /// field's own line is already right in front of him when it lands.
+    private func postFireOutcome(_ state: FireFieldState) {
+        switch state {
+        case .success(let text): controller.post(kind: .ok, title: text)
+        case .failure(let message): controller.post(kind: .error, title: message, notify: true)
+        default: break
         }
     }
 
@@ -800,8 +828,10 @@ struct MenuView: View {
             Actions.resume(record: record).map { "Resuming \(record.id)" }
         }) { outcome in
             switch outcome {
-            case .success(let message): show(message)
-            case .failure(let problem): show(problem.message)
+            case .success:
+                controller.post(kind: .info, title: "Resuming \(record.id)")
+            case .failure(let problem):
+                controller.post(kind: .error, title: "Couldn't resume", detail: problem.message)
             }
         }
     }
@@ -809,7 +839,8 @@ struct MenuView: View {
     private func openReport(_ record: TaskRecord) {
         switch Actions.openReport(base: controller.model.passURL, report: record.report) {
         case .success: break
-        case .failure(let problem): show(problem.message)
+        case .failure(let problem):
+            controller.post(kind: .error, title: "Couldn't open the report", detail: problem.message)
         }
     }
 
@@ -820,7 +851,8 @@ struct MenuView: View {
                                 base: controller.model.passURL,
                                 itemID: record.itemID ?? record.id) {
         case .success: break
-        case .failure(let problem): show(problem.message)
+        case .failure(let problem):
+            controller.post(kind: .error, title: "Couldn't open the item", detail: problem.message)
         }
     }
 
@@ -830,13 +862,13 @@ struct MenuView: View {
     private func run(_ record: TaskRecord) {
         let base = controller.passBase
         controller.perform(key: record.id, {
-            Actions.run(record: record, base: base).map { slug in
-                slug.isEmpty ? "Fired" : "Fired \(slug)"
-            }
+            Actions.run(record: record, base: base)
         }) { outcome in
             switch outcome {
-            case .success(let message): show(message)
-            case .failure(let problem): show(problem.message)
+            case .success(let slug):
+                controller.post(kind: .ok, title: slug.isEmpty ? "Job started" : "Job started: \(slug)")
+            case .failure(let problem):
+                controller.post(kind: .error, title: "Couldn't start the job", detail: problem.message)
             }
         }
     }
@@ -849,15 +881,25 @@ struct MenuView: View {
                            base: base, hubDir: hub).map { action }
         }) { outcome in
             switch outcome {
-            case .success: show("\(action.capitalized) saved")
-            case .failure(let problem): show(problem.message)
+            case .success:
+                controller.post(kind: .ok, title: Self.decisionTitle(for: action))
+            case .failure(let problem):
+                controller.post(kind: .error, title: "Couldn't save the decision", detail: problem.message)
             }
         }
     }
 
-    /// Shows an outcome in the header for a couple of seconds. A failure has
-    /// to be visible: the alternative is a task John believes is queued and
-    /// never hears about again.
+    /// The outcome-queue wording for a row's verdict -- worded as what just
+    /// happened, not the raw action name the Pass's `/decide` route expects.
+    private static func decisionTitle(for action: String) -> String {
+        switch action {
+        case "accept": return "Accepted"
+        case "redo": return "Sent back for redo"
+        case "reject": return "Rejected"
+        default: return "\(action.capitalized) saved"
+        }
+    }
+
     /// A suggestion's title click. Goes to wherever the suggestion came from
     /// when the engine said (`source_url`), and to the item in the Pass
     /// otherwise -- the source is the more useful of the two, since deciding a
@@ -871,7 +913,8 @@ struct MenuView: View {
                                 base: controller.model.passURL,
                                 itemID: suggestion.itemID) {
         case .success: break
-        case .failure(let problem): show(problem.message)
+        case .failure(let problem):
+            controller.post(kind: .error, title: "Couldn't open the item", detail: problem.message)
         }
     }
 
@@ -888,17 +931,11 @@ struct MenuView: View {
                                      hubDir: hubDir)
         }) { outcome in
             switch outcome {
-            case .success(let message): show(message)
-            case .failure(let problem): show(problem.message)
+            case .success(let message):
+                controller.post(kind: .ok, title: message)
+            case .failure(let problem):
+                controller.post(kind: .error, title: "Couldn't save the decision", detail: problem.message)
             }
-        }
-    }
-
-    private func show(_ message: String) {
-        flash = message
-        let shown = message
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-            if flash == shown { flash = nil }
         }
     }
 
@@ -907,6 +944,90 @@ struct MenuView: View {
         f.dateFormat = "h:mm a"
         return f
     }()
+}
+
+// MARK: - outcome banner
+
+/// The newest unseen Outcome, drawn at the top of the row list -- "Fired:",
+/// "Accepted", "Job started:", an error in red with its reason, whatever
+/// the newest producer just posted. A tap on the X dismisses it without
+/// waiting for the ~2s auto-seen timer; "N earlier" only appears once there
+/// is a second entry in the queue, so a burst of several outcomes (a poll
+/// that both restarted Pass and finished two jobs) is never lost the moment
+/// the newest one is dismissed or marked seen.
+struct OutcomeBanner: View {
+    let outcome: Outcome
+    let earlier: [Outcome]
+    let onDismiss: () -> Void
+
+    @State private var showingEarlier = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top, spacing: 7) {
+                Image(systemName: icon(for: outcome.kind))
+                    .font(.system(size: 12))
+                    .foregroundStyle(tint(for: outcome.kind))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(outcome.title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(tint(for: outcome.kind))
+                        .lineLimit(2)
+                    if let detail = outcome.detail {
+                        Text(detail)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 6)
+                RowButton(icon: "xmark", help: "Dismiss", action: onDismiss)
+            }
+            if !earlier.isEmpty {
+                Button(showingEarlier ? "Hide \(earlier.count) earlier" : "\(earlier.count) earlier") {
+                    showingEarlier.toggle()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 19)
+                if showingEarlier {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(earlier) { item in
+                            HStack(spacing: 5) {
+                                Image(systemName: icon(for: item.kind))
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(tint(for: item.kind))
+                                Text(item.title)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .padding(.leading, 19)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private func icon(for kind: Outcome.Kind) -> String {
+        switch kind {
+        case .ok: return "checkmark.circle.fill"
+        case .error: return "exclamationmark.triangle.fill"
+        case .info: return "info.circle.fill"
+        }
+    }
+
+    private func tint(for kind: Outcome.Kind) -> Color {
+        switch kind {
+        case .ok: return .primary
+        case .error: return .red
+        case .info: return .secondary
+        }
+    }
 }
 
 // MARK: - section header

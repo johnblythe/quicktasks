@@ -52,6 +52,13 @@ struct Settings {
     /// `KeyCombo.defaultCombo` instead of nil, which is why this is loaded and
     /// saved through its own three-state logic rather than `text(_:_:)`.
     var hotkeyCombo: KeyCombo?
+    /// Whether a background outcome (a job finishing, a Pass health
+    /// transition, a Restart Pass verdict, a quick-fire failure) posts a
+    /// real macOS notification. Only takes effect while neither the dropdown
+    /// nor the summon panel is visible -- see StatusController.notifyIfHidden.
+    /// Defaults on: "never an unsure moment" means background news should
+    /// reach John even when he is not looking at the menu bar.
+    var notifyWhenHidden: Bool
 
     static let pollRange: ClosedRange<TimeInterval> = 2...120
     static let limitRange: ClosedRange<Int> = 5...200
@@ -71,7 +78,8 @@ struct Settings {
                                     visibleSections: allSectionKeys,
                                     rowLimit: defaultRowLimit,
                                     fireDirOverride: nil,
-                                    hotkeyCombo: KeyCombo.defaultCombo)
+                                    hotkeyCombo: KeyCombo.defaultCombo,
+                                    notifyWhenHidden: true)
 
     enum Keys {
         static let passURL = "menubar.passURLOverride"
@@ -86,6 +94,7 @@ struct Settings {
         /// "never configured, use the default"; this true means "configured
         /// to nothing, on purpose" -- the difference Clear exists to make.
         static let hotkeyCleared = "menubar.hotkeyCleared"
+        static let notifyWhenHidden = "menubar.notifyWhenHidden"
     }
 
     /// Reads the stored settings, falling back to the defaults key by key. A
@@ -104,7 +113,10 @@ struct Settings {
                 ? defaultRowLimit
                 : clamp(defaults.integer(forKey: Keys.rowLimit), to: limitRange),
             fireDirOverride: text(defaults, Keys.fireDir),
-            hotkeyCombo: loadHotkey(defaults))
+            hotkeyCombo: loadHotkey(defaults),
+            notifyWhenHidden: defaults.object(forKey: Keys.notifyWhenHidden) == nil
+                ? true
+                : defaults.bool(forKey: Keys.notifyWhenHidden))
     }
 
     /// The hotkey's three states: cleared (nil, on purpose), configured (a
@@ -138,6 +150,7 @@ struct Settings {
             defaults.removeObject(forKey: Keys.hotkeyKeyCode)
             defaults.removeObject(forKey: Keys.hotkeyModifiers)
         }
+        defaults.set(notifyWhenHidden, forKey: Keys.notifyWhenHidden)
     }
 
     func shows(_ section: Section) -> Bool { visibleSections.contains(section.rawValue) }

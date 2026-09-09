@@ -211,7 +211,7 @@ enum PassEndpoint {
                 return Resolution(url: standard, source: .standard, file: file,
                                   fileURL: url.absoluteString, fileProblem: nil,
                                   settingProblem: settingProblem,
-                                  rejected: "\(url.absoluteString) serves \(other)")
+                                  rejected: "Found a Pass on \(url.absoluteString) serving \(other); ignoring it")
             }
             return Resolution(url: url, source: .file, file: file,
                               fileURL: url.absoluteString, fileProblem: nil,

@@ -44,12 +44,34 @@ enum StatusPalette {
     }
 }
 
+/// The dot's health, independent of its busy/attention/idle color: whether
+/// what's on screen is live from Pass, held over from a Pass that stopped
+/// answering (still legitimately Pass data, just delayed), or a fallback to
+/// the file ledgers because the hold window ran out. Mirrors
+/// MenuModel.headlineText's own rule exactly -- `source == .files &&
+/// passStaleSince != nil` is "down", everything else with `passReachable ==
+/// false` is "holding" -- so the dot, the tooltip, and the footer's
+/// freshness line can never disagree about which state the widget is in. A
+/// deliberate files-only setup (Pass discovery switched off) reads as
+/// `.normal`: there is no Pass to be down, so nothing should look broken.
+enum IconHealth: String {
+    case normal
+    case heldStale = "held-stale"
+    case filesOnly = "files-only"
+
+    static func of(source: FeedSource, passReachable: Bool, passStaleSince: Date?) -> IconHealth {
+        if source == .files, passStaleSince != nil { return .filesOnly }
+        if source == .pass, !passReachable { return .heldStale }
+        return .normal
+    }
+}
+
 enum MenuBarIcon {
     private static let dotDiameter: CGFloat = 9
     private static let gap: CGFloat = 3
     private static let height: CGFloat = 16
 
-    static func image(for aggregate: Aggregate) -> NSImage {
+    static func image(for aggregate: Aggregate, health: IconHealth = .normal) -> NSImage {
         let badge = aggregate.badge
         let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         let badgeWidth = badge.isEmpty ? 0 : (badge as NSString)
@@ -59,9 +81,33 @@ enum MenuBarIcon {
 
         let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
             let y = (height - dotDiameter) / 2
-            let dot = NSBezierPath(ovalIn: NSRect(x: 0, y: y, width: dotDiameter, height: dotDiameter))
-            color.setFill()
-            dot.fill()
+            let dotRect = NSRect(x: 0, y: y, width: dotDiameter, height: dotDiameter)
+            switch health {
+            case .normal:
+                color.setFill()
+                NSBezierPath(ovalIn: dotRect).fill()
+            case .heldStale:
+                // The same filled dot, with a small transparent notch punched
+                // out of the upper-right edge -- subtle on purpose, since the
+                // data on screen is still legitimately from Pass.
+                color.setFill()
+                NSBezierPath(ovalIn: dotRect).fill()
+                let notchDiameter = dotDiameter * 0.45
+                let notchRect = NSRect(x: dotRect.maxX - notchDiameter * 0.65,
+                                       y: dotRect.maxY - notchDiameter * 0.65,
+                                       width: notchDiameter,
+                                       height: notchDiameter)
+                NSGraphicsContext.current?.compositingOperation = .destinationOut
+                NSBezierPath(ovalIn: notchRect).fill()
+                NSGraphicsContext.current?.compositingOperation = .sourceOver
+            case .filesOnly:
+                // Pass is genuinely down: a hollow ring instead of a filled
+                // dot, the more visible departure from "idle and fine".
+                let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: 1, dy: 1))
+                ring.lineWidth = 1.6
+                color.setStroke()
+                ring.stroke()
+            }
 
             if !badge.isEmpty {
                 let attrs: [NSAttributedString.Key: Any] = [
