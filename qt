@@ -58,6 +58,13 @@ MODEL = os.environ.get("QT_MODEL", "")
 # downgrade to Manual, which in headless denies everything non-allowlisted.
 PERMISSIONS_ENV = os.environ.get("QT_PERMISSIONS")
 HUB_DIR_ENV = os.environ.get("QT_HUB")
+# Which UI surface fired this quick task, for the hub's own attribution.
+# Read once at queue() time and stamped on the task; each surface sets
+# QT_ORIGIN itself rather than qt taking a new CLI flag. Unknown/unset
+# values fall back to "qt" -- a typo in a surface's env var should never
+# block a task.
+ORIGIN_ENV = os.environ.get("QT_ORIGIN")
+QT_ORIGINS = ("qt", "raycast", "widget", "summon")
 
 
 def resolve_permissions():
@@ -525,6 +532,7 @@ def queue(prompt, wait=False, in_dir=None, model=None):
         "prompt": prompt,
         "status": "queued",
         "created": now(),
+        "origin": ORIGIN_ENV if ORIGIN_ENV in QT_ORIGINS else "qt",
         "invoked_from": invoked,
         "run_cwd": run_cwd,
         "perm_mode": perm_mode,
@@ -623,6 +631,9 @@ def _hub_job_record(task, item_id, rc):
         "finished": task.get("finished") or now(),
         "home_state": "today",
         "session_id": task.get("session_id"),
+        # Defaults to "qt" for a task saved before this field existed, same
+        # fallback queue() itself applies to an unset/unknown QT_ORIGIN.
+        "origin": task.get("origin") or "qt",
     }
     if rc is not None:
         job["rc"] = rc
@@ -687,17 +698,47 @@ def _notify_hub_job(hub_dir, jobdir):
     )
 
 
+def _deliver_hub_job(hub_dir, jobdir):
+    """Hand a finished job to the hub's own deliver.py, which decides
+    whether it auto-closes or waits in Verify -- qt never makes that call,
+    it just invokes the hub's policy, the same way _notify_hub_job invokes
+    notice.py's. A missing deliver.py is a silent no-op, same as a hub not
+    wired up for it at all. Runs before the finish notice so notice.py sees
+    whatever deliver.py stamped on the job first."""
+    deliver_script = os.path.join(hub_dir, "deliver.py")
+    if not os.path.isfile(deliver_script):
+        return
+    # Same 10s ceiling as the notice call below: this too sits ahead of the
+    # local osascript notify() at the end of the finish path.
+    subprocess.run(
+        [sys.executable, deliver_script, jobdir],
+        capture_output=True, text=True, timeout=10, check=True,
+    )
+
+
 def _feed_hub(task, rc=None):
     """Mirror a finished task into The Pass's ledger so it surfaces in the
-    Verify queue, and ask the hub to raise a Slack finish notice, when
-    hub_dir is configured. Best-effort: this must never break a task, so
-    every failure is caught and logged, never raised."""
+    Verify queue, hand it to the hub's deliver.py, and ask the hub to raise
+    a Slack finish notice, when hub_dir is configured. Best-effort: this
+    must never break a task, so every failure is caught and logged, never
+    raised."""
     hub_dir = resolve_hub_dir()
     if not hub_dir:
         return
     try:
         _seed_hub_item(hub_dir, _hub_item(task))
         jobdir = _write_hub_job(hub_dir, task, rc)
+        try:
+            # Delivery runs before the notice (see _deliver_hub_job) and is
+            # independent of it: a stuck/broken deliver.py should not also
+            # swallow the Slack notice this task would otherwise get.
+            _deliver_hub_job(hub_dir, jobdir)
+        except Exception as e:
+            try:
+                with open(os.path.join(LOGS_DIR, task["id"] + ".log"), "a") as f:
+                    f.write(f"\n--- hub deliver failed: {e} ---\n")
+            except OSError:
+                pass
         try:
             # By this point the record is already on disk (seed + job.json
             # + RESULT.md); only the Slack notice can still fail, so it

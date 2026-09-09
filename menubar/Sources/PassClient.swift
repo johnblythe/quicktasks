@@ -373,6 +373,24 @@ struct PassClient {
         }
     }
 
+    /// POST /revive -> sends a delivered/done item back to Verify (LD-224).
+    /// An older hub with no /revive route answers 404, which is left to the
+    /// generic failure path below rather than special-cased the way POST
+    /// /run's 409 is: it just reads as a plain action error.
+    func revive(id: String) -> Result<String, Problem> {
+        switch PassPayload.revive(id: id) {
+        case .failure(let problem): return .failure(problem)
+        case .success(let body):
+            switch post(path: "revive", body: body) {
+            case .failure(let failure):
+                return .failure(failure.problem)
+            case .success(let data):
+                let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                return .success((obj?["id"] as? String) ?? "")
+            }
+        }
+    }
+
     /// A 409 body in the widget's own words. serve.py sends "already running"
     /// or "max concurrent jobs running" as plain text; both mean "nothing was
     /// fired", which is the only part that has to fit in a menu header.

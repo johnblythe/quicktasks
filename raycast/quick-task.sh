@@ -20,7 +20,7 @@ QT="${QT_BIN:-$SELF_DIR/../qt}"
 [ -x "$QT" ] || QT="$HOME/.local/bin/qt"
 
 if [ -n "$2" ]; then
-  exec "$QT" --in "$2" "$1"
+  exec QT_ORIGIN=raycast "$QT" --in "$2" "$1"
 else
-  exec "$QT" "$1"
+  exec QT_ORIGIN=raycast "$QT" "$1"
 fi

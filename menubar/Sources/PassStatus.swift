@@ -15,7 +15,8 @@
 //                        "jobs":[{"item_id","title","state","status","started",
 //                                 "elapsed_s","failed","blocked","session_id",
 //                                 "resume_url","report","outputs",
-//                                 "finished","error","denials","can_run"}],
+//                                 "finished","error","denials","can_run",
+//                                 "revivable"}],
 //                        "needs_you":[{"item_id","title","state","reason",
 //                                      "resume_url","report","session_id",
 //                                      "started","can_run"}]}
@@ -289,6 +290,11 @@ struct PassStatus: Equatable {
             // rule the review page's own canRun() applies, computed server-side
             // so the widget and the page cannot drift.
             canRun: boolValue(field("can_run")) ?? false,
+            // Whether the hub will accept this item back into Verify
+            // (LD-224). Absent on an older hub, which reads as false and
+            // simply hides the Revive row action -- no button rather than
+            // one that 404s.
+            revivable: boolValue(field("revivable")) ?? false,
             // Which spoke filed the item, for the row glyph. Absent on a v1
             // payload and on any row the Pass has not tagged, which reads as
             // .other and draws the neutral glyph.
@@ -361,6 +367,15 @@ enum PassPayload {
     static func run(id: String) -> Result<[String: Any], Problem> {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .failure("no item id to run") }
+        return .success(["id": trimmed])
+    }
+
+    /// POST /revive (LD-224). Sends a delivered/done item back to Verify.
+    /// One key, same shape as `run`, for the same reason: trivial, but
+    /// through the seam a test can pin without a live server.
+    static func revive(id: String) -> Result<[String: Any], Problem> {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .failure("no item id to revive") }
         return .success(["id": trimmed])
     }
 

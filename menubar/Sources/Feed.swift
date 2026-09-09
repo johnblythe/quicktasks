@@ -240,6 +240,10 @@ enum Feed {
             // Only The Pass knows whether an item can be fired: the rule needs
             // the item's prompt and its lane, neither of which is in a ledger.
             canRun: pass.canRun,
+            // Only The Pass knows whether an item is revivable, same
+            // reasoning as canRun just above: a ledger row has no such
+            // concept, so the Pass side always wins.
+            revivable: pass.revivable,
             // Only the Pass tags a row with the spoke it came from; a ledger
             // row's own "source" says which of the two writers mirrored it,
             // which is a different question and is already `origin`.

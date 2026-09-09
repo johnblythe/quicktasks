@@ -151,6 +151,7 @@ enum DumpModel {
                     "wants_resume": r.wantsResume,
                     "can_decide": r.canDecide,
                     "can_run": r.canRun,
+                    "revivable": r.revivable,
                     "source_app": r.source.rawValue,
                     "source_raw": r.sourceRaw ?? NSNull(),
                     "source_symbol": r.source.symbol,
@@ -836,7 +837,8 @@ enum DumpModel {
         } else {
             let (prefixDir, stripped) = FireResolve.parsePrefix(text)
             let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: config.settings)
-            result = Actions.fire(prompt: stripped, in: resolved.url).map { "" }
+            result = Actions.fire(prompt: stripped, in: resolved.url,
+                                  origin: isPanel ? "summon" : "widget").map { "" }
             displayText = stripped
         }
         let (state, hidesPanel) = FireFieldOutcome.describe(
@@ -908,7 +910,30 @@ enum DumpModel {
         }
     }
 
-    /// `--dump-capture <text>`, `--dump-run <item-id>`, and
+    /// `--post-revive <item-id>`: the real POST to `/revive`, against
+    /// whatever QT_PASS_URL points at. Mirrors `runPost` above exactly --
+    /// same shape, no special-cased status code, since a revive that 404s
+    /// (an old hub, or an item that already moved on) is just a normal
+    /// action error rather than something the widget should call out.
+    static func runPostRevive(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--post-revive"), i + 1 < args.count else {
+            return fail("--post-revive needs an item id")
+        }
+        let config = StoreConfig.resolve()
+        guard let base = config.passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        switch PassClient(base: base).revive(id: args[i + 1]) {
+        case .success(let revivedID):
+            return emit(["ok": true, "id": revivedID])
+        case .failure(let problem):
+            _ = emit(["ok": false, "error": problem.message])
+            return 1
+        }
+    }
+
+    /// `--dump-capture <text>`, `--dump-run <item-id>`,
+    /// `--dump-revive <item-id>`, and
     /// `--dump-decision <item-id> <action> [comment]`.
     static func runPayload(args: [String]) -> Int32 {
         if let i = args.firstIndex(of: "--dump-capture") {
@@ -922,6 +947,14 @@ enum DumpModel {
         if let i = args.firstIndex(of: "--dump-run") {
             guard i + 1 < args.count else { return fail("--dump-run needs an item id") }
             switch PassPayload.run(id: args[i + 1]) {
+            case .failure(let problem): return fail(problem.message)
+            case .success(let body): return emit(body)
+            }
+        }
+
+        if let i = args.firstIndex(of: "--dump-revive") {
+            guard i + 1 < args.count else { return fail("--dump-revive needs an item id") }
+            switch PassPayload.revive(id: args[i + 1]) {
             case .failure(let problem): return fail(problem.message)
             case .success(let body): return emit(body)
             }

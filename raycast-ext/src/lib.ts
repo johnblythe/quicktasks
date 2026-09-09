@@ -172,7 +172,9 @@ export async function requeueTask(
   dir?: string,
 ): Promise<string> {
   const args = dir ? ["--in", dir, prompt] : [prompt];
-  const { stdout } = await execFileAsync(qtPath, args);
+  const { stdout } = await execFileAsync(qtPath, args, {
+    env: { ...process.env, QT_ORIGIN: "raycast" },
+  });
   const match = stdout.match(/queued (\S+)/);
   return match ? match[1] : stdout.trim();
 }

@@ -764,7 +764,7 @@ enum Entry {
             exit(DumpModel.runEndpoint())
         }
         if args.contains("--dump-capture") || args.contains("--dump-decision")
-            || args.contains("--dump-run") {
+            || args.contains("--dump-run") || args.contains("--dump-revive") {
             exit(DumpModel.runPayload(args: args))
         }
         if args.contains("--dump-keys") {
@@ -802,6 +802,10 @@ enum Entry {
         }
         if args.contains("--post-run") {
             exit(DumpModel.runPost(args: args))
+        }
+
+        if args.contains("--post-revive") {
+            exit(DumpModel.runPostRevive(args: args))
         }
         if args.contains("--post-decide") {
             exit(DumpModel.runPostDecide(args: args))

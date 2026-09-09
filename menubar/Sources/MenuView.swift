@@ -201,6 +201,7 @@ struct MenuView: View {
                                             onReport: { openReport(record) },
                                             onTitle: { openItem(record) },
                                             onRun: { run(record) },
+                                            onRevive: { revive(record) },
                                             onDecide: { action, comment in
                                                 decide(record, action: action, comment: comment)
                                             })
@@ -750,7 +751,8 @@ struct MenuView: View {
             let (prefixDir, stripped) = FireResolve.parsePrefix(rawText)
             let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: controller.settings)
             controller.perform(key: "fire", {
-                Actions.fire(prompt: stripped, in: resolved.url).map { "" }
+                Actions.fire(prompt: stripped, in: resolved.url,
+                            origin: isPanel ? "summon" : "widget").map { "" }
             }) { outcome in
                 let (state, hidesPanel) = FireFieldOutcome.describe(
                     result: outcome, toPass: false, displayText: stripped, isPanel: isPanel)
@@ -869,6 +871,24 @@ struct MenuView: View {
                 controller.post(kind: .ok, title: slug.isEmpty ? "Job started" : "Job started: \(slug)")
             case .failure(let problem):
                 controller.post(kind: .error, title: "Couldn't start the job", detail: problem.message)
+            }
+        }
+    }
+
+    /// LD-224: sends a delivered row back to Verify through `POST /revive`.
+    /// Only ever called from a button gated on `record.revivable`, so a 404
+    /// (an older hub with no such route) just reports as a normal error
+    /// rather than needing header-line treatment the way /run's 409 does.
+    private func revive(_ record: TaskRecord) {
+        let base = controller.passBase
+        controller.perform(key: record.id, {
+            Actions.revive(record: record, base: base)
+        }) { outcome in
+            switch outcome {
+            case .success:
+                controller.post(kind: .ok, title: "Revived: \(record.title)")
+            case .failure(let problem):
+                controller.post(kind: .error, title: "Couldn't revive", detail: problem.message)
             }
         }
     }
@@ -1245,6 +1265,7 @@ struct TaskRow: View {
     let onReport: () -> Void
     let onTitle: () -> Void
     let onRun: () -> Void
+    let onRevive: () -> Void
     let onDecide: (_ action: String, _ comment: String) -> Void
 
     @State private var hovering = false
@@ -1376,6 +1397,15 @@ struct TaskRow: View {
                 noting = true
             }
             RowButton(icon: "xmark.circle", help: "Reject") { confirmingReject = true }
+        }
+        // LD-224: offered only when the hub says this delivered row will
+        // still take a revive -- an older hub that never sends `revivable`
+        // reads as false, same as `canRun`/`canDecide`, so there is no
+        // button to 404 against.
+        if record.revivable {
+            RowButton(icon: "arrow.uturn.backward.circle",
+                      help: "Revive: send it back to Verify",
+                      action: onRevive)
         }
         // The reference's external-link arrow, here meaning "reopen the
         // session". Only shown when there is a session to reopen; the

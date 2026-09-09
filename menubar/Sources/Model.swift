@@ -325,6 +325,12 @@ struct TaskRecord: Codable, Equatable {
     /// and the review page's own fire action cannot disagree. Always false for
     /// a file-feed row: the ledgers do not carry the item's prompt.
     let canRun: Bool
+    /// Whether the hub will accept this item back into Verify via
+    /// `POST /revive` (LD-224). Decided server-side (`/status.json`'s
+    /// `revivable`), same reasoning as `canRun`: absent or false just hides
+    /// the row's Revive button rather than offering one that 404s. Always
+    /// false for a file-feed row, same as `canRun`.
+    let revivable: Bool
     /// Which spoke the item came in from, for the row's glyph. `.other` when
     /// nothing said -- which is every quicktask, since a task fired from a
     /// terminal has no spoke behind it.
@@ -352,6 +358,7 @@ struct TaskRecord: Codable, Equatable {
          error: String? = nil,
          denialCount: Int = 0,
          canRun: Bool = false,
+         revivable: Bool = false,
          source: ItemSource = .other,
          sourceRaw: String? = nil) {
         self.id = id
@@ -373,6 +380,7 @@ struct TaskRecord: Codable, Equatable {
         self.error = error
         self.denialCount = denialCount
         self.canRun = canRun
+        self.revivable = revivable
         self.source = source
         self.sourceRaw = sourceRaw
     }

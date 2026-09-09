@@ -184,6 +184,15 @@ already running or when all three job slots are busy, and the widget says so in
 the header ("Already running", "Job slots full, not fired") rather than
 surfacing an HTTP status.
 
+**Revive** sends a delivered/done item back to Verify (LD-224). Whether it is
+offered at all is The Pass's call, not the widget's: a row only gets the button
+when `/status.json` sends `revivable: true`, and an older hub that omits the
+field entirely gets no button, the same way a missing `can_run` means no Run
+it. `POST /revive` takes just the item id; unlike `/run`'s 409, nothing about
+the response is special-cased, so a 404 from a hub old enough to have no such
+route just reads as a plain action error. A file-feed row never offers it,
+same reasoning as Run it: the ledgers have no such field to read.
+
 Clicking the **title** opens the item in The Pass, using the
 `item_url_template` the payload carries (`…/?item={item_id}`) with the id
 substituted as a query value. On a v1 payload, or on a freshly fired quicktask
@@ -510,6 +519,7 @@ QuicktaskStatus --dump-model --limit 500         # all rows, not just visible on
 QuicktaskStatus --dump-endpoint                  # where the Pass was found, and how
 QuicktaskStatus --dump-capture "call dan"        # the POST /capture body
 QuicktaskStatus --dump-run <id>                  # the POST /run body
+QuicktaskStatus --dump-revive <id>               # the POST /revive body (LD-224)
 QuicktaskStatus --dump-decision <id> accept      # the POST /save body
 QuicktaskStatus --dump-decision <id> redo "note"
 QuicktaskStatus --dump-keys down,down,up         # where the keyboard highlight lands
@@ -522,6 +532,7 @@ QuicktaskStatus --dump-summon summon,escape,summon   # drives the real ⌥Q/Esca
 QuicktaskStatus --dump-fire-outcome "call dan" --mode pass --panel   # what the field would show, no display
 QuicktaskStatus --dump-recent-dirs               # the chip's recency menu, off the qt ledger
 QuicktaskStatus --post-run <id>                  # really fire an item through POST /run
+QuicktaskStatus --post-revive <id>               # really send an item back to Verify through POST /revive
 QuicktaskStatus --dump-restart                   # the POST /restart request: method, path, Origin
 QuicktaskStatus --post-restart                   # really POST /restart and print the outcome
 QuicktaskStatus --dump-outcomes show,login-on,restart,dismiss-newest   # drive outcome/notification producers headless
@@ -639,7 +650,7 @@ settings, all without touching the real ones.
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-286 tests in `tests/test_menubar_model.py` (298 across the whole suite, 38 of
+297 tests in `tests/test_menubar_model.py` (326 across the whole suite, 38 of
 them new for LD-201 v8: the persistent outcome queue's insert/cap/dismiss/
 mark-seen behaviour, the login-item and Restart Pass outcomes in both their
 success and forced-failure shapes, Settings Apply's outcome, the notification
@@ -654,7 +665,16 @@ history-only outcome, ten sustained failures producing exactly one down/back
 pair, a second episode inside the ten-minute rate-limit window recording its
 own outcomes without notifying again, a files-only fallback notifying even
 under the 45-second threshold, and a job that vanishes mid-blip and
-reappears finished firing its outcome exactly once). They build the
+reappears finished firing its outcome exactly once; a further 11 new for
+quick-fire origin and Revive (LD-224): the `--dump-revive`/`--post-revive`
+body, trim, and real round trip, a 404 on `/revive` reading as a plain
+action error rather than anything special-cased the way `/run`'s 409 is, an
+unreachable or unconfigured Pass still erroring rather than going silent, a
+file-feed row never offering the button, a `revivable: true` done job
+sorting into Done today with no new section, an older hub's payload
+defaulting the flag false when the field is missing outright, and the real
+subprocess environment threading `QT_ORIGIN=widget` from the dropdown
+versus `QT_ORIGIN=summon` from the hotkey panel). They build the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in
@@ -732,7 +752,7 @@ The module skips rather than fails when `swiftc` is unavailable.
 | `Sources/Notifier.swift` | The `Notifier` protocol; `SystemNotifier` (real) and `RecordingNotifier` (tests, snapshots, every headless seam) |
 | `Sources/Freshness.swift` | The footer's always-on freshness line |
 | `Sources/App.swift` | Entry point, polling controller, `MenuBarExtra` scene |
-| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--dump-restart`, `--post-restart`, `--dump-outcomes`, `--dump-notifications` (LD-201 v9) |
+| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-revive`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--post-revive`, `--dump-restart`, `--post-restart`, `--dump-outcomes`, `--dump-notifications` (LD-201 v9, revive LD-224) |
 | `Sources/Snapshot.swift` | `--snapshot`, `--snapshot-settings` |
 | `Sources/Hotkey.swift` | Carbon global hotkey registration, the mode-swap keys, the recorder control in Settings |
 | `Sources/FireResolve.swift` | What a fire actually does: directory precedence, `--in`/`@` prefix parsing, the recent-dirs list, and the shared description `--dump-fire` and ⌘⏎ both call |

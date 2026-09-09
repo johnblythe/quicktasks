@@ -1515,6 +1515,30 @@ class TestDoneTodayByFinished(PassCase):
         self.assertEqual(self.section_of(base, "j"), "earlier")
 
 
+class TestRevivableJobs(PassCase):
+    """revivable (LD-224): the Pass alone decides which done rows may go
+    back to Verify, and the flag rides into Done today without a new
+    section -- exactly like can_run rides into Needs you."""
+
+    def test_a_revivable_done_job_lands_in_done_today_never_needs_you(self):
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j", status="done", state="today", revivable=True,
+                      finished=_iso(datetime.now() - timedelta(minutes=5)))],
+            needs=[]))
+        r = self.by_id(self.pass_model(base), "j")
+        self.assertEqual(r["section"], "done_today")
+        self.assertTrue(r["revivable"])
+
+    def test_revivable_defaults_false_for_an_older_hub_payload(self):
+        """An older hub's status.json carries no revivable key at all --
+        leaving it out of the fixture is how that payload gets simulated."""
+        base = self.serve(payload=status_fixture(
+            jobs=[job("j", status="done", state="today",
+                      finished=_iso(datetime.now() - timedelta(minutes=5)))]))
+        r = self.by_id(self.pass_model(base), "j")
+        self.assertFalse(r["revivable"])
+
+
 class TestRunIt(PassCase):
     """POST /run: the body, the round trip, and the 409 that is an answer
     rather than a fault."""
@@ -1595,6 +1619,60 @@ class TestRunIt(PassCase):
         m = self.model()
         self.assertEqual(m["source"], "files")
         self.assertFalse(any(r["can_run"] for r in m["records"]))
+
+
+class TestReviveIt(PassCase):
+    """POST /revive: the body is just the item id (LD-224). Unlike /run,
+    nothing about it is special-cased -- a 404 from an older hub with no
+    such route, or an item that already moved on, both read as a plain
+    action error."""
+
+    def test_the_revive_body_is_just_the_item_id(self):
+        body = json.loads(self.run_binary("--dump-revive", "ld188").stdout)
+        self.assertEqual(body, {"id": "ld188"})
+
+    def test_the_revive_body_trims_and_refuses_empty(self):
+        body = json.loads(self.run_binary("--dump-revive", "  ld188  ").stdout)
+        self.assertEqual(body, {"id": "ld188"})
+        self.run_binary("--dump-revive", "   ", expect=1)
+
+    def test_reviving_an_item_posts_the_id_to_revive(self):
+        base = self.serve(payload=status_fixture(), post_body={"ok": True, "id": "ld188"})
+        proc = self.run_binary("--post-revive", "ld188", extra_env={"QT_PASS_URL": base})
+        self.assertEqual(json.loads(proc.stdout), {"ok": True, "id": "ld188"})
+        posts = self.server.posts_to("/revive")
+        self.assertEqual(len(posts), 1, self.server.posts)
+        self.assertEqual(posts[0]["body"], {"id": "ld188"})
+        self.assertEqual(posts[0]["headers"].get("Content-Type"), "application/json")
+
+    def test_a_404_on_revive_is_not_dressed_up_as_anything_special(self):
+        """/run turns a 409 into "Already running"; /revive has no such
+        table, so a 404 (no route, or the item already moved on) surfaces
+        as a plain HTTP error instead."""
+        base = self.serve(payload=status_fixture(), post_code=404,
+                          post_text="no such item")
+        proc = self.run_binary("--post-revive", "ld188", extra_env={"QT_PASS_URL": base},
+                               expect=1)
+        self.assertIn("404", json.loads(proc.stdout)["error"])
+
+    def test_an_unreachable_pass_is_not_a_silent_no_op(self):
+        proc = self.run_binary("--post-revive", "ld188",
+                               extra_env={"QT_PASS_URL": "http://127.0.0.1:1"}, expect=1)
+        self.assertFalse(json.loads(proc.stdout)["ok"])
+
+    def test_reviving_needs_a_pass(self):
+        """QT_PASS_URL="" means the file ledgers only, and the file feed has
+        no route to revive anything."""
+        self.run_binary("--post-revive", "gate1", extra_env={"QT_PASS_URL": ""}, expect=1)
+
+    def test_a_file_feed_row_never_offers_revive(self):
+        """revivable is a Pass-only concept, same as can_run just above --
+        neither ledger has such a field, so the button has to stay off in
+        file mode."""
+        self.write_task("t-local", status="done")
+        m = self.model()
+        self.assertEqual(m["source"], "files")
+        self.assertFalse(any(r["revivable"] for r in m["records"]))
 
 
 class TestItemDeepLink(PassCase):
@@ -2871,6 +2949,18 @@ class TestFireOutcome(PassCase):
         path.chmod(0o755)
         return str(path)
 
+    def stub_qt_capturing_origin(self):
+        """Like stub_qt, but also records $QT_ORIGIN to a file next to it,
+        so a test can prove what Actions.fire() actually threads through
+        to the real subprocess environment (LD-224) rather than trusting
+        the call site alone."""
+        origin_file = self.tmp / "origin.txt"
+        path = self.tmp / "bin" / "qt-origin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'#!/bin/sh\necho "$QT_ORIGIN" > {origin_file}\nexit 0\n')
+        path.chmod(0o755)
+        return str(path), origin_file
+
     # --- run now -----------------------------------------------------------
 
     def test_run_now_success_shows_fired_and_hides_the_panel(self):
@@ -2893,6 +2983,22 @@ class TestFireOutcome(PassCase):
                               extra_env={"QT_BIN": self.stub_qt()})
         self.assertEqual(result["state"], "success")
         self.assertFalse(result["hides_panel"])
+
+    def test_run_now_from_the_dropdown_threads_origin_widget(self):
+        """LD-224: the real MenuBarExtra dropdown fires with origin=widget,
+        proven by what actually lands in the subprocess environment."""
+        qt, origin_file = self.stub_qt_capturing_origin()
+        self.outcome("fix the flaky test", mode="run", panel=False,
+                     extra_env={"QT_BIN": qt})
+        self.assertEqual(origin_file.read_text().strip(), "widget")
+
+    def test_run_now_from_the_summon_panel_threads_origin_summon(self):
+        """LD-224: the ⌥Q hotkey panel fires with origin=summon, not
+        widget -- the whole reason qt needs the two kept distinct."""
+        qt, origin_file = self.stub_qt_capturing_origin()
+        self.outcome("fix the flaky test", mode="run", panel=True,
+                     extra_env={"QT_BIN": qt})
+        self.assertEqual(origin_file.read_text().strip(), "summon")
 
     def test_run_now_failure_keeps_the_panel_open_and_shows_the_real_error(self):
         result = self.outcome("fix the flaky test", mode="run", panel=True,

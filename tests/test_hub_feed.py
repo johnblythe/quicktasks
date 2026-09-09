@@ -65,7 +65,32 @@ log = os.environ.get("FAKE_NOTICE_LOG")
 if log:
     with open(log, "a") as f:
         f.write(repr(sys.argv[1:]) + "\\n")
+# Optional: append a one-word tag to a shared order log, so a test can prove
+# call order (deliver before notice) without disturbing the log above, which
+# existing tests assert on verbatim.
+order_log = os.environ.get("FAKE_ORDER_LOG")
+if order_log:
+    with open(order_log, "a") as f:
+        f.write("notice\\n")
 sys.exit(int(os.environ.get("FAKE_NOTICE_RC", "0")))
+"""
+
+# deliver.py itself lives in the hub repo, not here; its real behavior
+# (deciding whether a job auto-closes or waits in Verify) is out of scope
+# for qt's tests. Same subprocess-boundary contract as notice.py above, and
+# the same stub shape.
+FAKE_DELIVER_PY = """\
+#!/usr/bin/env python3
+import os, sys
+log = os.environ.get("FAKE_DELIVER_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(repr(sys.argv[1:]) + "\\n")
+order_log = os.environ.get("FAKE_ORDER_LOG")
+if order_log:
+    with open(order_log, "a") as f:
+        f.write("deliver\\n")
+sys.exit(int(os.environ.get("FAKE_DELIVER_RC", "0")))
 """
 
 
@@ -135,6 +160,14 @@ class HubFeedEndToEndTests(unittest.TestCase):
         notice_path.chmod(notice_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         return notice_path
 
+    def _install_fake_deliver(self):
+        """Drop the stub deliver.py (see FAKE_DELIVER_PY above) into the
+        throwaway hub dir, standing in for the hub's real one."""
+        deliver_path = self.hub_dir / "deliver.py"
+        deliver_path.write_text(FAKE_DELIVER_PY)
+        deliver_path.chmod(deliver_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return deliver_path
+
     def _run_qt(self, prompt, fake_json, fake_rc=0, extra_env=None):
         env = dict(os.environ)
         env["QT_DATA"] = str(self.qt_data)
@@ -144,6 +177,7 @@ class HubFeedEndToEndTests(unittest.TestCase):
         env["FAKE_CLAUDE_JSON"] = json.dumps(fake_json)
         env["FAKE_CLAUDE_RC"] = str(fake_rc)
         env.pop("QT_PERMISSIONS", None)
+        env.pop("QT_ORIGIN", None)
         if extra_env:
             env.update(extra_env)
         proc = subprocess.run(
@@ -251,6 +285,53 @@ class HubFeedEndToEndTests(unittest.TestCase):
         ])
         self.assertIn("Blocked on Bash.", result_md)
         self.assertIn(resume_hint, result_md)
+
+    def test_origin_defaults_to_qt_when_unset(self):
+        """A quick-fire with no QT_ORIGIN set (today's qt, or any surface
+        that forgot to set it) stamps "qt" on both the task and the hub
+        job -- the same default the hub already assumes for a job written
+        before this field existed."""
+        proc = self._run_qt(
+            "a task fired with no QT_ORIGIN set",
+            {"result": "Fine.", "session_id": "sess-origin-default"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        task = self._the_task()
+        self.assertEqual(task["origin"], "qt")
+        item_id = f"qt-{task['id']}"
+        job, _ = self._the_job(item_id)
+        self.assertEqual(job["origin"], "qt")
+
+    def test_origin_threads_from_env_to_task_and_job(self):
+        """QT_ORIGIN is read once at queue() time and stamped on the task,
+        then carried straight through onto the hub job -- the source of
+        truth for the hub's own attribution."""
+        proc = self._run_qt(
+            "a task fired from raycast",
+            {"result": "Fine.", "session_id": "sess-origin-raycast"},
+            extra_env={"QT_ORIGIN": "raycast"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        task = self._the_task()
+        self.assertEqual(task["origin"], "raycast")
+        item_id = f"qt-{task['id']}"
+        job, _ = self._the_job(item_id)
+        self.assertEqual(job["origin"], "raycast")
+
+    def test_unknown_origin_falls_back_to_qt(self):
+        """A typo or an unrecognized surface name in QT_ORIGIN must never
+        block a task -- it just falls back to "qt", same as unset."""
+        proc = self._run_qt(
+            "a task fired with a bogus QT_ORIGIN",
+            {"result": "Fine.", "session_id": "sess-origin-bogus"},
+            extra_env={"QT_ORIGIN": "some-typo"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        task = self._the_task()
+        self.assertEqual(task["origin"], "qt")
+        item_id = f"qt-{task['id']}"
+        job, _ = self._the_job(item_id)
+        self.assertEqual(job["origin"], "qt")
 
     def test_hub_off_by_default_is_a_no_op(self):
         """QT_HUB unset must be exactly today's behavior: no hub dir is
@@ -363,6 +444,111 @@ class HubFeedEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(notice_log.exists(), "notice.py must not run when QT_HUB is unset")
+
+    def test_deliver_invoked_with_jobdir_when_configured(self):
+        """After a job lands in hub_dir/jobs/, qt shells out to the hub's
+        deliver.py with exactly that jobdir as its one argument -- the same
+        calling convention _notify_hub_job uses for notice.py."""
+        self._install_fake_deliver()
+        deliver_log = Path(self.tmp.name) / "deliver.log"
+        proc = self._run_qt(
+            "a task that finishes cleanly for deliver",
+            {"result": "All done.", "session_id": "sess-deliver", "total_cost_usd": 0.01},
+            extra_env={"FAKE_DELIVER_LOG": str(deliver_log)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        task = self._the_task()
+        item_id = f"qt-{task['id']}"
+        jobdirs = list((self.hub_dir / "jobs").glob(f"{item_id}-*"))
+        self.assertEqual(len(jobdirs), 1, f"expected one jobdir, got {jobdirs}")
+        jobdir = jobdirs[0]
+
+        self.assertTrue(deliver_log.is_file(), "deliver.py was never invoked")
+        self.assertEqual(deliver_log.read_text().strip(), repr([str(jobdir)]))
+
+    def test_deliver_skipped_silently_when_deliver_py_absent(self):
+        """A hub dir with no deliver.py (older hub, or one not yet wired for
+        auto-close) must not raise or log anything -- the same silent no-op
+        the rest of qt uses for a hub that isn't installed for a given
+        step."""
+        proc = self._run_qt(
+            "a task with no deliver.py in the hub",
+            {"result": "Fine.", "session_id": "sess-no-deliver"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        task = self._the_task()
+        self.assertEqual(task["status"], "done")
+        self.assertFalse((self.hub_dir / "deliver.py").exists())
+
+        log_path = self.qt_data / "logs" / f"{task['id']}.log"
+        log_text = log_path.read_text() if log_path.is_file() else ""
+        self.assertNotIn("hub feed failed", log_text)
+        self.assertNotIn("hub deliver failed", log_text)
+
+    def test_deliver_failure_is_logged_and_does_not_break_task(self):
+        """A deliver.py that exits non-zero must be caught, logged to the
+        task's log file under its own "hub deliver failed" message, never
+        raised -- and must not suppress the Slack notice or disturb the job
+        already written to disk, since deliver.py and notice.py run in
+        independent try/except blocks."""
+        self._install_fake_deliver()
+        proc = self._run_qt(
+            "a task whose deliver fails",
+            {"result": "All done.", "session_id": "sess-deliver-fail"},
+            extra_env={"FAKE_DELIVER_RC": "3"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)  # the task itself still succeeds
+
+        task = self._the_task()
+        self.assertEqual(task["status"], "done")
+        item_id = f"qt-{task['id']}"
+        job, result_md = self._the_job(item_id)
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(result_md.strip(), "All done.")
+
+        log_path = self.qt_data / "logs" / f"{task['id']}.log"
+        log_text = log_path.read_text()
+        self.assertIn("hub deliver failed", log_text)
+        self.assertNotIn("hub feed failed", log_text)
+
+    def test_deliver_skipped_silently_when_hub_dir_unset(self):
+        """QT_HUB unset means the whole hub feed -- deliver.py included --
+        never runs, even with a real deliver.py sitting in self.hub_dir."""
+        self._install_fake_deliver()
+        deliver_log = Path(self.tmp.name) / "deliver-unset.log"
+        env = dict(os.environ)
+        env["QT_DATA"] = str(self.qt_data)
+        env.pop("QT_HUB", None)
+        env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
+        env["FAKE_NOTIFY_LOG"] = str(self.notify_log)
+        env["FAKE_DELIVER_LOG"] = str(deliver_log)
+        env["FAKE_CLAUDE_JSON"] = json.dumps({"result": "fine", "session_id": "s"})
+        env["FAKE_CLAUDE_RC"] = "0"
+        env.pop("QT_PERMISSIONS", None)
+
+        proc = subprocess.run(
+            [sys.executable, str(QT_SCRIPT), "-w", "a task with hub unset for deliver"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(deliver_log.exists(), "deliver.py must not run when QT_HUB is unset")
+
+    def test_deliver_runs_before_notice(self):
+        """_feed_hub calls deliver.py ahead of notice.py (see _feed_hub's
+        own comment on why: notice.py should see whatever deliver.py
+        stamped on the job first). Each fake shim appends its own name to a
+        shared order log; the write order proves the call order."""
+        self._install_fake_deliver()
+        self._install_fake_notice()
+        order_log = Path(self.tmp.name) / "order.log"
+        proc = self._run_qt(
+            "a task exercising deliver-then-notice ordering",
+            {"result": "All done.", "session_id": "sess-order"},
+            extra_env={"FAKE_ORDER_LOG": str(order_log)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(order_log.read_text().splitlines(), ["deliver", "notice"])
 
 
 class HubMappingUnitTests(unittest.TestCase):

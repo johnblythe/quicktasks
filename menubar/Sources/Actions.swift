@@ -41,9 +41,11 @@ enum Actions {
     /// actually meant to run in rather than wherever the widget's own process
     /// happens to have as its cwd; `dir` comes from `FireResolve`, which is
     /// also where the widget's own `--in`/`@`-prefix parsing and the
-    /// directory chip's precedence live.
+    /// directory chip's precedence live. `origin` is qt's source-of-truth for
+    /// which surface fired it (LD-224): "widget" for the dropdown, "summon"
+    /// for the hotkey panel -- the two call sites this widget has.
     @discardableResult
-    static func fire(prompt: String, in dir: URL) -> Result<Void, Problem> {
+    static func fire(prompt: String, in dir: URL, origin: String) -> Result<Void, Problem> {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return .failure("nothing to fire") }
         guard let qt = qtBinary() else {
@@ -53,6 +55,9 @@ enum Actions {
         p.executableURL = qt
         p.arguments = ["--in", dir.path, text]
         p.currentDirectoryURL = dir
+        var env = ProcessInfo.processInfo.environment
+        env["QT_ORIGIN"] = origin
+        p.environment = env
         // qt detaches the run itself, so this returns as soon as it is queued.
         do {
             try p.run()
@@ -163,6 +168,17 @@ enum Actions {
             return .failure("row has no Pass item id")
         }
         return PassClient(base: base).run(id: itemID)
+    }
+
+    /// Sends a delivered row back to Verify, through `POST /revive`. Only
+    /// offered when the row's `revivable` flag says the hub will accept it
+    /// (LD-224); a 404 from an older hub with no such route just reads as a
+    /// plain action error, same as any other failure here.
+    static func revive(record: TaskRecord, base: URL) -> Result<String, Problem> {
+        guard let itemID = record.itemID, !itemID.isEmpty else {
+            return .failure("row has no Pass item id")
+        }
+        return PassClient(base: base).revive(id: itemID)
     }
 
     /// Joins /status.json's root-relative `report` path onto its `pass_url`.
