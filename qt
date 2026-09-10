@@ -37,6 +37,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 QT_DATA = os.path.expanduser(os.environ.get("QT_DATA", "~/.quicktasks"))
@@ -262,6 +263,142 @@ def _cmux_ready(cmux):
         return False
 
 
+def _is_cmux_access_denied(stderr):
+    """Whether stderr indicates cmux's socket refused a process with no
+    cmux ancestry (default "cmuxOnly" socketControlMode) -- as opposed to
+    the socket simply being down. Case-insensitive; covers both wordings
+    cmux's CLI has used for this."""
+    s = (stderr or "").lower()
+    return "access denied" in s or "only processes started inside cmux" in s
+
+
+def _safe_unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _cmux_outside_probe(cmux, timeout=8):
+    """Whether the cmux socket accepts a connection from a process with no
+    cmux ancestry and no controlling TTY -- exactly the shape of
+    QuicktaskResume.app's launchd-spawned handler, which `doctor` itself
+    cannot reproduce by simply shelling out (a `qt doctor` run inside a
+    cmux terminal already has cmux ancestry, so it would never see a
+    denial). Double-forks and lets the middle process exit immediately so
+    the grandchild reparents to launchd (ppid 1) before it calls
+    `cmux ping`, then hands the result back through a temp file since the
+    grandchild's exit status never reaches this process directly.
+
+    Returns (outcome, detail):
+      "ok"          - ping succeeded; outside access works.
+      "denied"      - ping failed with cmux's "access denied" message.
+      "down"        - ping failed for any other reason, or timed out.
+      "unavailable" - the probe itself could not run (fork failed, etc).
+
+    Never raises and never blocks past `timeout` plus a small grace
+    period for the fork/wait bookkeeping around it.
+    """
+    try:
+        fd, result_path = tempfile.mkstemp(prefix="qt-cmux-probe-")
+        os.close(fd)
+    except OSError as e:
+        return "unavailable", f"could not create probe result file: {e}"
+
+    # Strip anything cmux-related from the ambient environment (so a stale
+    # CMUX_SOCKET_PASSWORD or similar can't leak in) but otherwise inherit
+    # it, since the fake-cmux test harness passes its own control vars
+    # (FAKE_CMUX_PING_RC, ...) this way too. PATH is pinned to the cmux
+    # binary's own directory plus the usual system dirs so find_cmux()
+    # results (including a test's fake binary) resolve the same way here.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CMUX_")}
+    env["HOME"] = os.environ.get("HOME", "")
+    env["PATH"] = os.pathsep.join(
+        [os.path.dirname(cmux) or ".", "/opt/homebrew/bin", "/usr/bin", "/bin"]
+    )
+    env["CMUX_QUIET"] = "1"
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        pid = os.fork()
+    except OSError as e:
+        _safe_unlink(result_path)
+        return "unavailable", f"fork failed: {e}"
+
+    if pid == 0:
+        # Middle process: start a new session, fork the real prober, then
+        # exit right away without waiting -- the prober is orphaned and
+        # re-parented to launchd, matching a launchd-spawned handler with
+        # no TTY. Every branch below ends in os._exit(); nothing here may
+        # return or raise back into whatever process forked us.
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        try:
+            pid2 = os.fork()
+        except OSError:
+            os._exit(0)
+        if pid2 == 0:
+            try:
+                time.sleep(0.3)  # let the middle process exit first
+                try:
+                    r = subprocess.run(
+                        [cmux, "ping"], capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=timeout, env=env,
+                    )
+                    data = {"rc": r.returncode, "stderr": (r.stderr or "")[:500]}
+                except subprocess.TimeoutExpired:
+                    data = {"rc": None, "stderr": "outside probe: cmux ping timed out"}
+                except Exception as e:
+                    data = {"rc": None, "stderr": str(e)[:500]}
+                try:
+                    tmp = result_path + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(data, f)
+                    os.replace(tmp, result_path)
+                except OSError:
+                    pass
+            except Exception:
+                pass
+            os._exit(0)
+        os._exit(0)
+
+    # Parent: reap the middle process (it exits almost immediately), then
+    # poll the result file the grandchild writes.
+    try:
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+
+    deadline = time.monotonic() + timeout + 2
+    data = None
+    while time.monotonic() < deadline:
+        try:
+            with open(result_path) as f:
+                text = f.read().strip()
+            if text:
+                data = json.loads(text)
+                break
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.05)
+
+    _safe_unlink(result_path)
+
+    if data is None:
+        return "down", "outside probe timed out waiting for a result"
+
+    rc = data.get("rc")
+    stderr = data.get("stderr") or ""
+    if rc == 0:
+        return "ok", ""
+    if _is_cmux_access_denied(stderr):
+        return "denied", stderr
+    return "down", stderr or f"cmux ping failed (rc {rc})"
+
+
 def _log_launch(record):
     """Append one JSON line to resume.log, rotating (keep-last) at
     RESUME_LOG_MAX_LINES. A logging failure must never break a launch."""
@@ -287,11 +424,20 @@ def _launch_cmux(workspace_name, argv):
     down (app not running), launch the app and poll for it before retrying
     once. Returns (ok, reason, attempts): ok is True only if a new-workspace
     call actually succeeded; reason is one of a small set of specific
-    causes ("cmux CLI not found", "cmux socket not answering after 10 s",
-    or "cmux new-workspace failed (rc N): <stderr head>") so a fallback
+    causes ("cmux CLI not found", "cmux refused an outside process (socket
+    control mode is cmuxOnly); set cmux Settings > Automation > Socket
+    control to password", "cmux socket not answering after 10 s", or
+    "cmux new-workspace failed (rc N): <stderr head>") so a fallback
     notification never has to say the generic "cmux unreachable"; attempts
     is every subprocess call actually made, each as
-    {"argv": [...first 3 tokens...], "rc": int|None, "stderr": str}."""
+    {"argv": [...first 3 tokens...], "rc": int|None, "stderr": str}.
+
+    An "access denied" failure is a distinct case from the socket being
+    down: it means cmux is up and answering, but its socket control mode
+    (default "cmuxOnly") refuses any process without cmux ancestry -- the
+    exact shape of a launchd-spawned resume click. Retrying via `open -ga
+    cmux` or polling for readiness would only get denied again, so that
+    case returns immediately instead of burning the usual ~10s wait."""
     attempts = []
     cmux = find_cmux()
     if not cmux:
@@ -305,6 +451,12 @@ def _launch_cmux(workspace_name, argv):
     attempts.append({"argv": new_workspace[:3], "rc": rc, "stderr": stderr[:200]})
     if ok:
         return True, None, attempts
+
+    if _is_cmux_access_denied(stderr):
+        return False, (
+            "cmux refused an outside process (socket control mode is cmuxOnly); "
+            "set cmux Settings > Automation > Socket control to password"
+        ), attempts
 
     _, open_rc, open_stderr = _run_logged(["open", "-ga", "cmux"], env=env)
     attempts.append({"argv": ["open", "-ga", "cmux"], "rc": open_rc, "stderr": open_stderr[:200]})
@@ -1007,6 +1159,17 @@ def cmd_setup():
         cfg["terminal"] = cur
     save_config(cfg)  # so a test launch below picks up the chosen terminal
 
+    if cfg["terminal"] == "cmux":
+        cmux = find_cmux()
+        if cmux and _cmux_ready(cmux):
+            outcome, _detail = _cmux_outside_probe(cmux)
+            if outcome == "denied":
+                print("\n!  cmux's socket refuses processes started outside cmux; resume")
+                print("   links (Slack, The Pass, menubar) will fall back to Terminal.app.")
+                print("   Fix: cmux Settings > Automation > Socket control to password")
+                print("   (automation.socketControlMode + socketPassword in")
+                print("   ~/.config/cmux/cmux.json), then cmux reload-config.")
+
     if input("test launch now? [y/N]: ").strip().lower() in ("y", "yes"):
         print('  opening... look for "qt: terminal launch works. You can close this."')
         launch_test_terminal()
@@ -1424,7 +1587,19 @@ def cmd_doctor():
             report("warn", "terminal (cmux)", "binary not found",
                     "install cmux, or qt setup to pick a different terminal")
         elif _cmux_ready(cmux):
-            report("ok", "terminal (cmux)", f"{cmux}, socket responding")
+            outcome, detail = _cmux_outside_probe(cmux)
+            if outcome == "ok":
+                report("ok", "terminal (cmux)", f"{cmux}, socket responding; outside-cmux probe ok")
+            elif outcome == "denied":
+                report("warn", "terminal (cmux)",
+                        "socket refuses processes started outside cmux; resume links "
+                        "(Slack, The Pass, menubar) will fall back to Terminal.app",
+                        "set cmux Settings > Automation > Socket control to password "
+                        "(automation.socketControlMode + socketPassword in "
+                        "~/.config/cmux/cmux.json), then cmux reload-config")
+            else:
+                report("ok", "terminal (cmux)",
+                        f"{cmux}, socket responding; outside-cmux probe {outcome} ({detail[:80]})")
         else:
             report("ok", "terminal (cmux)",
                     f"{cmux}, app not running now (resume auto-starts it)")
