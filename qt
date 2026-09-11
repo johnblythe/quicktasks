@@ -254,22 +254,52 @@ def _cmux_env():
     return dict(os.environ, CMUX_QUIET="1")
 
 
-def _cmux_ready(cmux):
-    """Whether the cmux socket is up right now."""
+def _cmux_socket_state(cmux):
+    """("ok" | "denied" | "down", stderr) for the cmux socket right now,
+    probed with `workspace list`. "denied" means cmux is up but its socket
+    control mode (default "cmuxOnly") refuses this process for lacking cmux
+    ancestry -- a state a bare up/down check reads as "down", which is how
+    doctor and setup used to print a green "app not running" line from any
+    non-cmux terminal, and how a cold-start resume click sat out the full
+    readiness poll against a socket that was answering all along."""
     try:
-        return subprocess.run([cmux, "workspace", "list"], capture_output=True,
-                              timeout=3, env=_cmux_env()).returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
+        r = subprocess.run([cmux, "workspace", "list"], capture_output=True, text=True,
+                           timeout=3, env=_cmux_env())
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        return "down", str(e)
+    if r.returncode == 0:
+        return "ok", ""
+    stderr = (r.stderr or "").strip()
+    return ("denied" if _is_cmux_access_denied(stderr) else "down"), stderr
+
+
+def _cmux_ready(cmux):
+    """Whether the cmux socket is up and accepting this process right now."""
+    return _cmux_socket_state(cmux)[0] == "ok"
 
 
 def _is_cmux_access_denied(stderr):
     """Whether stderr indicates cmux's socket refused a process with no
     cmux ancestry (default "cmuxOnly" socketControlMode) -- as opposed to
-    the socket simply being down. Case-insensitive; covers both wordings
-    cmux's CLI has used for this."""
+    the socket simply being down. Case-insensitive; covers the wordings
+    cmux's CLI has used for this across versions."""
     s = (stderr or "").lower()
-    return "access denied" in s or "only processes started inside cmux" in s
+    return ("access denied" in s or "only processes started inside cmux" in s
+            # cmux 0.63.x closed the connection before the CLI's write had
+            # finished, so the same refusal surfaced as a broken pipe (cmux
+            # issue #3089). A socket that is down fails to connect instead.
+            or ("broken pipe" in s and "socket" in s))
+
+
+# The one remedy for a cmuxOnly refusal, worded once so the launch
+# notification, `qt doctor` and `qt setup` cannot drift apart.
+CMUXONLY_REMEDY = ("set cmux Settings > Automation > Socket control to password "
+                   "(automation.socketControlMode + socketPassword in "
+                   "~/.config/cmux/cmux.json), then cmux reload-config")
+CMUXONLY_REASON = ("cmux refused an outside process (socket control mode is cmuxOnly); "
+                   + CMUXONLY_REMEDY)
+CMUXONLY_SYMPTOM = ("socket refuses processes started outside cmux; resume links "
+                    "(Slack, The Pass, menubar) will fall back to Terminal.app")
 
 
 def _safe_unlink(path):
@@ -308,13 +338,14 @@ def _cmux_outside_probe(cmux, timeout=8):
     # Strip anything cmux-related from the ambient environment (so a stale
     # CMUX_SOCKET_PASSWORD or similar can't leak in) but otherwise inherit
     # it, since the fake-cmux test harness passes its own control vars
-    # (FAKE_CMUX_PING_RC, ...) this way too. PATH is pinned to the cmux
-    # binary's own directory plus the usual system dirs so find_cmux()
-    # results (including a test's fake binary) resolve the same way here.
+    # (FAKE_CMUX_PING_RC, ...) this way too. PATH keeps its inherited entries
+    # (a test's fake binary, a pyenv or uv python3 for its shebang) with the
+    # cmux binary's own directory in front and the usual system dirs after.
     env = {k: v for k, v in os.environ.items() if not k.startswith("CMUX_")}
-    env["HOME"] = os.environ.get("HOME", "")
+    inherited = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
     env["PATH"] = os.pathsep.join(
-        [os.path.dirname(cmux) or ".", "/opt/homebrew/bin", "/usr/bin", "/bin"]
+        [os.path.dirname(cmux) or "."] + inherited
+        + ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
     )
     env["CMUX_QUIET"] = "1"
 
@@ -342,7 +373,13 @@ def _cmux_outside_probe(cmux, timeout=8):
             os._exit(0)
         if pid2 == 0:
             try:
-                time.sleep(0.3)  # let the middle process exit first
+                # cmuxOnly is a PID-ancestry walk, so ping must not run
+                # until launchd has adopted this process: a fixed sleep
+                # raced the middle process's exit on a loaded machine and
+                # could hand back a false "ok".
+                deadline = time.monotonic() + 2.0
+                while os.getppid() != 1 and time.monotonic() < deadline:
+                    time.sleep(0.02)
                 try:
                     r = subprocess.run(
                         [cmux, "ping"], capture_output=True, text=True,
@@ -453,20 +490,26 @@ def _launch_cmux(workspace_name, argv):
         return True, None, attempts
 
     if _is_cmux_access_denied(stderr):
-        return False, (
-            "cmux refused an outside process (socket control mode is cmuxOnly); "
-            "set cmux Settings > Automation > Socket control to password"
-        ), attempts
+        return False, CMUXONLY_REASON, attempts
 
     _, open_rc, open_stderr = _run_logged(["open", "-ga", "cmux"], env=env)
     attempts.append({"argv": ["open", "-ga", "cmux"], "rc": open_rc, "stderr": open_stderr[:200]})
 
+    # Cold start: the app was down for the first attempt, so a refusal can
+    # only show once it is up. Poll the socket's state rather than a bare
+    # up/down bool, so a cmuxOnly refusal ends the wait at once instead of
+    # masquerading as "not answering" for the full 10 s.
     deadline = time.monotonic() + 10
     became_ready = False
     while time.monotonic() < deadline:
-        if _cmux_ready(cmux):
+        state, probe_stderr = _cmux_socket_state(cmux)
+        if state == "ok":
             became_ready = True
             break
+        if state == "denied":
+            attempts.append({"argv": [cmux, "workspace", "list"], "rc": 1,
+                             "stderr": probe_stderr[:200]})
+            return False, CMUXONLY_REASON, attempts
         time.sleep(0.5)
 
     if not became_ready:
@@ -476,8 +519,26 @@ def _launch_cmux(workspace_name, argv):
     attempts.append({"argv": new_workspace[:3], "rc": rc, "stderr": stderr[:200]})
     if ok:
         return True, None, attempts
+    if _is_cmux_access_denied(stderr):
+        return False, CMUXONLY_REASON, attempts
 
     return False, f"cmux new-workspace failed (rc {rc}): {stderr[:200]}", attempts
+
+
+def _cmux_outside_access(cmux):
+    """One verdict on whether a process without cmux ancestry can reach the
+    cmux socket, as (verdict, detail): "ok", "denied", "down" (app not
+    running) or "inconclusive" (the detached probe itself failed). This
+    process's own view comes first: a doctor or setup run from Terminal.app
+    is already an outside process, so a refusal there is the answer and the
+    detached probe is only paid for when this process was let in."""
+    state, detail = _cmux_socket_state(cmux)
+    if state != "ok":
+        return state, detail
+    outcome, detail = _cmux_outside_probe(cmux)
+    if outcome in ("ok", "denied"):
+        return outcome, detail
+    return "inconclusive", f"{outcome}: {detail}"
 
 
 def _launch_in_terminal(file_stub, workspace_name, argv):
@@ -1161,14 +1222,9 @@ def cmd_setup():
 
     if cfg["terminal"] == "cmux":
         cmux = find_cmux()
-        if cmux and _cmux_ready(cmux):
-            outcome, _detail = _cmux_outside_probe(cmux)
-            if outcome == "denied":
-                print("\n!  cmux's socket refuses processes started outside cmux; resume")
-                print("   links (Slack, The Pass, menubar) will fall back to Terminal.app.")
-                print("   Fix: cmux Settings > Automation > Socket control to password")
-                print("   (automation.socketControlMode + socketPassword in")
-                print("   ~/.config/cmux/cmux.json), then cmux reload-config.")
+        if cmux and _cmux_outside_access(cmux)[0] == "denied":
+            print(f"\n!  cmux's {CMUXONLY_SYMPTOM}.")
+            print(f"   Fix: {CMUXONLY_REMEDY}.")
 
     if input("test launch now? [y/N]: ").strip().lower() in ("y", "yes"):
         print('  opening... look for "qt: terminal launch works. You can close this."')
@@ -1586,23 +1642,20 @@ def cmd_doctor():
         if not cmux:
             report("warn", "terminal (cmux)", "binary not found",
                     "install cmux, or qt setup to pick a different terminal")
-        elif _cmux_ready(cmux):
-            outcome, detail = _cmux_outside_probe(cmux)
-            if outcome == "ok":
-                report("ok", "terminal (cmux)", f"{cmux}, socket responding; outside-cmux probe ok")
-            elif outcome == "denied":
-                report("warn", "terminal (cmux)",
-                        "socket refuses processes started outside cmux; resume links "
-                        "(Slack, The Pass, menubar) will fall back to Terminal.app",
-                        "set cmux Settings > Automation > Socket control to password "
-                        "(automation.socketControlMode + socketPassword in "
-                        "~/.config/cmux/cmux.json), then cmux reload-config")
-            else:
-                report("ok", "terminal (cmux)",
-                        f"{cmux}, socket responding; outside-cmux probe {outcome} ({detail[:80]})")
         else:
-            report("ok", "terminal (cmux)",
-                    f"{cmux}, app not running now (resume auto-starts it)")
+            verdict, detail = _cmux_outside_access(cmux)
+            if verdict == "ok":
+                report("ok", "terminal (cmux)", f"{cmux}, socket responding; outside-cmux probe ok")
+            elif verdict == "denied":
+                report("warn", "terminal (cmux)", CMUXONLY_SYMPTOM, CMUXONLY_REMEDY)
+            elif verdict == "down":
+                report("ok", "terminal (cmux)",
+                        f"{cmux}, app not running now (resume auto-starts it)")
+            else:
+                report("warn", "terminal (cmux)",
+                        f"{cmux}, socket responding; outside-cmux probe inconclusive ({detail[:80]})",
+                        "run qt doctor again; if a resume click still lands in Terminal.app, "
+                        "qt resume-log names the reason")
     elif term in ("Ghostty", "iTerm"):
         app_path = f"/Applications/{term}.app"
         if os.path.isdir(app_path):
