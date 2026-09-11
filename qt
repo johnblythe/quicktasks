@@ -1118,6 +1118,11 @@ def cmd_resume_log(n=10):
         except ValueError:
             print(ln)
             continue
+        if rec.get("outcome") == "no-task":
+            print(f"{rec.get('ts', '?')}  no-task fragment={rec.get('fragment', '?')}")
+            if rec.get("candidates"):
+                print(f"    candidates tried: {', '.join(rec['candidates'])}")
+            continue
         print(f"{rec.get('ts', '?')}  {rec.get('outcome', '?'):<18} "
               f"requested={rec.get('requested_terminal', '?')} branch={rec.get('branch', '?')} "
               f"rc={rec.get('rc')} elapsed={rec.get('elapsed')}s")
@@ -1795,19 +1800,85 @@ def latest_blocked():
     sys.exit("no blocked tasks")
 
 
-def match_id(fragment):
-    """Allow qt log/resume with a unique id fragment. An exact id always
-    wins, so a task's own published link resolves even when another id
-    contains it as a substring."""
-    names = [f[:-5] for f in os.listdir(TASKS_DIR) if f.endswith(".json")]
+_HUB_SLUG_TS_RE = re.compile(r"-\d{8}-\d{6}$")
+
+
+def _hub_slug_candidates(fragment):
+    """Derive candidate original task ids from a hub job slug. The Pass
+    names a qt-originated run's job directory
+    qt-<task id>-<YYYYMMDD>-<HHMMSS> (e.g.
+    qt-260909-165637-do-a-deep-20260909-210126), while qt's own task
+    record is 260909-165637-do-a-deep -- so a leading "qt-" and/or a
+    trailing "-YYYYMMDD-HHMMSS" get stripped, in every combination that
+    applies, most specific (both stripped) first. Never includes
+    `fragment` itself; a plain id with neither yields nothing."""
+    has_prefix = fragment.startswith("qt-")
+    ts_match = _HUB_SLUG_TS_RE.search(fragment)
+
+    candidates = []
+    if has_prefix and ts_match:
+        candidates.append(fragment[len("qt-"):ts_match.start()])
+    if has_prefix:
+        candidates.append(fragment[len("qt-"):])
+    if ts_match:
+        candidates.append(fragment[:ts_match.start()])
+
+    seen = set()
+    result = []
+    for c in candidates:
+        if c and c != fragment and c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
+def _exact_or_unique_substring(fragment, names):
+    """An exact id always wins, so a task's own published link resolves
+    even when another id contains it as a substring. Returns the resolved
+    id, or None if `fragment` matched nothing in `names` (letting a caller
+    try another candidate). Ambiguity still exits immediately, unchanged
+    from match_id's original behavior."""
     if fragment in names:
         return fragment
     hits = [n for n in names if fragment in n]
     if len(hits) == 1:
         return hits[0]
     if not hits:
-        sys.exit(f"no task matching '{fragment}'")
+        return None
     sys.exit(f"ambiguous: {', '.join(sorted(hits))}")
+
+
+def _resolve_id_or_none(fragment):
+    """Like match_id, but returns None instead of exiting when nothing
+    matches at all -- letting a caller (namely _resume-launch) handle
+    "not found" itself instead of getting a raised SystemExit. Ambiguity
+    still exits immediately and unchanged: it is a different, specific
+    failure from "no match anywhere", not one a caller should paper over.
+    An exact id always wins, so a task's own published link resolves even
+    when another id contains it as a substring. When the raw fragment
+    matches nothing, a hub job slug (qt-<task id>-<timestamp>) is retried
+    via its derived candidates -- see _hub_slug_candidates -- so a
+    `quicktask://resume/` link built from a hub job dir name still
+    resolves to the original task."""
+    names = [f[:-5] for f in os.listdir(TASKS_DIR) if f.endswith(".json")]
+    result = _exact_or_unique_substring(fragment, names)
+    if result is not None:
+        return result
+    for candidate in _hub_slug_candidates(fragment):
+        result = _exact_or_unique_substring(candidate, names)
+        if result is not None:
+            return result
+    return None
+
+
+def match_id(fragment):
+    """Allow qt log/resume with a unique id fragment. See
+    _resolve_id_or_none for the resolution rules; this just exits when it
+    comes back empty."""
+    tid = _resolve_id_or_none(fragment)
+    if tid is None:
+        sys.exit(f"no task matching '{fragment}'")
+    return tid
 
 
 HELP = """\
@@ -1883,7 +1954,27 @@ def main():
         run_task(args[1])
     elif cmd == "_resume-launch":
         bootstrap()
-        launch_resume_terminal(match_id(args[1]) if len(args) > 1 else latest_blocked())
+        if len(args) > 1:
+            fragment = args[1]
+            tid = _resolve_id_or_none(fragment)
+            if tid is None:
+                # Nothing matched, including every hub-slug candidate: the
+                # link sent an id that doesn't exist rather than hitting a
+                # real launch failure, so record it and tell the user
+                # instead of exiting silently under a missed notification.
+                candidates = _hub_slug_candidates(fragment)
+                _log_launch({
+                    "ts": now(),
+                    "outcome": "no-task",
+                    "fragment": fragment,
+                    "candidates": candidates,
+                })
+                msg = f"no quicktask matching {fragment} · qt resume-log"
+                notify("Quicktask resume", "no match", msg)
+                sys.exit(msg)
+            launch_resume_terminal(tid)
+        else:
+            launch_resume_terminal(latest_blocked())
     elif cmd == "_test-echo":
         cmd_test_echo()
     elif cmd in ("log", "resume", "untrust"):
