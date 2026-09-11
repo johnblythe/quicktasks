@@ -115,6 +115,8 @@ Note: your global allowlist is inherited by headless runs, and sandbox-safe read
 
 Model resolution per task: `-m` flag > `QT_MODEL` env > config `"model"` > your CLI default. Leaving `model` unset (the default if you skip that step in `qt setup`) always falls through to whatever the `claude` CLI itself defaults to; setup never writes a model choice you didn't make.
 
+`qt setup --defaults [--hub <dir>]` skips every prompt, for scripted installs (e.g. the hub's one-command installer): `permissions` → `acceptEdits`, `model` → `sonnet[1m]`, `terminal` → the same auto-detected choice plain `qt setup` offers as its default. `--hub <dir>` turns the hub feed on for that dir exactly like `qt hub <dir>` (`dir` must contain `serve.py`) and leaves `slack_owner_id` unset, since a configured hub's own `guard.py` governs Slack policy instead; omit `--hub` and the hub feed stays off. Idempotent and scoped: reruns only touch the keys above, so `trusted_dirs`, `notifier`, `trusted_permissions`, and any existing `slack_owner_id` are left exactly as they were.
+
 Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (seconds, default 1800), `QT_MODEL`, `QT_PERMISSIONS`, `QT_HUB` (see below).
 
 ### Hub mode

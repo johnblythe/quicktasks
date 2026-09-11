@@ -1429,7 +1429,61 @@ def cmd_hub(arg=None):
     print(f"hub feed on: {p}\nfinished tasks now land in its Verify queue")
 
 
-def cmd_setup():
+def cmd_setup_defaults(hub_arg):
+    """Non-interactive `qt setup --defaults [--hub <dir>]`: no stdin
+    prompts, for callers like the hub's one-command installer. Writes
+    permissions/model/terminal to their documented defaults and, when
+    --hub is given, turns the hub feed on for that dir (same effect on
+    config as `qt hub <dir>`) and leaves slack_owner_id unset since the
+    hub's own guard.py governs Slack policy once a hub is configured.
+
+    Idempotent and scoped: only the keys this writes (terminal,
+    permissions, model, and hub_dir when --hub is given) are touched.
+    trusted_dirs, notifier, trusted_permissions, and slack_owner_id are
+    left exactly as they already are in an existing config.json."""
+    hub_path = None
+    if hub_arg is not None:
+        hub_path = os.path.realpath(os.path.expanduser(hub_arg))
+        if not os.path.isdir(hub_path):
+            sys.exit(f"not a directory: {hub_path}")
+        if not os.path.isfile(os.path.join(hub_path, "serve.py")):
+            sys.exit(f"not a hub dir (no serve.py): {hub_path}")
+
+    bootstrap()
+    cfg = load_config()
+
+    cfg["terminal"] = detect_terminals()[0]
+    print(f"terminal: {cfg['terminal']}")
+
+    cfg["permissions"] = "acceptEdits"
+    print("permissions: acceptEdits")
+
+    cfg["model"] = "sonnet[1m]"
+    print("model: sonnet[1m]")
+
+    if hub_path:
+        cfg["hub_dir"] = hub_path
+        print(f"hub_dir: {hub_path}")
+        print("slack_owner_id: unset (hub policy applies through its guard.py)")
+    else:
+        print("hub_dir: off (pass --hub <dir> to turn the hub feed on)")
+
+    save_config(cfg)
+    print(f"saved → {CONFIG_PATH}")
+
+
+def cmd_setup(argv=None):
+    argv = argv or []
+    if "--defaults" in argv:
+        hub_arg = None
+        if "--hub" in argv:
+            i = argv.index("--hub")
+            if i + 1 >= len(argv):
+                sys.exit("--hub needs a directory")
+            hub_arg = argv[i + 1]
+        cmd_setup_defaults(hub_arg)
+        return
+
     bootstrap()
     cfg = load_config()
     candidates = detect_terminals()
@@ -2209,7 +2263,7 @@ def main():
         bootstrap()
         cmd_resume(match_id(args[1]))
     elif cmd == "setup":
-        cmd_setup()
+        cmd_setup(args[1:])
     elif cmd == "doctor":
         cmd_doctor()
     elif cmd == "install-handler":
