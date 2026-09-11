@@ -105,13 +105,16 @@ def resolve_owner_slack_id():
     return owner.strip() if isinstance(owner, str) and owner.strip() else None
 
 
-# Every mcp__ld-tools__ld_slack_* tool, gated by whichever guard
-# resolve_slack_guard_cmd() picks. Broad on purpose: a quick-fire keeps its
-# normal tool freedom (no --allowedTools change), so the PreToolUse hook is
-# the only deterministic gate against a repeat of LD-224's incident, where
-# a quick-fire posted to a public channel with no Slack-destination check
-# at all.
-SLACK_GUARD_MATCHER = "mcp__ld-tools__ld_slack_.*"
+# Every mcp__ld-tools__ld_slack_* tool, plus any other MCP server whose
+# name contains "slack" (mcp__claude_ai_Slack__*, mcp__plugin_slack_slack__*,
+# etc.), gated by whichever guard resolve_slack_guard_cmd() picks. Broad on
+# purpose: a quick-fire keeps its normal tool freedom (no --allowedTools
+# change), so the PreToolUse hook is the only deterministic gate against a
+# repeat of LD-224's incident, where a quick-fire posted to a public channel
+# with no Slack-destination check at all -- and against a follow-up gap
+# where a denied ld_slack_send just routed around the hook through a
+# different Slack-flavored MCP tool the user happened to have configured.
+SLACK_GUARD_MATCHER = "mcp__.*[Ss]lack.*"
 
 # LD-224 follow-up: a fresh install has no personal permission allow rule
 # for mcp__ld-tools__* (those come from John's own settings, not from qt),

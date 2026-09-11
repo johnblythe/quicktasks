@@ -28,6 +28,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -178,6 +179,29 @@ class QtGuardScriptTests(unittest.TestCase):
         proc = self._ask("Bash", {"command": "ls"}, config={"slack_owner_id": "U123"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_non_ld_tools_slack_connector_denied_by_default(self):
+        # LD-224 follow-up: a denied ld_slack_send must not be routeable
+        # around this hook through some other Slack-flavored MCP server.
+        proc = self._ask("mcp__claude_ai_Slack__slack_send_message",
+                          {"channel": "C0PUBLIC"}, config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("Slack connectors other than ld-tools are off", proc.stderr)
+        self.assertIn("mcp__ld-tools__ld_slack_send", proc.stderr)
+
+    def test_non_ld_tools_slack_connector_denied_with_no_config_at_all(self):
+        proc = self._ask("mcp__plugin_slack_slack__slack_send_message", {"channel": "C0PUBLIC"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("Slack connectors other than ld-tools are off", proc.stderr)
+
+    def test_non_ld_tools_slack_connector_allowed_with_public_opt_in(self):
+        proc = self._ask("mcp__claude_ai_Slack__slack_send_message", {"channel": "C0PUBLIC"},
+                          config={"slack_owner_id": "U123", "slack_allow_public_channels": True})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_non_slack_mcp_tool_passes_through(self):
+        proc = self._ask("mcp__fff__grep", {"query": "foo"}, config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_malformed_stdin_is_denied(self):
         env = dict(os.environ)
         env["QT_DATA"] = str(self.qt_data)
@@ -235,6 +259,12 @@ class ResolveSlackGuardCmdUnitTests(unittest.TestCase):
         path, source = self.mod.resolve_slack_guard_cmd()
         self.assertEqual(source, "qt")
 
+    def test_matcher_covers_other_slack_connectors_not_unrelated_tools(self):
+        matcher = self.mod.SLACK_GUARD_MATCHER
+        self.assertIsNotNone(re.match(matcher, "mcp__claude_ai_Slack__slack_send_message"))
+        self.assertIsNotNone(re.match(matcher, "mcp__ld-tools__ld_slack_send"))
+        self.assertIsNone(re.match(matcher, "mcp__fff__grep"))
+
     def test_render_settings_shape_and_matcher(self):
         self.mod.__file__ = str(QT_SCRIPT)
         path = self.mod.render_slack_guard_settings("tid-abc")
@@ -244,7 +274,7 @@ class ResolveSlackGuardCmdUnitTests(unittest.TestCase):
         hooks = data["hooks"]["PreToolUse"]
         self.assertEqual(len(hooks), 1)
         self.assertEqual(hooks[0]["matcher"], self.mod.SLACK_GUARD_MATCHER)
-        self.assertEqual(hooks[0]["matcher"], "mcp__ld-tools__ld_slack_.*")
+        self.assertEqual(hooks[0]["matcher"], "mcp__.*[Ss]lack.*")
         command = hooks[0]["hooks"][0]["command"]
         self.assertEqual(hooks[0]["hooks"][0]["type"], "command")
         self.assertIn("qt-guard.py", command)
@@ -409,7 +439,7 @@ class RunTaskSettingsEndToEndTests(unittest.TestCase):
         self.assertIsNotNone(captured["settings_content"], "settings file was gone by the time claude ran")
         settings = json.loads(captured["settings_content"])
         hook = settings["hooks"]["PreToolUse"][0]
-        self.assertEqual(hook["matcher"], "mcp__ld-tools__ld_slack_.*")
+        self.assertEqual(hook["matcher"], "mcp__.*[Ss]lack.*")
         self.assertIn("qt-guard.py", hook["hooks"][0]["command"])
 
         # run_task() removes the file in its `finally` right after the

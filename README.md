@@ -123,7 +123,7 @@ Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (secon
 
 ### Slack safety
 
-Every headless `claude -p` a quick-fire launches carries a `--settings` file wiring a PreToolUse hook on every `mcp__ld-tools__ld_slack_*` tool call -- not a tool allowlist, so a quick-fire keeps its normal freedom, but a deterministic gate on where it can post. This closed an incident where a quick-fire posted to a public channel with no Slack-destination check at all.
+Every headless `claude -p` a quick-fire launches carries a `--settings` file wiring a PreToolUse hook on every `mcp__ld-tools__ld_slack_*` tool call, and every other MCP tool whose name contains "slack" (`mcp__claude_ai_Slack__*`, `mcp__plugin_slack_slack__*`, etc.) -- not a tool allowlist, so a quick-fire keeps its normal freedom, but a deterministic gate on where it can post. This closed an incident where a quick-fire posted to a public channel with no Slack-destination check at all; quick-fires' Slack path is ld-tools only, so any non-ld-tools Slack connector is denied outright unless `slack_allow_public_channels` is set, the same opt-in the ld-tools path itself uses when it can't tell where a write is headed.
 
 - **Hub feed configured** (`qt hub <dir>`, and that checkout has a `guard.py`): quick-fires reuse the hub's own `guard.py` and `pass-config.json` policy, the same one hub-fired jobs already obey. Nothing to configure in qt itself.
 - **No hub feed**: quick-fires run under qt's own `qt-guard.py`, reading two `config.json` keys `qt setup` writes:

@@ -9,6 +9,17 @@ one used when qt isn't pointed at a hub checkout (qt hub <dir>). When a
 hub *is* configured, qt uses the hub's own guard.py + pass-config.json
 instead, so hub-fired jobs and hub-fed quick-fires obey one policy.
 
+Follow-up gap: a headless run inherits the user's other configured MCP
+servers, so a Slack send denied on mcp__ld-tools__ld_slack_send could
+just route around this guard through a different Slack-flavored MCP
+tool (e.g. mcp__claude_ai_Slack__slack_send_message,
+mcp__plugin_slack_slack__slack_send_message). qt's PreToolUse matcher
+(SLACK_GUARD_MATCHER in `qt`) is now broad enough to send every one of
+those here too; this hook denies any non-ld-tools MCP tool whose name
+contains "slack" unless slack_allow_public_channels is set, since only
+the ld-tools path understands enough about the destination to check it
+against slack_owner_id/slack_allowed_channels.
+
 Policy, read from QT_DATA/config.json (default ~/.quicktasks/config.json,
 the same file `qt setup`/`qt doctor` use):
 - slack_owner_id: the owner's Slack member id (starts with U). With no
@@ -131,6 +142,17 @@ def main():
         return
 
     if not tool_name.startswith(SLACK_PREFIX):
+        if tool_name.startswith("mcp__") and "slack" in tool_name.lower():
+            # Some other MCP server's Slack connector -- this hook has no
+            # way to check its destination the way check_write() does for
+            # ld-tools, so it's denied outright unless the config has
+            # opted into public posting.
+            if bool(load_config().get("slack_allow_public_channels", False)):
+                allow()
+                return
+            deny(f"qt-guard: {tool_name}: Slack connectors other than ld-tools are off; "
+                 "use mcp__ld-tools__ld_slack_send (slack_allow_public_channels=false)")
+            return
         # The PreToolUse matcher only ever sends Slack tools here, but stay
         # honest about scope if something else ever reaches this hook.
         allow()
