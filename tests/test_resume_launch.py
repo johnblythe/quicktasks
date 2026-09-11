@@ -682,5 +682,174 @@ class SetupDefaultModelTests(unittest.TestCase):
         self.assertIn("model=sonnet[1m]", proc.stdout)
 
 
+class HubSlugCandidatesTests(unittest.TestCase):
+    """Pure-function checks of _hub_slug_candidates: no tasks dir, no
+    subprocess, just the string surgery that turns a hub job slug back
+    into the ids qt might actually recognize."""
+
+    def setUp(self):
+        self._old_environ = dict(os.environ)
+        self.addCleanup(self._restore_environ)
+        os.environ["QT_DATA"] = str(TMP_ROOT / "unused-hub-slug-candidates-qtdata")
+        self.qt = _load_qt_module()
+
+    def _restore_environ(self):
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    def test_plain_id_yields_nothing_new(self):
+        self.assertEqual(
+            self.qt._hub_slug_candidates("260909-165637-do-a-deep"), [])
+
+    def test_qt_prefix_alone_is_stripped(self):
+        self.assertEqual(
+            self.qt._hub_slug_candidates("qt-260909-165637-do-a-deep"),
+            ["260909-165637-do-a-deep"])
+
+    def test_trailing_timestamp_alone_is_stripped(self):
+        self.assertEqual(
+            self.qt._hub_slug_candidates(
+                "260909-165637-do-a-deep-20260909-210126"),
+            ["260909-165637-do-a-deep"])
+
+    def test_both_prefix_and_timestamp_stripped_together_comes_first(self):
+        candidates = self.qt._hub_slug_candidates(
+            "qt-260909-165637-do-a-deep-20260909-210126")
+        # the fully-stripped id (what the hub actually named the run
+        # after) is the first and most likely candidate to try.
+        self.assertEqual(candidates[0], "260909-165637-do-a-deep")
+        self.assertIn("260909-165637-do-a-deep-20260909-210126", candidates)
+        self.assertIn("qt-260909-165637-do-a-deep", candidates)
+        self.assertNotIn(
+            "qt-260909-165637-do-a-deep-20260909-210126", candidates)
+
+
+class MatchIdHubSlugTests(unittest.TestCase):
+    """match_id against a real (temp) tasks dir: a hub job slug resolves
+    to the original quicktask, an exact id still wins over a substring,
+    and an unknown fragment still exits the same way it always did."""
+
+    def setUp(self):
+        TMP_ROOT.mkdir(exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT))
+        self.addCleanup(self.tmp.cleanup)
+        self.qt_data = Path(self.tmp.name) / "qtdata"
+
+        self._old_environ = dict(os.environ)
+        self.addCleanup(self._restore_environ)
+        os.environ["QT_DATA"] = str(self.qt_data)
+
+        self.qt = _load_qt_module()
+        os.makedirs(self.qt.TASKS_DIR, exist_ok=True)
+
+    def _restore_environ(self):
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    def _make_task(self, tid):
+        (Path(self.qt.TASKS_DIR) / f"{tid}.json").write_text("{}")
+
+    def test_hub_slug_resolves_to_the_original_task(self):
+        self._make_task("260909-165637-do-a-deep")
+        resolved = self.qt.match_id(
+            "qt-260909-165637-do-a-deep-20260909-210126")
+        self.assertEqual(resolved, "260909-165637-do-a-deep")
+
+    def test_exact_id_still_wins_over_a_substring(self):
+        self._make_task("abc")
+        self._make_task("abcdef")
+        self.assertEqual(self.qt.match_id("abc"), "abc")
+
+    def test_unknown_fragment_exits_with_no_task_matching(self):
+        self._make_task("some-other-task")
+        with self.assertRaises(SystemExit) as cm:
+            self.qt.match_id("qt-nonexistent-20260909-210126")
+        self.assertIn("no task matching", str(cm.exception))
+
+
+class ResumeLaunchNoTaskTests(unittest.TestCase):
+    """`qt _resume-launch <id>` (the dispatch a quicktask:// link or a
+    blocked-task notification click drives) when the id resolves to
+    nothing at all, including every hub-slug candidate. This used to just
+    sys.exit with no resume.log record and an easily-missed notification
+    as the only signal. Driven as a real subprocess, against the same
+    fake cmux/open/osascript/terminal-notifier shims LaunchInTerminalTests
+    uses, so the exit code, the resume.log record, and the notification
+    are all exercised the way a real click would hit them -- and so a
+    passing test proves no fake `open` or `cmux` call ever happened."""
+
+    def setUp(self):
+        TMP_ROOT.mkdir(exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT))
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.qt_data = root / "qtdata"
+
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _write_exec(bin_dir / "cmux", FAKE_CMUX)
+        _write_exec(bin_dir / "open", FAKE_OPEN)
+        _write_exec(bin_dir / "osascript", FAKE_NOTIFIER_SHIM)
+        _write_exec(bin_dir / "terminal-notifier", FAKE_NOTIFIER_SHIM)
+        self.assertNotIn("/T/", str(bin_dir))
+        self.bin_dir = bin_dir
+
+        self.cmux_log = root / "cmux.log"
+        self.open_log = root / "open.log"
+        self.notify_log = root / "notify.log"
+
+        self.env = dict(os.environ)
+        self.env["QT_DATA"] = str(self.qt_data)
+        self.env["PATH"] = f"{bin_dir}:{self.env.get('PATH', '')}"
+        self.env["FAKE_CMUX_LOG"] = str(self.cmux_log)
+        self.env["FAKE_OPEN_LOG"] = str(self.open_log)
+        self.env["FAKE_NOTIFY_LOG"] = str(self.notify_log)
+        self.env.pop("QT_HUB", None)
+
+    def _run_resume_launch(self, fragment):
+        return subprocess.run(
+            [sys.executable, str(QT_SCRIPT), "_resume-launch", fragment],
+            capture_output=True, text=True, env=self.env, timeout=30,
+        )
+
+    def _log_records(self):
+        resume_log = self.qt_data / "logs" / "resume.log"
+        if not resume_log.exists():
+            return []
+        with open(resume_log) as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+
+    def _read_calls(self, log_path):
+        if not log_path.exists():
+            return []
+        with open(log_path) as f:
+            return [ast.literal_eval(ln) for ln in f if ln.strip()]
+
+    def test_unknown_id_logs_no_task_and_notifies_without_launching(self):
+        fragment = "qt-260909-165637-do-a-deep-20260909-210126"
+        proc = self._run_resume_launch(fragment)
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(fragment, proc.stderr)
+
+        records = self._log_records()
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["outcome"], "no-task")
+        self.assertEqual(rec["fragment"], fragment)
+        self.assertIn("260909-165637-do-a-deep", rec["candidates"])
+
+        notify_calls = self._read_calls(self.notify_log)
+        self.assertEqual(len(notify_calls), 1)
+        body = notify_calls[0][1]
+        self.assertIn(fragment, body)
+        self.assertIn("qt resume-log", body)
+
+        # no attempt to actually launch anything: no cmux call, no open
+        # call (only the notifier's fake osascript ran).
+        self.assertFalse(self.cmux_log.exists())
+        self.assertFalse(self.open_log.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
