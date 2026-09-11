@@ -273,6 +273,92 @@ class ResolveSlackGuardCmdUnitTests(unittest.TestCase):
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         self.assertEqual(os.path.dirname(path), self.mod.TMP_DIR)
 
+    def test_render_settings_includes_permission_allow_list(self):
+        """A fresh install has no personal allow rule for mcp__ld-tools__*,
+        so render_slack_guard_settings() must carry its own permissions.
+        allow list (QT_TOOLS_ALLOW) alongside the guard hook -- otherwise
+        the very first quick-fire that touches an ld-tools MCP call is
+        denied outright, which is exactly this incident."""
+        self.mod.__file__ = str(QT_SCRIPT)
+        path = self.mod.render_slack_guard_settings("tid-allow")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        data = json.loads(Path(path).read_text())
+        allow = data["permissions"]["allow"]
+        self.assertEqual(allow, self.mod.QT_TOOLS_ALLOW)
+        for name in (
+            "Read",
+            "mcp__ld-tools__ld_research",
+            "mcp__ld-tools__ld_slack_search",
+            "mcp__ld-tools__ld_slack_send",
+            "mcp__ld-tools__ld_slack_user_by_email",
+        ):
+            self.assertIn(name, allow)
+        # The hook is still doing the Slack-destination gating; the allow
+        # list only fills the fresh-install permission gap.
+        self.assertIn("hooks", data)
+
+
+class TaskPromptOwnerIdTests(unittest.TestCase):
+    """task_prompt()'s owner-id note (see resolve_owner_slack_id()): once
+    the prompt names the owner's Slack id directly, a "slack me" quick-
+    fire should never need to call mcp__ld-tools__ld_slack_user_by_email
+    to find out who to message -- the exact lookup this incident's run
+    was denied on."""
+
+    def setUp(self):
+        self.mod = _load_qt_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.mod.QT_DATA = str(root / "qtdata")
+        self.mod.CONFIG_PATH = str(root / "qtdata" / "config.json")
+        self.mod.HUB_DIR_ENV = None
+
+    def _task(self, prompt="do the thing"):
+        return {
+            "id": "tid-prompt",
+            "prompt": prompt,
+            "invoked_from": str(Path(self.tmp.name)),
+        }
+
+    def _write_qt_config(self, config):
+        os.makedirs(os.path.dirname(self.mod.CONFIG_PATH), exist_ok=True)
+        with open(self.mod.CONFIG_PATH, "w") as f:
+            json.dump(config, f)
+
+    def test_standalone_config_owner_id_is_named_in_prompt(self):
+        self._write_qt_config({"slack_owner_id": "U123STANDALONE"})
+        prompt = self.mod.task_prompt(self._task())
+        self.assertIn("U123STANDALONE", prompt)
+        self.assertIn("mcp__ld-tools__ld_slack_send", prompt)
+        self.assertNotIn("unavailable", prompt)
+
+    def test_hub_config_owner_id_is_named_in_prompt(self):
+        hub_dir = Path(self.tmp.name) / "hub"
+        hub_dir.mkdir()
+        (hub_dir / "pass-config.json").write_text(json.dumps({"owner_slack_id": "U999HUB"}))
+        self.mod.HUB_DIR_ENV = str(hub_dir)
+        prompt = self.mod.task_prompt(self._task())
+        self.assertIn("U999HUB", prompt)
+        self.assertNotIn("unavailable", prompt)
+
+    def test_hub_config_without_owner_id_does_not_fall_back_to_qt_config(self):
+        # Hub configured but pass-config.json has no owner_slack_id: this
+        # must report unavailable, not silently read qt's own config.json.
+        self._write_qt_config({"slack_owner_id": "U123STANDALONE"})
+        hub_dir = Path(self.tmp.name) / "hub"
+        hub_dir.mkdir()
+        (hub_dir / "pass-config.json").write_text(json.dumps({}))
+        self.mod.HUB_DIR_ENV = str(hub_dir)
+        prompt = self.mod.task_prompt(self._task())
+        self.assertNotIn("U123STANDALONE", prompt)
+        self.assertIn("unavailable", prompt)
+
+    def test_no_owner_id_configured_anywhere_reports_unavailable(self):
+        prompt = self.mod.task_prompt(self._task())
+        self.assertIn("unavailable", prompt)
+        self.assertNotIn("mcp__ld-tools__ld_slack_send", prompt)
+
 
 class RunTaskSettingsEndToEndTests(unittest.TestCase):
     """Drives `qt -w <prompt>` as a real subprocess and inspects the exact

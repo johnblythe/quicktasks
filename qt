@@ -83,6 +83,28 @@ def resolve_hub_dir():
     return os.path.realpath(os.path.expanduser(d)) if d else None
 
 
+def resolve_owner_slack_id():
+    """Read-only config lookup: which Slack member id (a "U..." string)
+    belongs to this qt install's owner, so task_prompt() can mention it
+    by id instead of leaving the model to look it up at run time.
+
+    Hub configured: the "owner_slack_id" field of <hub_dir>/pass-
+    config.json (same field doctor's "Slack guard" line already reads).
+    Otherwise: the "slack_owner_id" field of qt's own config.json (same
+    key qt-guard.py already enforces). Returns None when neither file
+    has that field set."""
+    hub_dir = resolve_hub_dir()
+    if hub_dir:
+        try:
+            with open(os.path.join(hub_dir, "pass-config.json")) as f:
+                owner = json.load(f).get("owner_slack_id")
+        except (OSError, json.JSONDecodeError):
+            owner = None
+    else:
+        owner = load_config().get("slack_owner_id")
+    return owner.strip() if isinstance(owner, str) and owner.strip() else None
+
+
 # Every mcp__ld-tools__ld_slack_* tool, gated by whichever guard
 # resolve_slack_guard_cmd() picks. Broad on purpose: a quick-fire keeps its
 # normal tool freedom (no --allowedTools change), so the PreToolUse hook is
@@ -90,6 +112,61 @@ def resolve_hub_dir():
 # a quick-fire posted to a public channel with no Slack-destination check
 # at all.
 SLACK_GUARD_MATCHER = "mcp__ld-tools__ld_slack_.*"
+
+# LD-224 follow-up: a fresh install has no personal permission allow rule
+# for mcp__ld-tools__* (those come from John's own settings, not from qt),
+# so a brand-new user's first quick-fire that touches any ld-tools MCP call
+# is auto-denied under --permission-mode acceptEdits in headless mode --
+# exactly what happened here: a first-run "slack me a haiku" quick-fire was
+# blocked on mcp__ld-tools__ld_slack_user_by_email. This is the same
+# read-only allowlist the hub grants its own jobs (see TOOLS in
+# hub/runner.py), copied by hand since qt ships and runs standalone and
+# can't import the hub's module, plus mcp__ld-tools__ld_slack_send (so a
+# quick-fire can actually DM someone) and ld_slack_user_by_email (the exact
+# tool this incident's run was denied on; qt-guard.py's own READ_TOOLS set
+# already treats it as a safe read, so allowing it here just matches that).
+# This is a `permissions.allow` list, not --allowedTools -- it only adds
+# tools a fresh install was missing, it never narrows what acceptEdits
+# already permits.
+QT_TOOLS_ALLOW = [
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "WebSearch",
+    "WebFetch",
+    "mcp__fff__grep",
+    "mcp__fff__find_files",
+    "mcp__fff__multi_grep",
+    "mcp__ld-tools__ld_research",
+    "mcp__ld-tools__ld_slack_search",
+    "mcp__ld-tools__ld_slack_history",
+    "mcp__ld-tools__ld_slack_thread",
+    "mcp__ld-tools__ld_slack_channel_info",
+    "mcp__ld-tools__ld_slack_user_by_email",
+    "mcp__ld-tools__ld_jira_search",
+    "mcp__ld-tools__ld_jira_issue",
+    "mcp__ld-tools__ld_confluence_search",
+    "mcp__ld-tools__ld_confluence_page",
+    "mcp__ld-tools__ld_github_search",
+    "mcp__ld-tools__ld_github_prs_list",
+    "mcp__ld-tools__ld_github_pr_get",
+    "mcp__ld-tools__ld_github_pr_context",
+    "mcp__ld-tools__ld_github_commits_list",
+    "mcp__ld-tools__ld_github_issues_list",
+    "mcp__ld-tools__ld_github_issue_get",
+    "mcp__ld-tools__ld_gdrive_search",
+    "mcp__ld-tools__ld_gdrive_content",
+    # Gmail: read-only only, matching hub/runner.py's TOOLS -- writes and
+    # attachment_download stay out of the allow list.
+    "mcp__ld-tools__ld_gmail_search",
+    "mcp__ld-tools__ld_gmail_get",
+    "mcp__ld-tools__ld_gmail_thread",
+    "mcp__ld-tools__ld_gmail_threads",
+    "mcp__ld-tools__ld_gmail_labels",
+    "mcp__ld-tools__ld_slack_send",
+]
 
 
 def resolve_slack_guard_cmd():
@@ -121,16 +198,21 @@ def resolve_slack_guard_cmd():
 def render_slack_guard_settings(tid):
     """Write a one-off Claude Code --settings file wiring the chosen Slack
     guard (see resolve_slack_guard_cmd()) as a PreToolUse hook on
-    SLACK_GUARD_MATCHER. Lives under QT_DATA/tmp named by this run's task
-    id, which is already unique per run, so two concurrent quick-fires
-    never race on the same path -- same convention _seed_hub_item() uses
-    for its own per-item fragment file. Returns None (skip --settings)
-    when no guard script exists at all; the caller is responsible for
-    removing the file once the run finishes."""
+    SLACK_GUARD_MATCHER, plus a `permissions.allow` list (QT_TOOLS_ALLOW)
+    so a fresh install's quick-fires can reach the hub's read-only
+    ld-tools/fff tools and Slack-send without a permission prompt -- the
+    guard hook above is still what decides where a Slack message may go.
+    Lives under QT_DATA/tmp named by this run's task id, which is already
+    unique per run, so two concurrent quick-fires never race on the same
+    path -- same convention _seed_hub_item() uses for its own per-item
+    fragment file. Returns None (skip --settings) when no guard script
+    exists at all; the caller is responsible for removing the file once
+    the run finishes."""
     guard_path, _source = resolve_slack_guard_cmd()
     if not guard_path:
         return None
     settings = {
+        "permissions": {"allow": QT_TOOLS_ALLOW},
         "hooks": {
             "PreToolUse": [
                 {
@@ -844,10 +926,27 @@ def queue(prompt, wait=False, in_dir=None, model=None):
 
 def task_prompt(task):
     """Compose the prompt for the claude run: the task text, the fired-from
-    context, and a per-task Slack resume footer (the id only exists per
-    task, so the prompt carries it rather than the workspace CLAUDE.md)."""
+    context, a note on where a "DM the owner" instruction should land (see
+    resolve_owner_slack_id()), and a per-task Slack resume footer (the id
+    only exists per task, so the prompt carries it rather than the
+    workspace CLAUDE.md)."""
     tid = task["id"]
-    return task["prompt"] + (
+    owner_id = resolve_owner_slack_id()
+    if owner_id:
+        owner_note = (
+            "\n\n(If the task says to Slack, DM, or message the owner or "
+            f'"me", send exactly one DM to Slack user id {owner_id} with '
+            "mcp__ld-tools__ld_slack_send. Use that id directly; don't look "
+            "up the owner and don't post to a channel.)"
+        )
+    else:
+        owner_note = (
+            "\n\n(No owner Slack id is configured for this install, so "
+            "Slack delivery is unavailable. If the task says to Slack, DM, "
+            "or message the owner or \"me\", write the result to the task "
+            "output instead of trying to send it.)"
+        )
+    return task["prompt"] + owner_note + (
         f"\n\n(Context: task fired from directory {task['invoked_from']}. "
         "Only relevant if the task references the current directory or repo.)"
         f"\n\n(Your quicktask id is {tid}. If you post any Slack message as part "

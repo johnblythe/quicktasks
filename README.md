@@ -135,6 +135,12 @@ Every headless `claude -p` a quick-fire launches carries a `--settings` file wir
 
 `qt doctor` prints one "Slack guard" line: which guard is active (`hub` or `qt-guard.py`), the owner id in effect (or `DENY-ALL` when none is configured), and whether public-channel posting is on.
 
+The same `--settings` file also carries a `permissions.allow` list of the hub's own read-only `ld-tools`/`fff` tools plus Slack send: a fresh install has no personal allowlist for `mcp__ld-tools__*`, so under headless `acceptEdits` the very first quick-fire that touches one of those MCP tools was denied outright, with no guard involved at all. This list only closes that fresh-install gap; it never narrows `--permission-mode` and it's not an `--allowedTools` change, so a quick-fire otherwise keeps its normal tool freedom -- the guard hook above still decides where a Slack message can go. Separately, the prompt every quick-fire runs under now names the owner's Slack id directly (hub configured: `owner_slack_id` from the hub's `pass-config.json`; otherwise `slack_owner_id` from qt's own config) so "slack me" or "DM the owner" sends straight to that id instead of the model looking the owner up by email first. With no owner id configured anywhere, the prompt says Slack delivery is unavailable and to write the result to the task output instead.
+
+### Testing against another Pass
+
+Three env vars, all optional, let you point a qt install at a different Pass checkout for testing without touching your real one: `QT_HUB=<hub dir>` selects which Pass `qt` itself feeds and reads Slack policy from; `QT_PASS_URL=<url>` is the same override the menu-bar widget reads for its own feed; `QT_DATA=<dir>` relocates `qt`'s entire data dir (tasks, logs, config) away from `~/.quicktasks`. Set all three together to run a fully isolated qt + Pass pair alongside your real one.
+
 ## Troubleshooting
 
 Start with `qt doctor`. It's read-only and checks the whole chain: claude CLI, data dir, config, terminal readiness, notifier, PATH, trusted dirs, and (see below) the resume handler.
