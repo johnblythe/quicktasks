@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -29,10 +30,15 @@ TMP_ROOT = REPO_ROOT / "tmp"
 
 DASHES = "-" * 80
 
-# Stands in for the real cmux CLI. Two subcommands matter: `new-workspace`
-# (the actual launch attempt) and `workspace list` (the readiness probe
-# _cmux_ready polls after nudging cmux open). Each is independently
-# controllable so a test can make the probe answer instantly -- skipping
+# The exact wording cmux's real CLI uses when its socket control mode
+# (default "cmuxOnly") refuses a process with no cmux ancestry.
+ACCESS_DENIED_STDERR = "Error: ERROR: Access denied - only processes started inside cmux can connect"
+
+# Stands in for the real cmux CLI. Three subcommands matter: `new-workspace`
+# (the actual launch attempt), `workspace list` (the readiness probe
+# _cmux_ready polls after nudging cmux open), and `ping` (the outside-cmux
+# probe). Each is independently controllable so a test can make the probe
+# answer instantly -- skipping
 # the real 10s wait _launch_cmux would otherwise sit through -- while the
 # launch itself still fails.
 FAKE_CMUX = """\
@@ -46,7 +52,11 @@ if len(sys.argv) > 1 and sys.argv[1] == "new-workspace":
     sys.stderr.write(os.environ.get("FAKE_CMUX_NEW_WORKSPACE_STDERR", ""))
     sys.exit(int(os.environ.get("FAKE_CMUX_NEW_WORKSPACE_RC", "0")))
 if len(sys.argv) > 2 and sys.argv[1] == "workspace" and sys.argv[2] == "list":
+    sys.stderr.write(os.environ.get("FAKE_CMUX_READY_STDERR", ""))
     sys.exit(int(os.environ.get("FAKE_CMUX_READY_RC", "0")))
+if len(sys.argv) > 1 and sys.argv[1] == "ping":
+    sys.stderr.write(os.environ.get("FAKE_CMUX_PING_STDERR", ""))
+    sys.exit(int(os.environ.get("FAKE_CMUX_PING_RC", "0")))
 sys.exit(0)
 """
 
@@ -244,6 +254,139 @@ class LaunchInTerminalTests(unittest.TestCase):
         self.assertEqual(len(open_calls), 1)
         self.assertEqual(open_calls[0][:2], ["-a", "Terminal"])
 
+    def test_access_denied_returns_immediately_without_nudge_or_poll(self):
+        self._set_terminal("cmux")
+        os.environ["FAKE_CMUX_NEW_WORKSPACE_RC"] = "1"
+        os.environ["FAKE_CMUX_NEW_WORKSPACE_STDERR"] = ACCESS_DENIED_STDERR
+
+        ok, reason, attempts = self.qt._launch_cmux("qt t4", [sys.executable, "-c", "pass"])
+
+        self.assertFalse(ok)
+        self.assertIn("outside", reason)
+        self.assertIn("password", reason)
+        # exactly the one new-workspace attempt: no "open -ga cmux" nudge,
+        # no readiness poll -- a denial can only ever be denied again.
+        self.assertEqual(len(attempts), 1)
+        self.assertIn("new-workspace", attempts[0]["argv"])
+
+    def test_access_denied_falls_back_to_terminal_with_the_denial_reason(self):
+        self._set_terminal("cmux")
+        os.environ["FAKE_CMUX_NEW_WORKSPACE_RC"] = "1"
+        os.environ["FAKE_CMUX_NEW_WORKSPACE_STDERR"] = ACCESS_DENIED_STDERR
+
+        self.qt._launch_in_terminal("resume-t4", "qt t4", [sys.executable, "-c", "pass"])
+
+        records = self._log_records()
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["outcome"], "terminal-fallback")
+        self.assertEqual(rec["branch"], "cmux")
+
+        # only the Terminal.app fallback ran -- no "open -ga cmux" nudge
+        cmux_calls = self._read_calls(self.cmux_log)
+        self.assertEqual(len(cmux_calls), 1)
+        open_calls = self._read_calls(self.open_log)
+        self.assertEqual(len(open_calls), 1)
+        self.assertEqual(open_calls[0][:2], ["-a", "Terminal"])
+
+        notify_calls = self._read_calls(self.notify_log)
+        self.assertEqual(len(notify_calls), 1)
+        body = notify_calls[0][1]
+        self.assertIn("outside", body)
+        self.assertIn("password", body)
+        self.assertNotIn("cmux unreachable", body)
+
+    def test_cold_start_denial_ends_the_readiness_poll_at_once(self):
+        # App down for the first attempt (a socket-down error, not a
+        # denial), then up and refusing: the poll must stop on the first
+        # refusal with the cmuxOnly reason instead of sitting out the 10 s
+        # wait and reporting "not answering".
+        self._set_terminal("cmux")
+        os.environ["FAKE_CMUX_NEW_WORKSPACE_RC"] = "1"
+        os.environ["FAKE_CMUX_NEW_WORKSPACE_STDERR"] = "Error: connection refused"
+        os.environ["FAKE_CMUX_READY_RC"] = "1"
+        os.environ["FAKE_CMUX_READY_STDERR"] = ACCESS_DENIED_STDERR
+
+        ok, reason, attempts = self.qt._launch_cmux("qt t5", [sys.executable, "-c", "pass"])
+
+        self.assertFalse(ok)
+        self.assertIn("outside", reason)
+        self.assertIn("password", reason)
+        self.assertNotIn("not answering", reason)
+        # new-workspace, the open -ga nudge, then the one denied probe
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(attempts[1]["argv"], ["open", "-ga", "cmux"])
+        self.assertIn("Access denied", attempts[2]["stderr"])
+        open_calls = self._read_calls(self.open_log)
+        self.assertEqual(open_calls[0], ["-ga", "cmux"])
+
+    def test_socket_state_tells_denied_from_down(self):
+        cmux = str(self.bin_dir / "cmux")
+        os.environ["FAKE_CMUX_READY_RC"] = "1"
+        os.environ["FAKE_CMUX_READY_STDERR"] = ACCESS_DENIED_STDERR
+        state, stderr = self.qt._cmux_socket_state(cmux)
+        self.assertEqual(state, "denied")
+        self.assertIn("Access denied", stderr)
+
+        os.environ["FAKE_CMUX_READY_STDERR"] = "Error: connection refused"
+        state, _ = self.qt._cmux_socket_state(cmux)
+        self.assertEqual(state, "down")
+
+        os.environ["FAKE_CMUX_READY_RC"] = "0"
+        state, _ = self.qt._cmux_socket_state(cmux)
+        self.assertEqual(state, "ok")
+
+
+class CmuxOutsideProbeTests(unittest.TestCase):
+    """_cmux_outside_probe() double-forks and detaches to launchd before
+    calling `cmux ping`, reproducing the ancestry a resume click has.
+    Driven against the same FAKE_CMUX shim, controlled via
+    FAKE_CMUX_PING_RC / FAKE_CMUX_PING_STDERR."""
+
+    def setUp(self):
+        TMP_ROOT.mkdir(exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT))
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.qt_data = root / "qtdata"
+
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _write_exec(bin_dir / "cmux", FAKE_CMUX)
+        self.assertNotIn("/T/", str(bin_dir))
+        self.bin_dir = bin_dir
+
+        self._old_environ = dict(os.environ)
+        self.addCleanup(self._restore_environ)
+        os.environ["QT_DATA"] = str(self.qt_data)
+        os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+
+        self.qt = _load_qt_module()
+        self.cmux_path = str(bin_dir / "cmux")
+
+    def _restore_environ(self):
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    def test_ok_when_ping_succeeds(self):
+        os.environ["FAKE_CMUX_PING_RC"] = "0"
+        outcome, detail = self.qt._cmux_outside_probe(self.cmux_path, timeout=5)
+        self.assertEqual(outcome, "ok")
+
+    def test_denied_when_ping_reports_access_denied(self):
+        os.environ["FAKE_CMUX_PING_RC"] = "1"
+        os.environ["FAKE_CMUX_PING_STDERR"] = ACCESS_DENIED_STDERR
+        outcome, detail = self.qt._cmux_outside_probe(self.cmux_path, timeout=5)
+        self.assertEqual(outcome, "denied")
+        self.assertIn("Access denied", detail)
+
+    def test_down_on_other_nonzero_exit(self):
+        os.environ["FAKE_CMUX_PING_RC"] = "17"
+        os.environ["FAKE_CMUX_PING_STDERR"] = "boom: something else broke"
+        outcome, detail = self.qt._cmux_outside_probe(self.cmux_path, timeout=5)
+        self.assertEqual(outcome, "down")
+        self.assertIn("boom: something else broke", detail)
+
 
 class ResumeLogRotationTests(unittest.TestCase):
     """resume.log keeps at most RESUME_LOG_MAX_LINES records, dropping the
@@ -351,6 +494,86 @@ class LsregisterClaimantsParsingTests(unittest.TestCase):
         # lsregister for real -- fake_run_step stood in for every call
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][-1], "/private/tmp/qtdefect_test.app")
+
+
+class DoctorCmuxOutsideProbeTests(unittest.TestCase):
+    """`qt doctor`'s terminal (cmux) section, driven as a real subprocess
+    against a fake cmux CLI whose `ping` subcommand is independently
+    controllable -- the same fixture shape _cmux_outside_probe's own tests
+    use, but exercised through the actual `qt doctor` entry point."""
+
+    def setUp(self):
+        TMP_ROOT.mkdir(exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT))
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.qt_data = root / "qtdata"
+        self.qt_data.mkdir()
+
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _write_exec(bin_dir / "cmux", FAKE_CMUX)
+        _write_exec(bin_dir / "claude", FAKE_CLAUDE_VERSION)
+        self.assertNotIn("/T/", str(bin_dir))
+        self.bin_dir = bin_dir
+
+        with open(self.qt_data / "config.json", "w") as f:
+            json.dump({"terminal": "cmux"}, f)
+
+        # doctor's resume-handler section reads lsregister; point it at a
+        # fixture so these tests never touch the real LaunchServices DB.
+        self.fixture_path = root / "lsdump_fixture.txt"
+        self.fixture_path.write_text(
+            f"{DASHES}\n"
+            "bundle id:                  QuicktaskResume.new (0x3c8c)\n"
+            f"path:                       {self.qt_data / 'QuicktaskResume.app'}\n"
+            "name:                       QuicktaskResume.new\n"
+            "identifier:                 com.quicktasks.resume-handler\n"
+            f"{DASHES}\n"
+        )
+
+    def _run_qt_doctor(self, extra_env=None):
+        env = dict(os.environ)
+        env["QT_DATA"] = str(self.qt_data)
+        env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
+        env["QT_TEST_LSREGISTER_DUMP"] = str(self.fixture_path)
+        env.pop("QT_HUB", None)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            [sys.executable, str(QT_SCRIPT), "doctor"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+
+    def test_denied_probe_warns_with_the_password_mode_fix(self):
+        proc = self._run_qt_doctor({
+            "FAKE_CMUX_PING_RC": "1",
+            "FAKE_CMUX_PING_STDERR": ACCESS_DENIED_STDERR,
+        })
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        self.assertIn("terminal (cmux)", out)
+        self.assertIn("socket refuses processes started outside cmux", out)
+        self.assertIn("Terminal.app", out)
+        self.assertIn("password", out)
+        self.assertIn("reload-config", out)
+
+    def test_ok_probe_reports_probe_ok(self):
+        proc = self._run_qt_doctor({"FAKE_CMUX_PING_RC": "0"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outside-cmux probe ok", proc.stdout)
+
+    def test_denied_socket_state_warns_without_claiming_the_app_is_down(self):
+        # doctor run from a non-cmux terminal: its own `workspace list` is
+        # refused. That used to print a green "app not running now".
+        proc = self._run_qt_doctor({
+            "FAKE_CMUX_READY_RC": "1",
+            "FAKE_CMUX_READY_STDERR": ACCESS_DENIED_STDERR,
+        })
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("socket refuses processes started outside cmux", proc.stdout)
+        self.assertIn("reload-config", proc.stdout)
+        self.assertNotIn("app not running now", proc.stdout)
 
 
 class ResumeHandlerDoctorTests(unittest.TestCase):
