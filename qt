@@ -855,10 +855,25 @@ def load(tid):
 
 
 def save(task):
-    tmp = task_path(task["id"]) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(task, f, indent=2)
-    os.replace(tmp, task_path(task["id"]))
+    """Persist a task's JSON. If TASKS_DIR vanished out from under us (e.g. a
+    fresh-install rehearsal renaming ~/.quicktasks mid-run), recreate it and
+    retry once before giving up -- a task must never silently stay stuck at
+    an earlier status just because its directory disappeared."""
+    path = task_path(task["id"])
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(task, f, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(task, f, indent=2)
+            os.replace(tmp, path)
+        except OSError as e:
+            sys.stderr.write(f"qt: cannot save task {task.get('id')}: {e}\n")
+            sys.exit(1)
 
 
 def now():
@@ -1144,110 +1159,135 @@ def _feed_hub(task, rc=None):
             pass
 
 
+def _append_log(log_path, text):
+    """Best-effort log append. Recreate LOGS_DIR if it vanished (e.g. a
+    fresh-install rehearsal renaming ~/.quicktasks mid-run) and retry once;
+    if it's still not writable, drop the log line rather than crash a task
+    that has already finished running."""
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(text)
+    except OSError:
+        pass
+
+
 def run_task(tid, interactive=False):
     task = load(tid)
     task["status"] = "running"
     task["started"] = now()
     save(task)
 
-    claude = find_claude()
-    if not claude:
-        task.update(status="failed", result="claude CLI not found on PATH", finished=now())
-        save(task)
-        _feed_hub(task)
-        notify("Quicktask failed", task["prompt"], "claude CLI not found")
-        return
-
-    prompt = task_prompt(task)
-    cmd = [
-        claude, "-p", prompt,
-        "--output-format", "json",
-        "--permission-mode", task.get("perm_mode") or resolve_permissions(),
-    ]
-    if task.get("model"):
-        cmd += ["--model", task["model"]]
-    # LD-224 follow-up: gate every mcp__ld-tools__ld_slack_* call behind a
-    # PreToolUse hook (hub guard.py, or qt-guard.py) rather than leaving
-    # quick-fires with no Slack-destination check at all. Not an
-    # --allowedTools change -- a quick-fire keeps its normal tool freedom,
-    # the hook is the deterministic gate.
-    settings_path = render_slack_guard_settings(tid)
-    if settings_path:
-        cmd += ["--settings", settings_path]
-
-    log_path = os.path.join(LOGS_DIR, tid + ".log")
-    run_cwd = task.get("run_cwd", WORKSPACE)
     try:
-        try:
-            proc = subprocess.run(
-                cmd, cwd=run_cwd, capture_output=True, text=True, timeout=TIMEOUT
-            )
-            stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
-        except subprocess.TimeoutExpired as e:
-            stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-            with open(log_path, "a") as f:
-                f.write(stdout + f"\n--- timed out after {TIMEOUT}s ---\n")
-            task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
+        claude = find_claude()
+        if not claude:
+            task.update(status="failed", result="claude CLI not found on PATH", finished=now())
             save(task)
             _feed_hub(task)
-            notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}")
+            notify("Quicktask failed", task["prompt"], "claude CLI not found")
             return
-    finally:
+
+        prompt = task_prompt(task)
+        cmd = [
+            claude, "-p", prompt,
+            "--output-format", "json",
+            "--permission-mode", task.get("perm_mode") or resolve_permissions(),
+        ]
+        if task.get("model"):
+            cmd += ["--model", task["model"]]
+        # LD-224 follow-up: gate every mcp__ld-tools__ld_slack_* call behind a
+        # PreToolUse hook (hub guard.py, or qt-guard.py) rather than leaving
+        # quick-fires with no Slack-destination check at all. Not an
+        # --allowedTools change -- a quick-fire keeps its normal tool freedom,
+        # the hook is the deterministic gate.
+        settings_path = render_slack_guard_settings(tid)
         if settings_path:
-            try:
-                os.remove(settings_path)
-            except OSError:
-                pass
+            cmd += ["--settings", settings_path]
 
-    with open(log_path, "a") as f:
-        f.write(stdout)
+        log_path = os.path.join(LOGS_DIR, tid + ".log")
+        run_cwd = task.get("run_cwd", WORKSPACE)
+        try:
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=run_cwd, capture_output=True, text=True, timeout=TIMEOUT
+                )
+                stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
+            except subprocess.TimeoutExpired as e:
+                stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+                _append_log(log_path, stdout + f"\n--- timed out after {TIMEOUT}s ---\n")
+                task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
+                save(task)
+                _feed_hub(task)
+                notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}")
+                return
+        finally:
+            if settings_path:
+                try:
+                    os.remove(settings_path)
+                except OSError:
+                    pass
+
+        text = stdout
         if stderr:
-            f.write("\n--- stderr ---\n" + stderr)
+            text += "\n--- stderr ---\n" + stderr
+        _append_log(log_path, text)
 
-    data = {}
-    for line in reversed(stdout.strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                data = json.loads(line)
-                break
-            except json.JSONDecodeError:
-                continue
+        data = {}
+        for line in reversed(stdout.strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    data = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
 
-    result = (data.get("result") or "").strip()
-    denials = data.get("permission_denials") or []
-    ok = rc == 0 and not data.get("is_error", False)
-    if denials:
-        status = "blocked"
-    elif ok:
-        status = "done"
-    else:
-        status = "failed"
-    task.update(
-        status=status,
-        result=result or (stderr.strip()[-300:] if not ok else ""),
-        session_id=data.get("session_id"),
-        cost_usd=data.get("total_cost_usd"),
-        denials=[
-            {"tool_name": d.get("tool_name"), "tool_input": d.get("tool_input")}
-            for d in denials
-        ],
-        finished=now(),
-    )
-    save(task)
-    _feed_hub(task, rc=rc)
+        result = (data.get("result") or "").strip()
+        denials = data.get("permission_denials") or []
+        ok = rc == 0 and not data.get("is_error", False)
+        if denials:
+            status = "blocked"
+        elif ok:
+            status = "done"
+        else:
+            status = "failed"
+        task.update(
+            status=status,
+            result=result or (stderr.strip()[-300:] if not ok else ""),
+            session_id=data.get("session_id"),
+            cost_usd=data.get("total_cost_usd"),
+            denials=[
+                {"tool_name": d.get("tool_name"), "tool_input": d.get("tool_input")}
+                for d in denials
+            ],
+            finished=now(),
+        )
+        save(task)
+        _feed_hub(task, rc=rc)
 
-    if status == "blocked":
-        if not interactive:
-            notify_blocked(task, denials)
-        return
-    icon = "✓" if status == "done" else "✗"
-    cost = f" · ${task['cost_usd']:.2f}" if task.get("cost_usd") else ""
-    notify(
-        f"Quicktask {icon}{cost}",
-        task["prompt"],
-        result.splitlines()[0] if result else status,
-    )
+        if status == "blocked":
+            if not interactive:
+                notify_blocked(task, denials)
+            return
+        icon = "✓" if status == "done" else "✗"
+        cost = f" · ${task['cost_usd']:.2f}" if task.get("cost_usd") else ""
+        notify(
+            f"Quicktask {icon}{cost}",
+            task["prompt"],
+            result.splitlines()[0] if result else status,
+        )
+    except Exception as e:
+        # General safety net: whatever broke, a task must never be left at
+        # "running" forever. Only stamp failed if nothing already gave it a
+        # terminal status (done/failed/timeout/blocked) -- don't clobber a
+        # real outcome just because a late, non-essential step (e.g. a
+        # notification) misbehaved after the task already finished.
+        if task.get("status") == "running":
+            task["status"] = "failed"
+            task["result"] = f"{type(e).__name__}: {e}"[:2000]
+            task["finished"] = now()
+            save(task)
+        raise
 
 
 # --- commands -----------------------------------------------------------
