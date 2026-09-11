@@ -82,6 +82,76 @@ def resolve_hub_dir():
     d = HUB_DIR_ENV or load_config().get("hub_dir")
     return os.path.realpath(os.path.expanduser(d)) if d else None
 
+
+# Every mcp__ld-tools__ld_slack_* tool, gated by whichever guard
+# resolve_slack_guard_cmd() picks. Broad on purpose: a quick-fire keeps its
+# normal tool freedom (no --allowedTools change), so the PreToolUse hook is
+# the only deterministic gate against a repeat of LD-224's incident, where
+# a quick-fire posted to a public channel with no Slack-destination check
+# at all.
+SLACK_GUARD_MATCHER = "mcp__ld-tools__ld_slack_.*"
+
+
+def resolve_slack_guard_cmd():
+    """Which script enforces the Slack-posting policy for a headless
+    quick-fire's PreToolUse hook.
+
+    The hub's own guard.py (and whatever pass-config.json policy it reads)
+    when the hub feed is configured and that file exists there -- quick-
+    fires then obey the same policy hub-fired jobs already do. Otherwise
+    qt's own qt-guard.py, shipped next to this script, reading config.json
+    keys slack_owner_id / slack_allowed_channels / slack_allow_public_
+    channels.
+
+    Returns (path, "hub"|"qt"), or (None, None) if neither script exists
+    on disk -- callers then skip --settings entirely rather than pointing
+    Claude at a hook command that isn't there.
+    """
+    hub_dir = resolve_hub_dir()
+    if hub_dir:
+        hub_guard = os.path.join(hub_dir, "guard.py")
+        if os.path.isfile(hub_guard):
+            return hub_guard, "hub"
+    qt_guard = os.path.join(os.path.dirname(os.path.realpath(__file__)), "qt-guard.py")
+    if os.path.isfile(qt_guard):
+        return qt_guard, "qt"
+    return None, None
+
+
+def render_slack_guard_settings(tid):
+    """Write a one-off Claude Code --settings file wiring the chosen Slack
+    guard (see resolve_slack_guard_cmd()) as a PreToolUse hook on
+    SLACK_GUARD_MATCHER. Lives under QT_DATA/tmp named by this run's task
+    id, which is already unique per run, so two concurrent quick-fires
+    never race on the same path -- same convention _seed_hub_item() uses
+    for its own per-item fragment file. Returns None (skip --settings)
+    when no guard script exists at all; the caller is responsible for
+    removing the file once the run finishes."""
+    guard_path, _source = resolve_slack_guard_cmd()
+    if not guard_path:
+        return None
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": SLACK_GUARD_MATCHER,
+                    "hooks": [{
+                        "type": "command",
+                        "command": f"{shlex.quote(sys.executable)} {shlex.quote(guard_path)}",
+                    }],
+                }
+            ]
+        }
+    }
+    os.makedirs(TMP_DIR, exist_ok=True)
+    path = os.path.join(TMP_DIR, f"slack-guard-{tid}.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(settings, f)
+    os.replace(tmp, path)
+    return path
+
+
 WORKSPACE_CLAUDE_MD = """\
 # Quicktask runner
 
@@ -994,23 +1064,38 @@ def run_task(tid, interactive=False):
     ]
     if task.get("model"):
         cmd += ["--model", task["model"]]
+    # LD-224 follow-up: gate every mcp__ld-tools__ld_slack_* call behind a
+    # PreToolUse hook (hub guard.py, or qt-guard.py) rather than leaving
+    # quick-fires with no Slack-destination check at all. Not an
+    # --allowedTools change -- a quick-fire keeps its normal tool freedom,
+    # the hook is the deterministic gate.
+    settings_path = render_slack_guard_settings(tid)
+    if settings_path:
+        cmd += ["--settings", settings_path]
 
     log_path = os.path.join(LOGS_DIR, tid + ".log")
     run_cwd = task.get("run_cwd", WORKSPACE)
     try:
-        proc = subprocess.run(
-            cmd, cwd=run_cwd, capture_output=True, text=True, timeout=TIMEOUT
-        )
-        stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
-    except subprocess.TimeoutExpired as e:
-        stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        with open(log_path, "a") as f:
-            f.write(stdout + f"\n--- timed out after {TIMEOUT}s ---\n")
-        task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
-        save(task)
-        _feed_hub(task)
-        notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}")
-        return
+        try:
+            proc = subprocess.run(
+                cmd, cwd=run_cwd, capture_output=True, text=True, timeout=TIMEOUT
+            )
+            stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
+        except subprocess.TimeoutExpired as e:
+            stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            with open(log_path, "a") as f:
+                f.write(stdout + f"\n--- timed out after {TIMEOUT}s ---\n")
+            task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
+            save(task)
+            _feed_hub(task)
+            notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}")
+            return
+    finally:
+        if settings_path:
+            try:
+                os.remove(settings_path)
+            except OSError:
+                pass
 
     with open(log_path, "a") as f:
         f.write(stdout)
@@ -1284,6 +1369,25 @@ def cmd_setup():
     # empty input changes nothing: a configured model stays configured,
     # and staying unset must keep falling through to the CLI's own
     # default rather than setup quietly forcing sonnet[1m] on everyone
+
+    hub_dir = resolve_hub_dir()
+    if hub_dir and os.path.isfile(os.path.join(hub_dir, "guard.py")):
+        print(f"\nSlack safety: the hub feed is configured ({hub_dir}), so its own "
+              "guard.py + pass-config.json policy governs where quick-fires can post "
+              "Slack messages -- nothing to set here.")
+    else:
+        cur_owner = cfg.get("slack_owner_id", "")
+        print(f"\nSlack member id for quick-fire posts (current: {cur_owner or 'none · every Slack write is denied'}):")
+        print("  Slack profile → More → Copy member ID (starts with U); empty to keep current")
+        owner_choice = input(f"choice [{cur_owner or 'none'}]: ").strip()
+        if owner_choice.lower() in ("none", "skip", "clear"):
+            cfg.pop("slack_owner_id", None)
+        elif owner_choice:
+            if owner_choice.startswith("U"):
+                cfg["slack_owner_id"] = owner_choice
+            else:
+                print("  doesn't look like a Slack member id (should start with U), not saving")
+        # empty input keeps whatever is already configured
 
     tn = find_notifier()
     print(f"\nNotifications: " + (
@@ -1704,6 +1808,32 @@ def cmd_doctor():
         report("warn", "hub feed", f"{hub_dir} (no seed.py)", "check hub_dir points at a Pass checkout")
     else:
         report("ok", "hub feed", hub_dir)
+
+    guard_path, guard_source = resolve_slack_guard_cmd()
+    if guard_source == "hub":
+        hub_owner = None
+        try:
+            with open(os.path.join(hub_dir, "pass-config.json")) as f:
+                hub_owner = json.load(f).get("owner_slack_id")
+        except (OSError, json.JSONDecodeError):
+            pass
+        report("ok", "Slack guard",
+               f"hub · {guard_path} · owner="
+               f"{hub_owner or 'DENY-ALL (owner_slack_id unset in hub pass-config.json)'} "
+               "· public posting: governed by hub policy")
+    elif guard_source == "qt":
+        owner = cfg.get("slack_owner_id")
+        allow_public = bool(cfg.get("slack_allow_public_channels", False))
+        allowed_n = len(cfg.get("slack_allowed_channels") or [])
+        detail = (f"qt-guard.py · owner={owner or 'DENY-ALL (no slack_owner_id)'} "
+                  f"· allowed_channels={allowed_n} "
+                  f"· public posting: {'on' if allow_public else 'off'}")
+        report("ok" if owner else "warn", "Slack guard", detail,
+               None if owner else "qt setup to set slack_owner_id, or set "
+                                   "slack_allow_public_channels: true in config.json")
+    else:
+        report("warn", "Slack guard", "no guard script found (hub guard.py or qt-guard.py)",
+               "reinstall qt, or check hub_dir")
 
     app = handler_app_path()
     if not os.path.isdir(app):

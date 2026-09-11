@@ -661,10 +661,12 @@ class SetupDefaultModelTests(unittest.TestCase):
             return json.load(f)
 
     def test_recommends_sonnet_1m_and_blank_choice_leaves_model_unset(self):
-        # 5 blank answers: terminal, test-launch, trusted-dirs, permissions,
-        # model. "test launch now? [y/N]" blank means no, so this never
-        # actually tries to launch a terminal.
-        proc = self._run_qt_setup("\n" * 5)
+        # 6 blank answers: terminal, test-launch, trusted-dirs, permissions,
+        # model, slack owner id (QT_HUB is unset in _run_qt_setup, so this
+        # step asks rather than deferring to the hub's policy). "test
+        # launch now? [y/N]" blank means no, so this never actually tries
+        # to launch a terminal.
+        proc = self._run_qt_setup("\n" * 6)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("sonnet[1m]", proc.stdout)
         self.assertIn("recommended", proc.stdout)
@@ -674,7 +676,10 @@ class SetupDefaultModelTests(unittest.TestCase):
         self.assertIn("model=unset · CLI default", proc.stdout)
 
     def test_choosing_1_sets_sonnet_1m(self):
-        proc = self._run_qt_setup("\n\n\n\n1\n")
+        # ...terminal, test-launch, trusted-dirs, permissions, model=1,
+        # then a blank slack-owner-id answer (see the 6-answer comment
+        # above).
+        proc = self._run_qt_setup("\n\n\n\n1\n\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
         cfg = self._config()

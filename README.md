@@ -111,7 +111,7 @@ Note: your global allowlist is inherited by headless runs, and sandbox-safe read
 
 ## Config
 
-`qt setup` writes `~/.quicktasks/config.json`: `terminal` (cmux | Ghostty | iTerm | Terminal | custom template with `{script}`), `trusted_dirs`, `permissions` (see above, also set by `qt setup`), `trusted_permissions` (mode inside trusted dirs, default `auto`), `model` (default for all tasks; `qt setup` recommends `sonnet[1m]`, Claude Code 2.1.266+'s 1M-context alias, but leaves it unset unless you pick it), optional `notifier: "osascript"` to force the fallback.
+`qt setup` writes `~/.quicktasks/config.json`: `terminal` (cmux | Ghostty | iTerm | Terminal | custom template with `{script}`), `trusted_dirs`, `permissions` (see above, also set by `qt setup`), `trusted_permissions` (mode inside trusted dirs, default `auto`), `model` (default for all tasks; `qt setup` recommends `sonnet[1m]`, Claude Code 2.1.266+'s 1M-context alias, but leaves it unset unless you pick it), optional `notifier: "osascript"` to force the fallback, and `slack_owner_id` / `slack_allowed_channels` / `slack_allow_public_channels` (see Slack safety, below).
 
 Model resolution per task: `-m` flag > `QT_MODEL` env > config `"model"` > your CLI default. Leaving `model` unset (the default if you skip that step in `qt setup`) always falls through to whatever the `claude` CLI itself defaults to; setup never writes a model choice you didn't make.
 
@@ -120,6 +120,20 @@ Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (secon
 ### Hub mode
 
 `qt hub <dir>` points qt at a checkout of The Pass (a separate ledger app; `dir` must contain its `seed.py`); `qt hub off` clears it; `qt hub status` shows the current setting. Unset (the default) is a strict no-op: nothing changes. Set it and every finished task also seeds an item into that ledger (`seed.py`, so a re-run never duplicates) and writes a `jobs/qt-<id>-<timestamp>/job.json` + `output/RESULT.md`, so it shows up in the ledger's Verify queue: done tasks land as `done`, blocked tasks land as `blocked`, and failed/timeout tasks land as `failed`, each with an error explaining why and a `qt resume <id>` hint. `QT_HUB` overrides the config value. This never blocks or fails the task itself; a hub-feed problem is logged to the task's log file at most.
+
+### Slack safety
+
+Every headless `claude -p` a quick-fire launches carries a `--settings` file wiring a PreToolUse hook on every `mcp__ld-tools__ld_slack_*` tool call -- not a tool allowlist, so a quick-fire keeps its normal freedom, but a deterministic gate on where it can post. This closed an incident where a quick-fire posted to a public channel with no Slack-destination check at all.
+
+- **Hub feed configured** (`qt hub <dir>`, and that checkout has a `guard.py`): quick-fires reuse the hub's own `guard.py` and `pass-config.json` policy, the same one hub-fired jobs already obey. Nothing to configure in qt itself.
+- **No hub feed**: quick-fires run under qt's own `qt-guard.py`, reading two `config.json` keys `qt setup` writes:
+  - `slack_owner_id`: the owner's Slack member id (Slack profile → More → Copy member ID, starts with `U`). With none set, **every Slack write is denied** -- there's no hardcoded fallback.
+  - `slack_allowed_channels`: an array of extra channel/conversation ids a write may target beyond the owner's own DM.
+  - `slack_allow_public_channels` (bool, default `false`): opt-in escape hatch that allows any channel, including a write with no channel field to check at all. Off unless you turn it on.
+
+  Read-only Slack tools (search, history, thread lookups, channel/user lookups, etc.) are always allowed; only tools that can change what someone else sees go through the channel check.
+
+`qt doctor` prints one "Slack guard" line: which guard is active (`hub` or `qt-guard.py`), the owner id in effect (or `DENY-ALL` when none is configured), and whether public-channel posting is on.
 
 ## Troubleshooting
 
