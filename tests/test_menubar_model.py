@@ -18,6 +18,10 @@ is the only way to test discovery without depending on what is really listening
 on 8811. `--dump-keys` walks the keyboard highlight over the visible rows, and
 (LD-201 v5) now also drives Tab/⌘1/⌘2/⌘↩'s mode-swap logic and
 its one-shot "fire the other way," so the keyboard is tested without a display.
+It also drives Return's routing between a focused text field and a
+highlighted row (`--field-focused`/`--search-focused`, and the `summon`/
+`focus-field`/`focus-search` tokens), the fix for a highlight from an
+earlier visit hijacking Return the moment quick-fire's field regains focus.
 `--dump-fire` and `--dump-keys`'s own ⌘↩ case both call
 FireResolve.describe(), so a fire is described the same way from either seam;
 `--dump-recent-dirs` reads the directory chip's recency menu off a fixture qt
@@ -2227,6 +2231,84 @@ class TestKeyboardHighlight(PassCase):
         self.assertEqual(k["highlight"], "n-audit-1")
         self.assertEqual(k["primary_action"], "item")
         self.assertEqual(k["primary_url"], "http://127.0.0.1:8811/?item=n-audit-1")
+
+
+class TestKeyboardHighlightFocus(PassCase):
+    """Return's routing between a focused text field and a highlighted row,
+    via the extended --dump-keys (--field-focused/--search-focused,
+    focus-field/focus-search, summon). This is the LD-201-adjacent fix: the
+    root .onKeyPress(.return) used to check only `highlighted`, so a row
+    highlighted on an earlier visit hijacked Return the instant quick-fire's
+    field regained focus. KeyboardNav.returnTarget is the guard that view
+    code now calls first; these tests exercise that guard through the same
+    seam TestKeyboardHighlight uses for the highlight walk itself."""
+
+    def keys(self, base, sequence, field_focused=False, search_focused=False):
+        args = ["--dump-keys", sequence]
+        if field_focused:
+            args.append("--field-focused")
+        if search_focused:
+            args.append("--search-focused")
+        proc = self.run_binary(*args, extra_env={"QT_PASS_URL": base})
+        return json.loads(proc.stdout)
+
+    def three_rows(self):
+        return self.serve(payload=status_fixture(
+            jobs=[job("j-live", status="running",
+                      resume_url="quicktask://resume/j-live-20260904-120000-aaaaaa")],
+            needs=[need("g-gate", "gate", can_run=True),
+                   need("j-block", "blocked")],
+            item_url_template="http://127.0.0.1:8811/?item={item_id}"))
+
+    def test_a_highlighted_row_with_the_field_focused_is_a_field_submit(self):
+        """A row highlighted by an earlier arrow key, with the field then
+        given focus by a direct click (`focus-field`, which -- unlike
+        `summon` -- leaves the highlight alone, the same way a live click
+        into the field would): Return has to keep going to the field. No
+        row action is reported for it -- `return_target` is `"field"`,
+        never `"row"`."""
+        base = self.three_rows()
+        k = self.keys(base, "down,focus-field,return")
+        self.assertEqual(k["return_target"], "field")
+        self.assertTrue(k["field_focused"])
+        # The highlight itself is untouched by a field-bound return: it
+        # still names the row an arrow key landed on, just not one this
+        # Return acted on.
+        self.assertEqual(k["highlight"], "j-live-20260904-120000-aaaaaa")
+
+    def test_a_highlighted_row_with_neither_field_focused_still_acts_on_return(self):
+        """Unchanged from today: with neither field focused, Return acts on
+        whatever is highlighted."""
+        base = self.three_rows()
+        k = self.keys(base, "down,return")
+        self.assertEqual(k["return_target"], "row")
+        self.assertEqual(k["primary_action"], "resume")
+        self.assertEqual(k["primary_url"],
+                         "quicktask://resume/j-live-20260904-120000-aaaaaa")
+
+    def test_summon_clears_the_highlight_and_a_following_return_is_a_field_submit(self):
+        """The actual bug: a highlight from an earlier visit has to be gone
+        by the time a fresh summon's field-focus dance lands, or Return
+        would still find something to act on."""
+        base = self.three_rows()
+        k = self.keys(base, "down,summon,return")
+        self.assertIsNone(k["highlight"])
+        self.assertEqual(k["return_target"], "field")
+
+    def test_down_still_drops_focus_and_moves_the_highlight(self):
+        """The arrows still belong to the list once navigation starts,
+        exactly as before this fix -- a field that had focus loses it the
+        moment `down`/`up` moves the highlight."""
+        base = self.three_rows()
+        k = self.keys(base, "down", field_focused=True)
+        self.assertFalse(k["field_focused"])
+        self.assertEqual(k["highlight"], "j-live-20260904-120000-aaaaaa")
+
+    def test_search_focused_also_keeps_return_off_a_highlighted_row(self):
+        base = self.three_rows()
+        k = self.keys(base, "down,focus-search,return")
+        self.assertEqual(k["return_target"], "field")
+        self.assertTrue(k["search_focused"])
 
 
 class TestCaptureLimits(ModelCase):

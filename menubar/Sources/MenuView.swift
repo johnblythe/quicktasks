@@ -14,7 +14,11 @@
 // there is a session, else the item's deep link), and escape clears the
 // quick-fire field. The first arrow key also drops focus out of that field --
 // while it has focus the field owns the arrows and return, which is what makes
-// typing and pressing return still fire a quick task.
+// typing and pressing return still fire a quick task. That focus check
+// (KeyboardNav.returnTarget) is what a fresh summon relies on too: a
+// highlight left over from an earlier visit to the panel is cleared before
+// the field regains focus, but even if it weren't, the field's own focus
+// would still win return over a stale highlight.
 
 import SwiftUI
 import AppKit
@@ -278,6 +282,9 @@ struct MenuView: View {
             controller.scheduleMarkOutcomesSeen()
         }
         .onDisappear {
+            // Whichever host just closed, it starts the next visit clean --
+            // see `resetKeyboardState()`.
+            resetKeyboardState()
             if onEscapeExhausted == nil { controller.dropdownDidDisappear() }
         }
         .onChange(of: controller.summonTick) { _, _ in
@@ -289,11 +296,17 @@ struct MenuView: View {
             // reruns. Harmless for the real dropdown's own MenuView, which
             // observes the same controller: writing @FocusState on a
             // window that is not key has no visible effect.
+            //
+            // Reset before focusing: a highlight (or a suggestion mid-
+            // confirm) from an earlier visit to a cached panel must not
+            // survive into this one, or Return would act on it the instant
+            // the field's own focus dance below finishes.
+            resetKeyboardState()
             focusQuickFireField()
         }
         .onKeyPress(.downArrow) { moveHighlight(1) }
         .onKeyPress(.upArrow) { moveHighlight(-1) }
-        .onKeyPress(.return) { triggerHighlighted() }
+        .onKeyPress(.return) { handleReturn() }
         // Bare Tab, no modifier, so onKeyPress sees it directly -- only the
         // command-modified shortcuts above need the hidden-button trick.
         // Guarded to the quick-fire field itself: Tab while it is unfocused
@@ -363,6 +376,23 @@ struct MenuView: View {
         return .handled
     }
 
+    /// The root `.onKeyPress(.return)` handler. Routes through
+    /// `KeyboardNav.returnTarget` first: while quick-fire's own field or the
+    /// search field has focus, Return is `.ignored` here so the field's own
+    /// `.onSubmit` (`send`/`submitSearch`) is what actually runs -- a
+    /// highlight left over from an earlier visit must never hijack the key
+    /// the moment a fresh summon refocuses the field. Only once neither
+    /// field owns the keystroke does a highlighted row get to act.
+    private func handleReturn() -> KeyPress.Result {
+        switch KeyboardNav.returnTarget(highlighted: highlighted,
+                                        fieldFocused: fieldFocused,
+                                        searchFocused: searchFocused) {
+        case .field: return .ignored
+        case .row: return triggerHighlighted()
+        case .none: return .ignored
+        }
+    }
+
     /// Return in the search field itself, before any arrow has taken focus
     /// off it. A highlight already means an arrow got there first, and the
     /// root `.onKeyPress(.return)` -- `triggerHighlighted` -- owns that case
@@ -417,6 +447,7 @@ struct MenuView: View {
         // one thing a floating window needs from Escape that a dropdown does
         // not (a dropdown's own Escape-to-dismiss is AppKit's, not this).
         if let onEscapeExhausted {
+            resetKeyboardState()
             onEscapeExhausted()
             return .handled
         }
@@ -740,6 +771,17 @@ struct MenuView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { fieldFocused = true }
     }
 
+    /// The transient interaction state a fresh summon, or a closing panel,
+    /// has to start clean from: no row highlighted, no suggestion mid-confirm.
+    /// Without this, a highlight set on an earlier visit sat there once
+    /// quick-fire's field regained focus on the next summon, and Return acted
+    /// on that stale row instead of reaching the field's own `.onSubmit` --
+    /// see `KeyboardNav.returnTarget`, which is the other half of the fix.
+    private func resetKeyboardState() {
+        highlighted = KeyboardNav.summonReset()
+        confirmingSuggestion = nil
+    }
+
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !fireState.isFiring else { return }
@@ -821,7 +863,10 @@ struct MenuView: View {
             // one in the meantime.
             guard fireState == state else { return }
             fireState = .idle
-            if hidesPanel { onEscapeExhausted?() }
+            if hidesPanel {
+                resetKeyboardState()
+                onEscapeExhausted?()
+            }
         }
     }
 

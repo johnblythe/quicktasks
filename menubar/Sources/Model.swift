@@ -849,6 +849,33 @@ enum KeyboardNav {
         guard let current, ids.contains(current) else { return nil }
         return current
     }
+
+    /// Where Return goes when it lands on the panel/dropdown's root
+    /// `.onKeyPress`, rather than inside a text field's own `.onSubmit`.
+    /// A focused field -- quick-fire's own, or the search field -- always
+    /// keeps Return for itself; the root handler only gets to act on a
+    /// highlighted row once neither field owns the keystroke. This is the
+    /// fix for the stale-highlight bug: a row highlighted on an earlier
+    /// visit used to steal Return the moment quick-fire regained focus on a
+    /// fresh summon, because the root handler checked only `highlighted`
+    /// and never the field's own focus.
+    enum ReturnTarget: Equatable {
+        case field
+        case row(String)
+        case none
+    }
+
+    static func returnTarget(highlighted: String?, fieldFocused: Bool,
+                             searchFocused: Bool) -> ReturnTarget {
+        if fieldFocused || searchFocused { return .field }
+        if let id = highlighted { return .row(id) }
+        return .none
+    }
+
+    /// The highlight a summon (or a closing panel) leaves behind: none. Named
+    /// so the reset reads as an intentional decision at the call site rather
+    /// than a bare `nil` that looks like it could be a bug.
+    static func summonReset() -> String? { nil }
 }
 
 // MARK: - Relative age, for the right-hand column

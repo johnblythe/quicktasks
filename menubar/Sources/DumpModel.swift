@@ -541,22 +541,38 @@ enum DumpModel {
     /// `--dump-keys down,down,up`: the highlight's landing place after a key
     /// sequence, over the same visible rows a freshly opened menu would show.
     /// Anything but `up`/`down`/`return`/`escape`/`tab`/`cmd-1`/`cmd-2`/
-    /// `cmd-return` is refused rather than ignored, so a typo in a test is
-    /// not a silent pass.
+    /// `cmd-return`/`summon`/`focus-field`/`focus-search` is refused rather
+    /// than ignored, so a typo in a test is not a silent pass.
     ///
     /// `--search <query>` narrows `ids` (and the row lookup) to the same
     /// filtered model the search field draws from and the arrows walk in
     /// MenuView, so a test can express "filter, then arrow, then return"
     /// over exactly the rows that would be on screen.
     ///
-    /// `return` mirrors the search field's own `.onSubmit` (`submitSearch`)
-    /// when nothing is highlighted yet: one visible row acts on it directly
-    /// -- reported through `primary_action`/`primary_url` without moving
-    /// `highlight`, the same way the field's return never shows a highlight
-    /// for a match it acted on outright -- more than one highlights the
-    /// first rather than guessing. A `return` with something already
-    /// highlighted is a no-op here: `primary_action`/`primary_url` already
-    /// report that row.
+    /// `--field-focused`/`--search-focused` seed the simulated run's initial
+    /// focus, mirroring MenuView's `fieldFocused`/`searchFocused`
+    /// @FocusStates (both default false, matching neither field having
+    /// focus). `down`/`up` clear both, exactly as `moveHighlight` does --
+    /// the arrows belong to the list once it is being navigated. `summon`
+    /// sets `fieldFocused` and clears `highlight`, mirroring a real
+    /// \u{2325}Q: see `KeyboardNav.summonReset`. `focus-field`/`focus-search`
+    /// set the respective focus flag *without* touching `highlight` --
+    /// modeling a direct click into that field, which is the other way (an
+    /// arrow key aside) the live view can end up with a stale highlight
+    /// sitting under a now-focused field, since a click's own @FocusState
+    /// write never runs through `moveHighlight` or `summon`'s reset.
+    ///
+    /// `return` is routed through `KeyboardNav.returnTarget`, the same
+    /// function MenuView's own root `.onKeyPress(.return)` calls, and the
+    /// result is reported as `return_target`. While either field is
+    /// focused it is always `"field"`: no row acts, `highlight` is
+    /// untouched, and the field is what would actually receive Return in
+    /// the real view (its own `.onSubmit`, not modeled here). Otherwise, a
+    /// row already highlighted reports `"row"` -- a no-op here, since
+    /// `primary_action`/`primary_url` already describe it -- and nothing
+    /// highlighted reports `"none"` and falls through to the search field's
+    /// own `.onSubmit` logic (`submitSearch`): one visible row acts on it
+    /// directly, more than one highlights the first rather than guessing.
     ///
     /// `tab`, `cmd-1`, `cmd-2`, and `cmd-return` walk quick-fire's mode toggle
     /// exactly the way MenuView's own hidden buttons do (`toggleMode`,
@@ -586,14 +602,42 @@ enum DumpModel {
         var toPass = value(args, "--mode") == "pass"
         let draft = value(args, "--draft") ?? "sample text"
         var fired: [String: Any]?
+        // `--field-focused`/`--search-focused`: the simulated run's initial
+        // focus state, mirroring MenuView's own `fieldFocused`/`searchFocused`
+        // @FocusStates. `down`/`up` drop both, exactly as `moveHighlight`
+        // does; `summon` sets `fieldFocused` (and clears the other), exactly
+        // as a real \u{2325}Q's focus dance does.
+        var fieldFocused = args.contains("--field-focused")
+        var searchFocused = args.contains("--search-focused")
+        // What `return` resolved to, via the same `KeyboardNav.returnTarget`
+        // MenuView's root handler calls -- "field" (a focused field kept the
+        // key, no row acted on), "row" (a highlighted row's primary action
+        // applies, unchanged from before), or "none" (nothing highlighted,
+        // falls through to the single/no-match logic below). nil until a
+        // `return` token actually runs.
+        var returnTarget: String?
         for key in args[i + 1].split(separator: ",") {
             let name = key.trimmingCharacters(in: .whitespaces).lowercased()
             guard !name.isEmpty else { continue }
             switch name {
-            case "down": highlight = KeyboardNav.move(ids: ids, from: highlight, delta: 1)
-            case "up": highlight = KeyboardNav.move(ids: ids, from: highlight, delta: -1)
+            case "down":
+                fieldFocused = false
+                searchFocused = false
+                highlight = KeyboardNav.move(ids: ids, from: highlight, delta: 1)
+            case "up":
+                fieldFocused = false
+                searchFocused = false
+                highlight = KeyboardNav.move(ids: ids, from: highlight, delta: -1)
             case "return":
-                if highlight == nil {
+                switch KeyboardNav.returnTarget(highlighted: highlight,
+                                                fieldFocused: fieldFocused,
+                                                searchFocused: searchFocused) {
+                case .field:
+                    returnTarget = "field"
+                case .row:
+                    returnTarget = "row"
+                case .none:
+                    returnTarget = "none"
                     if ids.count == 1 {
                         actedID = ids.first
                     } else if let first = ids.first {
@@ -606,8 +650,27 @@ enum DumpModel {
             case "cmd-2": toPass = true
             case "cmd-return":
                 fired = FireResolve.describe(text: draft, toPass: !toPass, settings: config.settings)
+            case "summon":
+                highlight = KeyboardNav.summonReset()
+                fieldFocused = true
+                searchFocused = false
+            // `focus-field`/`focus-search`: a direct click into that field,
+            // which is how this state is actually reached in the live view
+            // outside a summon -- SwiftUI's own click handling sets the
+            // @FocusState straight from AppKit, never touching `highlighted`
+            // on the way. Unlike `down`/`up`, this does not clear the
+            // highlight -- that is the point: it is what lets a test build
+            // "a row is still highlighted from an arrow key, and the field
+            // now has focus" without going through `summon`, which clears it.
+            case "focus-field":
+                fieldFocused = true
+                searchFocused = false
+            case "focus-search":
+                searchFocused = true
+                fieldFocused = false
             default:
-                return fail("unknown key: \(name) (down, up, return, escape, tab, cmd-1, cmd-2, cmd-return)")
+                return fail("unknown key: \(name) (down, up, return, escape, tab, cmd-1, cmd-2, "
+                            + "cmd-return, summon, focus-field, focus-search)")
             }
             keys.append(name)
         }
@@ -627,6 +690,9 @@ enum DumpModel {
             } ?? NSNull(),
             "mode": toPass ? "pass" : "run",
             "fired": fired ?? NSNull(),
+            "return_target": returnTarget ?? NSNull(),
+            "field_focused": fieldFocused,
+            "search_focused": searchFocused,
         ])
     }
 
