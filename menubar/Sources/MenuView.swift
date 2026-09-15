@@ -327,9 +327,12 @@ struct MenuView: View {
     // MARK: - keyboard
 
     /// The rows the highlight can walk: display order, collapsed sections left
-    /// out, so it is the same list the eye is walking.
+    /// out, so it is the same list the eye is walking. Reads the same
+    /// (possibly search-narrowed) `model` the rows are drawn from -- with a
+    /// query typed, the drawn rows and the walked rows have to be the same
+    /// list, or the arrows land on a row nobody can see.
     private var visibleIDs: [String] {
-        controller.model
+        model
             .visibleRecords(collapsed: controller.collapsed, now: controller.now)
             .map { $0.id }
     }
@@ -339,15 +342,18 @@ struct MenuView: View {
         guard !ids.isEmpty else { return .ignored }
         // The arrows belong to the list once it is being navigated. Dropping
         // the field's focus is what lets return act on the row rather than
-        // firing whatever is half-typed in the field.
+        // firing whatever is half-typed in the field. Both fields are
+        // dropped: whichever one had focus (quick-fire, or search while a
+        // query is being narrowed) has to give up Return the same way.
         fieldFocused = false
+        searchFocused = false
         highlighted = KeyboardNav.move(ids: ids, from: highlighted, delta: delta)
         return .handled
     }
 
     private func triggerHighlighted() -> KeyPress.Result {
         guard let id = highlighted,
-              let record = controller.model.records.first(where: { $0.id == id }) else {
+              let record = model.records.first(where: { $0.id == id }) else {
             return .ignored
         }
         switch record.primaryAction {
@@ -355,6 +361,27 @@ struct MenuView: View {
         case .item: openItem(record)
         }
         return .handled
+    }
+
+    /// Return in the search field itself, before any arrow has taken focus
+    /// off it. A highlight already means an arrow got there first, and the
+    /// root `.onKeyPress(.return)` -- `triggerHighlighted` -- owns that case
+    /// once `moveHighlight` drops `searchFocused`; this only runs while the
+    /// field still owns Return. One match is unambiguous enough to act on
+    /// directly; more than one highlights the first rather than guessing
+    /// which of several the query meant.
+    private func submitSearch() {
+        guard highlighted == nil else { return }
+        let ids = visibleIDs
+        if ids.count == 1, let id = ids.first,
+           let record = model.records.first(where: { $0.id == id }) {
+            switch record.primaryAction {
+            case .resume: resume(record)
+            case .item: openItem(record)
+            }
+        } else if let first = ids.first {
+            highlighted = first
+        }
     }
 
     /// Escape backs out of one thing at a time, innermost first: a pending
@@ -504,6 +531,7 @@ struct MenuView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .focused($searchFocused)
+                .onSubmit(submitSearch)
             if !search.isEmpty {
                 // The count is the useful thing here rather than in the header:
                 // it says how much of the list the query is hiding.

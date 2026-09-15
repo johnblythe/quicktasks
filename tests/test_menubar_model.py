@@ -2094,9 +2094,11 @@ class TestKeyboardHighlight(PassCase):
     escape clears. Driven through --dump-keys, which runs the same pure
     KeyboardNav the view uses."""
 
-    def keys(self, base, sequence):
-        proc = self.run_binary("--dump-keys", sequence,
-                               extra_env={"QT_PASS_URL": base})
+    def keys(self, base, sequence, search=None):
+        args = ["--dump-keys", sequence]
+        if search is not None:
+            args += ["--search", search]
+        proc = self.run_binary(*args, extra_env={"QT_PASS_URL": base})
         return json.loads(proc.stdout)
 
     def three_rows(self):
@@ -2105,6 +2107,18 @@ class TestKeyboardHighlight(PassCase):
                       resume_url="quicktask://resume/j-live-20260904-120000-aaaaaa")],
             needs=[need("g-gate", "gate", can_run=True),
                    need("j-block", "blocked")],
+            item_url_template="http://127.0.0.1:8811/?item={item_id}"))
+
+    def search_rows(self):
+        """Five rows, two of which match a query of "audit", interleaved
+        with three that don't -- enough to tell "the first row" apart from
+        "the first row that matches"."""
+        return self.serve(payload=status_fixture(
+            needs=[need("n1", "gate", title="Ship the release notes"),
+                   need("n-audit-1", "gate", title="Audit the release process"),
+                   need("n2", "blocked", title="Write documentation"),
+                   need("n-audit-2", "blocked", title="Second audit item"),
+                   need("n3", "blocked", title="Clean up logs")],
             item_url_template="http://127.0.0.1:8811/?item={item_id}"))
 
     def test_visible_rows_are_the_rows_in_reading_order(self):
@@ -2176,6 +2190,43 @@ class TestKeyboardHighlight(PassCase):
         proc = self.run_binary("--dump-keys", "down,left",
                                extra_env={"QT_PASS_URL": base}, expect=1)
         self.assertIn("left", proc.stderr)
+
+    def test_search_narrows_the_walked_rows_to_the_matches(self):
+        """With a query typed, the arrows have to walk exactly the rows the
+        query left on screen, in their on-screen order -- not the full,
+        unfiltered list."""
+        base = self.search_rows()
+        k = self.keys(base, "down", search="audit")
+        self.assertEqual(k["visible_ids"], ["n-audit-1", "n-audit-2"])
+        self.assertEqual(k["highlight"], "n-audit-1")
+        self.assertEqual(k["primary_action"], "item")
+        self.assertEqual(k["primary_url"], "http://127.0.0.1:8811/?item=n-audit-1")
+
+    def test_return_reports_the_highlighted_matchs_action(self):
+        base = self.search_rows()
+        k = self.keys(base, "down,return", search="audit")
+        self.assertEqual(k["highlight"], "n-audit-1")
+        self.assertEqual(k["primary_action"], "item")
+        self.assertEqual(k["primary_url"], "http://127.0.0.1:8811/?item=n-audit-1")
+
+    def test_return_with_one_match_and_no_highlight_acts_on_it_directly(self):
+        """A query narrow enough to leave exactly one row is unambiguous
+        enough to act on without making the user highlight it first."""
+        base = self.search_rows()
+        k = self.keys(base, "return", search="second")
+        self.assertEqual(k["visible_ids"], ["n-audit-2"])
+        self.assertIsNone(k["highlight"])
+        self.assertEqual(k["primary_action"], "item")
+        self.assertEqual(k["primary_url"], "http://127.0.0.1:8811/?item=n-audit-2")
+
+    def test_return_with_several_matches_and_no_highlight_only_highlights_the_first(self):
+        """More than one match is not unambiguous enough to act on -- return
+        highlights the first match instead of guessing which one was meant."""
+        base = self.search_rows()
+        k = self.keys(base, "return", search="audit")
+        self.assertEqual(k["highlight"], "n-audit-1")
+        self.assertEqual(k["primary_action"], "item")
+        self.assertEqual(k["primary_url"], "http://127.0.0.1:8811/?item=n-audit-1")
 
 
 class TestCaptureLimits(ModelCase):

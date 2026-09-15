@@ -540,8 +540,23 @@ enum DumpModel {
 
     /// `--dump-keys down,down,up`: the highlight's landing place after a key
     /// sequence, over the same visible rows a freshly opened menu would show.
-    /// Anything but `up`/`down`/`escape`/`tab`/`cmd-1`/`cmd-2`/`cmd-return` is
-    /// refused rather than ignored, so a typo in a test is not a silent pass.
+    /// Anything but `up`/`down`/`return`/`escape`/`tab`/`cmd-1`/`cmd-2`/
+    /// `cmd-return` is refused rather than ignored, so a typo in a test is
+    /// not a silent pass.
+    ///
+    /// `--search <query>` narrows `ids` (and the row lookup) to the same
+    /// filtered model the search field draws from and the arrows walk in
+    /// MenuView, so a test can express "filter, then arrow, then return"
+    /// over exactly the rows that would be on screen.
+    ///
+    /// `return` mirrors the search field's own `.onSubmit` (`submitSearch`)
+    /// when nothing is highlighted yet: one visible row acts on it directly
+    /// -- reported through `primary_action`/`primary_url` without moving
+    /// `highlight`, the same way the field's return never shows a highlight
+    /// for a match it acted on outright -- more than one highlights the
+    /// first rather than guessing. A `return` with something already
+    /// highlighted is a no-op here: `primary_action`/`primary_url` already
+    /// report that row.
     ///
     /// `tab`, `cmd-1`, `cmd-2`, and `cmd-return` walk quick-fire's mode toggle
     /// exactly the way MenuView's own hidden buttons do (`toggleMode`,
@@ -559,9 +574,14 @@ enum DumpModel {
         }
         let config = StoreConfig.resolve()
         let now = Date()
-        let model = Feed.load(config: config, now: now)
+        let loaded = Feed.load(config: config, now: now)
+        let query = value(args, "--search") ?? ""
+        let model = loaded.filtered(query: query)
         let ids = defaultVisibleIDs(model, now: now)
         var highlight: String?
+        // The row a `return` acted on directly (the single-match case),
+        // reported without ever touching `highlight` -- see the doc comment.
+        var actedID: String?
         var keys: [String] = []
         var toPass = value(args, "--mode") == "pass"
         let draft = value(args, "--draft") ?? "sample text"
@@ -572,6 +592,14 @@ enum DumpModel {
             switch name {
             case "down": highlight = KeyboardNav.move(ids: ids, from: highlight, delta: 1)
             case "up": highlight = KeyboardNav.move(ids: ids, from: highlight, delta: -1)
+            case "return":
+                if highlight == nil {
+                    if ids.count == 1 {
+                        actedID = ids.first
+                    } else if let first = ids.first {
+                        highlight = first
+                    }
+                }
             case "escape": highlight = nil
             case "tab": toPass.toggle()
             case "cmd-1": toPass = false
@@ -579,11 +607,11 @@ enum DumpModel {
             case "cmd-return":
                 fired = FireResolve.describe(text: draft, toPass: !toPass, settings: config.settings)
             default:
-                return fail("unknown key: \(name) (down, up, escape, tab, cmd-1, cmd-2, cmd-return)")
+                return fail("unknown key: \(name) (down, up, return, escape, tab, cmd-1, cmd-2, cmd-return)")
             }
             keys.append(name)
         }
-        let row = model.records.first { $0.id == highlight }
+        let row = model.records.first { $0.id == (actedID ?? highlight) }
         return emit([
             "keys": keys,
             "visible_ids": ids,
