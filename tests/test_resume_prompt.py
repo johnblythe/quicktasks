@@ -390,7 +390,26 @@ class ResumeNoPromptStillInteractiveTests(unittest.TestCase):
         def fake_execvp(cmd, argv):
             self.execvp_calls.append((cmd, argv))
 
-        self.qt.os.execvp = fake_execvp
+        # cmd_resume() os.chdir()s into task["run_cwd"] (here, a directory
+        # inside self.tmp) *before* calling os.execvp -- harmless under a
+        # real execvp, which replaces the process image and never returns,
+        # but our fake_execvp below returns normally so that chdir sticks.
+        # Restore the real cwd, before self.tmp gets torn down out from
+        # under it, or every later test in the same process inherits a cwd
+        # pointing at a deleted directory (addCleanup runs LIFO, so
+        # registering this after self.tmp's cleanup above puts it first).
+        self.addCleanup(os.chdir, os.getcwd())
+
+        # self.qt.os is the real, process-wide `os` module (module imports
+        # are singletons keyed by name in sys.modules), so assigning to
+        # self.qt.os.execvp directly -- as this test used to -- patches
+        # os.execvp for every other test in the process, not just this
+        # module's private copy. patch.object() + addCleanup(patcher.stop)
+        # scopes the patch to this test and guarantees it is undone even on
+        # failure.
+        patcher = patch.object(self.qt.os, "execvp", fake_execvp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_bare_resume_still_calls_execvp_with_resume_and_session_id(self):
         with patch.object(sys, "argv", ["qt", "resume", self.tid]):
