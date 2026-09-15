@@ -1017,11 +1017,15 @@ def _seed_hub_item(hub_dir, item):
             pass
 
 
-def _hub_job_record(task, item_id, rc):
+def _hub_job_record(task, item_id, rc, thread=None):
     """Map a finished qt task onto a hub jobs/<slug>/job.json record, plus
     the RESULT.md body that goes with it. The hub understands done/failed/
     blocked directly; only qt's timeout status has no hub equivalent, so it
-    becomes failed with an explanatory error and a resume hint."""
+    becomes failed with an explanatory error and a resume hint.
+
+    `thread` is the Slack ts a headless resume's finish notice should post
+    under (see qt resume <id> --prompt); None for a plain fired task, which
+    has no preceding message to thread under."""
     status = task["status"]
     resume_hint = f"qt resume {task['id']}"
     job = {
@@ -1037,6 +1041,8 @@ def _hub_job_record(task, item_id, rc):
     }
     if rc is not None:
         job["rc"] = rc
+    if thread:
+        job["thread_ts"] = thread
 
     if status == "done":
         job["status"] = "done"
@@ -1060,12 +1066,12 @@ def _hub_job_record(task, item_id, rc):
     return job, body
 
 
-def _write_hub_job(hub_dir, task, rc):
+def _write_hub_job(hub_dir, task, rc, thread=None):
     item_id = f"qt-{task['id']}"
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
     jobdir = os.path.join(hub_dir, "jobs", f"{item_id}-{ts}")
     os.makedirs(os.path.join(jobdir, "output"), exist_ok=True)
-    job, body = _hub_job_record(task, item_id, rc)
+    job, body = _hub_job_record(task, item_id, rc, thread=thread)
     # RESULT.md lands before job.json claims a terminal status; a reader
     # scanning jobs/ must never see "done" with the result still missing.
     with open(os.path.join(jobdir, "output", "RESULT.md"), "w") as f:
@@ -1078,24 +1084,26 @@ def _write_hub_job(hub_dir, task, rc):
     return jobdir
 
 
-def _notify_hub_job(hub_dir, jobdir):
+def _notify_hub_job(hub_dir, jobdir, thread=None):
     """Ask the hub to post a Slack finish notice for this job via its own
     notice.py, which owns the policy (when to post, how to format) and is
     itself best-effort. A missing notice.py is a silent no-op, same as a
     hub not wired up for it at all -- qt doesn't decide notification
-    policy, it just invokes it. No --thread: a qt task has no preceding
-    fire message to thread under."""
+    policy, it just invokes it. `thread` (a Slack ts) is passed as
+    --thread when a headless resume gave one (qt resume <id> --prompt
+    --thread <ts>); omitted otherwise, since a plain fired task has no
+    preceding fire message to thread under."""
     notice_script = os.path.join(hub_dir, "notice.py")
     if not os.path.isfile(notice_script):
         return
+    argv = [sys.executable, notice_script, jobdir]
+    if thread:
+        argv += ["--thread", thread]
     # A short timeout: this sits between task completion and the local
     # osascript notify() at the end of the finish path, so a hung notice.py
     # would delay the thing John actually sees first. Slack sends are
     # sub-second; 10s is already generous.
-    subprocess.run(
-        [sys.executable, notice_script, jobdir],
-        capture_output=True, text=True, timeout=10, check=True,
-    )
+    subprocess.run(argv, capture_output=True, text=True, timeout=10, check=True)
 
 
 def _deliver_hub_job(hub_dir, jobdir):
@@ -1116,18 +1124,22 @@ def _deliver_hub_job(hub_dir, jobdir):
     )
 
 
-def _feed_hub(task, rc=None):
+def _feed_hub(task, rc=None, thread=None):
     """Mirror a finished task into The Pass's ledger so it surfaces in the
     Verify queue, hand it to the hub's deliver.py, and ask the hub to raise
     a Slack finish notice, when hub_dir is configured. Best-effort: this
     must never break a task, so every failure is caught and logged, never
-    raised."""
+    raised.
+
+    `thread` (a Slack ts) threads straight through to the new job.json and
+    the notice.py call -- see qt resume <id> --prompt --thread <ts>; None
+    for a plain fired task, unchanged from before this parameter existed."""
     hub_dir = resolve_hub_dir()
     if not hub_dir:
         return
     try:
         _seed_hub_item(hub_dir, _hub_item(task))
-        jobdir = _write_hub_job(hub_dir, task, rc)
+        jobdir = _write_hub_job(hub_dir, task, rc, thread=thread)
         try:
             # Delivery runs before the notice (see _deliver_hub_job) and is
             # independent of it: a stuck/broken deliver.py should not also
@@ -1144,7 +1156,7 @@ def _feed_hub(task, rc=None):
             # + RESULT.md); only the Slack notice can still fail, so it
             # gets its own message rather than "hub feed failed" pointing a
             # future debugger at the wrong subsystem.
-            _notify_hub_job(hub_dir, jobdir)
+            _notify_hub_job(hub_dir, jobdir, thread=thread)
         except Exception as e:
             try:
                 with open(os.path.join(LOGS_DIR, task["id"] + ".log"), "a") as f:
@@ -1170,6 +1182,44 @@ def _append_log(log_path, text):
             f.write(text)
     except OSError:
         pass
+
+
+def _parse_claude_run(stdout, stderr, rc):
+    """Parse a claude --output-format json run's stdout into the
+    status/result mapping shared by run_task() and headless resume's
+    post-run bookkeeping (qt resume <id> --prompt): (status, result_raw,
+    result_text, session_id, cost_usd, denials_out).
+
+    result_raw is the claude result text alone (stripped, possibly empty).
+    result_text is what gets persisted as the task's result: result_raw,
+    or -- when the run wasn't ok -- the tail of stderr as a fallback.
+    denials_out is the {"tool_name", "tool_input"} shape both callers
+    store on the task record."""
+    data = {}
+    for line in reversed(stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                data = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+
+    result_raw = (data.get("result") or "").strip()
+    denials = data.get("permission_denials") or []
+    ok = rc == 0 and not data.get("is_error", False)
+    if denials:
+        status = "blocked"
+    elif ok:
+        status = "done"
+    else:
+        status = "failed"
+    result_text = result_raw or (stderr.strip()[-300:] if not ok else "")
+    denials_out = [
+        {"tool_name": d.get("tool_name"), "tool_input": d.get("tool_input")}
+        for d in denials
+    ]
+    return status, result_raw, result_text, data.get("session_id"), data.get("total_cost_usd"), denials_out
 
 
 def run_task(tid, interactive=False):
@@ -1232,34 +1282,14 @@ def run_task(tid, interactive=False):
             text += "\n--- stderr ---\n" + stderr
         _append_log(log_path, text)
 
-        data = {}
-        for line in reversed(stdout.strip().splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    data = json.loads(line)
-                    break
-                except json.JSONDecodeError:
-                    continue
-
-        result = (data.get("result") or "").strip()
-        denials = data.get("permission_denials") or []
-        ok = rc == 0 and not data.get("is_error", False)
-        if denials:
-            status = "blocked"
-        elif ok:
-            status = "done"
-        else:
-            status = "failed"
+        status, result_raw, result_text, session_id, cost_usd, denials_out = \
+            _parse_claude_run(stdout, stderr, rc)
         task.update(
             status=status,
-            result=result or (stderr.strip()[-300:] if not ok else ""),
-            session_id=data.get("session_id"),
-            cost_usd=data.get("total_cost_usd"),
-            denials=[
-                {"tool_name": d.get("tool_name"), "tool_input": d.get("tool_input")}
-                for d in denials
-            ],
+            result=result_text,
+            session_id=session_id,
+            cost_usd=cost_usd,
+            denials=denials_out,
             finished=now(),
         )
         save(task)
@@ -1267,14 +1297,14 @@ def run_task(tid, interactive=False):
 
         if status == "blocked":
             if not interactive:
-                notify_blocked(task, denials)
+                notify_blocked(task, denials_out)
             return
         icon = "✓" if status == "done" else "✗"
         cost = f" · ${task['cost_usd']:.2f}" if task.get("cost_usd") else ""
         notify(
             f"Quicktask {icon}{cost}",
             task["prompt"],
-            result.splitlines()[0] if result else status,
+            result_raw.splitlines()[0] if result_raw else status,
         )
     except Exception as e:
         # General safety net: whatever broke, a task must never be left at
@@ -1367,6 +1397,156 @@ def cmd_resume(tid):
     if not claude:
         sys.exit("claude CLI not found on PATH")
     os.execvp(claude, [claude, "--resume", sid])
+
+
+def cmd_resume_prompt(fragment, prompt_text, thread=None):
+    """`qt resume <id> --prompt "<text>" [--thread <ts>]`: continue a
+    finished task's Claude session headlessly, with `prompt_text` as the
+    next user turn, then mirror the result into the hub as a new job (so
+    the hub can post the Slack finish notice threaded under `thread`).
+    This is what a Slack-thread reply drives, so it must work from a
+    minimal launchd/nohup environment with no tty -- unlike cmd_resume(),
+    it never execs an interactive `claude --resume`.
+
+    Refuses (non-zero exit, one-line message) when the task is currently
+    running or has no recorded session_id -- resuming either would either
+    race a live run or have nothing to resume."""
+    bootstrap()
+    tid = match_id(fragment)
+    task = load(tid)
+    if task.get("status") == "running":
+        sys.exit(f"qt resume: {tid} is currently running; wait for it to finish")
+    sid = task.get("session_id")
+    if not sid:
+        sys.exit(f"qt resume: no session id recorded for {tid} (status: {task['status']})")
+
+    started = now()
+    start_monotonic = time.monotonic()
+    _log_launch({
+        "ts": started, "outcome": "headless-start", "requested_terminal": "headless",
+        "branch": "headless", "id": tid, "prompt": prompt_text[:200], "thread": thread,
+    })
+
+    task["status"] = "running"
+    save(task)
+
+    def _elapsed():
+        return round(time.monotonic() - start_monotonic)
+
+    claude = find_claude()
+    if not claude:
+        previous = task.get("result") or ""
+        heading = (f"## Continuation {started}\n\n**Prompt:** {prompt_text}\n\n"
+                   "claude CLI not found")
+        task.update(status="failed", result=(f"{previous}\n\n{heading}" if previous else heading),
+                    finished=now())
+        save(task)
+        hub_task = dict(task, result="claude CLI not found")
+        _feed_hub(hub_task, rc=None, thread=thread)
+        notify("Quicktask continuation failed ✗", task["prompt"], "claude CLI not found")
+        _log_launch({
+            "ts": now(), "outcome": "headless-failed", "requested_terminal": "headless",
+            "branch": "headless", "id": tid, "rc": None, "elapsed": _elapsed(),
+        })
+        sys.exit("claude CLI not found on PATH")
+
+    cmd = [
+        claude, "-p", prompt_text,
+        "--output-format", "json",
+        "--permission-mode", task.get("perm_mode") or resolve_permissions(),
+        "--resume", sid,
+    ]
+    if task.get("model"):
+        cmd += ["--model", task["model"]]
+    settings_path = render_slack_guard_settings(tid)
+    if settings_path:
+        cmd += ["--settings", settings_path]
+
+    log_path = os.path.join(LOGS_DIR, tid + ".log")
+    run_cwd = task.get("run_cwd", WORKSPACE)
+    try:
+        try:
+            proc = subprocess.run(
+                cmd, cwd=run_cwd, capture_output=True, text=True, timeout=TIMEOUT
+            )
+            stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
+        except subprocess.TimeoutExpired as e:
+            stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            _append_log(log_path, stdout + f"\n--- continuation timed out after {TIMEOUT}s ---\n")
+            previous = task.get("result") or ""
+            heading = (f"## Continuation {started}\n\n**Prompt:** {prompt_text}\n\n"
+                       f"timed out after {TIMEOUT}s")
+            resumes = task.get("resumes") or []
+            resumes.append({"at": started, "prompt": prompt_text, "rc": None, "thread": thread})
+            task.update(status="timeout",
+                        result=(f"{previous}\n\n{heading}" if previous else heading),
+                        finished=now(), resumes=resumes)
+            save(task)
+            hub_task = dict(task, result=f"timed out after {TIMEOUT}s")
+            _feed_hub(hub_task, rc=None, thread=thread)
+            notify("Quicktask continuation timed out", task["prompt"],
+                   f"after {TIMEOUT}s · qt log {tid}")
+            _log_launch({
+                "ts": now(), "outcome": "headless-timeout", "requested_terminal": "headless",
+                "branch": "headless", "id": tid, "rc": None, "elapsed": _elapsed(),
+            })
+            return
+    finally:
+        if settings_path:
+            try:
+                os.remove(settings_path)
+            except OSError:
+                pass
+
+    text = stdout
+    if stderr:
+        text += "\n--- stderr ---\n" + stderr
+    _append_log(log_path, "\n--- continuation ---\n" + text)
+
+    status, result_raw, result_text, session_id, cost_usd, denials_out = \
+        _parse_claude_run(stdout, stderr, rc)
+
+    previous = task.get("result") or ""
+    heading = f"## Continuation {started}\n\n**Prompt:** {prompt_text}\n\n{result_text}"
+    resumes = task.get("resumes") or []
+    resumes.append({"at": started, "prompt": prompt_text, "rc": rc, "thread": thread})
+
+    task.update(
+        status=status,
+        result=(f"{previous}\n\n{heading}" if previous else heading),
+        session_id=session_id or sid,
+        cost_usd=cost_usd,
+        denials=denials_out,
+        finished=now(),
+        resumes=resumes,
+    )
+    save(task)
+
+    # The hub job for a continuation carries only this continuation's own
+    # result, not the accumulated task["result"] -- a fresh copy of the
+    # task record with result overridden, everything else (id, prompt,
+    # session_id, origin, ...) unchanged.
+    hub_task = dict(task, result=result_text)
+    _feed_hub(hub_task, rc=rc, thread=thread)
+
+    if status == "blocked":
+        notify_blocked(task, denials_out)
+    else:
+        icon = "✓" if status == "done" else "✗"
+        cost = f" · ${cost_usd:.2f}" if cost_usd else ""
+        notify(
+            f"Quicktask continued {icon}{cost}",
+            task["prompt"],
+            result_raw.splitlines()[0] if result_raw else status,
+        )
+
+    _log_launch({
+        "ts": now(), "outcome": f"headless-{status}", "requested_terminal": "headless",
+        "branch": "headless", "id": tid, "rc": rc, "elapsed": _elapsed(),
+    })
+
+    if status != "done":
+        sys.exit(1)
 
 
 def cmd_trust(path=None):
@@ -2218,6 +2398,9 @@ qt · fire-and-forget quicktasks for Claude Code
   qt log <id>            full record + raw log path (id fragments ok)
   qt resume-log [n]      last n resume-launch records (default 10)
   qt resume <id>         reopen a task as an interactive session
+  qt resume <id> --prompt "<text>" [--thread <ts>]
+                          continue headlessly with <text> as the next turn,
+                          mirrored into the hub; --prompt - reads stdin
   qt setup               pick terminal, trusted dirs, permission mode
   qt doctor              read-only environment health check
   qt install-handler     register quicktask:// links (clickable Slack resume)
@@ -2261,7 +2444,30 @@ def main():
         cmd_resume_log(args[1] if len(args) > 1 else 10)
     elif cmd == "resume" and len(args) > 1:
         bootstrap()
-        cmd_resume(match_id(args[1]))
+        fragment = args[1]
+        rest = args[2:]
+        prompt_text = None
+        thread = None
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--prompt":
+                if i + 1 >= len(rest):
+                    sys.exit("qt resume: --prompt needs text (or - to read stdin)")
+                prompt_text = rest[i + 1]
+                i += 2
+            elif rest[i] == "--thread":
+                if i + 1 >= len(rest):
+                    sys.exit("qt resume: --thread needs a value")
+                thread = rest[i + 1]
+                i += 2
+            else:
+                sys.exit("usage: qt resume <id> [--prompt <text>|- [--thread <ts>]]")
+        if prompt_text is not None:
+            if prompt_text == "-":
+                prompt_text = sys.stdin.read()
+            cmd_resume_prompt(fragment, prompt_text, thread=thread)
+        else:
+            cmd_resume(match_id(fragment))
     elif cmd == "setup":
         cmd_setup(args[1:])
     elif cmd == "doctor":
