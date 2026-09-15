@@ -113,7 +113,13 @@ if [ "$INSTALL" -eq 1 ]; then
     # own). Restart through launchd. A bare `open` here would start a second,
     # unmanaged instance next to the agent's: two dots in the menu bar, which
     # is exactly what --run used to do on a machine with the agent loaded.
-    launchctl kickstart -k "$AGENT_LABEL"
+    # bootout + bootstrap rather than `kickstart -k`: after the bundle on
+    # disk has been replaced, kickstart relaunches under the agent's old
+    # registration and macOS kills the new binary with a code-signing
+    # "Launch Constraint Violation" (SIGKILL, seen 2026-09-15). Re-registering
+    # the plist makes launchd pick up the new bundle cleanly.
+    launchctl bootout "$AGENT_LABEL" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "${AGENT_PLIST:-$HOME/Library/LaunchAgents/com.quicktasks.menubar.plist}"
     echo "restarted through the login agent ($AGENT_LABEL)."
   elif [ "$RUN" -eq 1 ]; then
     open "$TARGET"
