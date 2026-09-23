@@ -127,7 +127,25 @@ struct MenuView: View {
     /// The model the list draws: the controller's, narrowed to the search
     /// query. Everything below the header reads this; the header itself reads
     /// the controller's own model, so the count never moves while filtering.
-    private var model: MenuModel { controller.model.filtered(query: search) }
+    ///
+    /// Cached rather than recomputed on read: this used to be a computed
+    /// property that reran `filtered(query:)` (a full `RowFilter` pass,
+    /// re-folding every record's haystack) on every single access, and it is
+    /// read a dozen-plus times across one `body` evaluation. That meant
+    /// typing into quick-fire's *unrelated* draft field -- which reruns
+    /// `body` on every keystroke but never touches `search` -- still paid for
+    /// the search filter's full cost, repeatedly, per character. Recomputed
+    /// only in `.onChange(of: search)` and alongside the controller's own
+    /// model refresh, so a keystroke elsewhere is just a body re-evaluation
+    /// reading a stored value.
+    @State private var filteredModel: MenuModel
+    private var model: MenuModel { filteredModel }
+
+    init(controller: StatusController, onEscapeExhausted: (() -> Void)? = nil) {
+        self.controller = controller
+        self.onEscapeExhausted = onEscapeExhausted
+        self._filteredModel = State(initialValue: controller.model.filtered(query: ""))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -330,10 +348,19 @@ struct MenuView: View {
             return .handled
         }
         .onChange(of: controller.model.refreshedAt) { _, _ in
+            // The controller polled a fresh model: re-narrow it to whatever
+            // is currently typed, once, here -- not on every read below.
+            filteredModel = controller.model.filtered(query: search)
             // A highlight whose row has left the feed is dropped rather than
             // moved: the row under the cursor changing identity between polls
             // is how you act on the wrong thing.
             highlighted = KeyboardNav.survivor(ids: visibleIDs, current: highlighted)
+        }
+        .onChange(of: search) { _, newValue in
+            // The query changed: re-narrow the controller's current model
+            // once, here -- see `filteredModel`'s own doc comment for why
+            // this used to happen on every read instead.
+            filteredModel = controller.model.filtered(query: newValue)
         }
     }
 
@@ -1581,7 +1608,12 @@ struct FireDirectoryChip: View {
     }
 
     var body: some View {
-        let recents = RecentDirs.load(tasksDir: controller.config.tasksDir)
+        // Cached on the controller, refreshed at poll cadence off the main
+        // thread -- see `StatusController.recentDirs`. This used to call
+        // `RecentDirs.load` straight from here, scanning and JSON-parsing
+        // every task file on the main thread every time this view's body
+        // ran, which is every keystroke into quick-fire's own field.
+        let recents = controller.recentDirs
         Menu {
             ForEach(recents, id: \.self) { dir in
                 Button(Self.abbreviate(dir)) { commit(dir) }

@@ -46,6 +46,15 @@ final class StatusController: ObservableObject {
     /// without being relaunched. Two small file reads every five seconds, off
     /// the main thread with the poll itself.
     @Published private(set) var config: StoreConfig
+    /// The chip's recency menu (`RecentDirs.load`), resolved here alongside
+    /// `config` on every poll rather than read straight from
+    /// `FireDirectoryChip.body`. That used to mean opening and parsing every
+    /// task JSON under `tasksDir` -- ~126 files on a lived-in install -- on
+    /// the main thread each time the chip's view rendered, which is every
+    /// keystroke into quick-fire's own field, since that field's typing
+    /// reruns the whole `MenuView.body` and the chip sits in it
+    /// unconditionally.
+    @Published private(set) var recentDirs: [String] = []
     private let defaults: UserDefaults
     private var poll: Timer?
     private var ticker: Timer?
@@ -230,10 +239,14 @@ final class StatusController: ObservableObject {
             // dead port until the app is relaunched.
             let config = StoreConfig.resolve(probeDiscovery: true)
             let fresh = Feed.load(config: config, previous: previous)
+            // Same tasksDir scan the chip's menu used to run from `body`;
+            // done here instead, off the main thread, at poll cadence.
+            let dirs = RecentDirs.load(tasksDir: config.tasksDir)
             DispatchQueue.main.async {
                 self?.pollInFlight = false
                 self?.config = config
                 self?.model = fresh
+                self?.recentDirs = dirs
                 self?.now = Date()
                 // Health is diffed as an episode, not a raw transition: see
                 // HealthEpisodeTracker for the 45-second-or-files-only gate
