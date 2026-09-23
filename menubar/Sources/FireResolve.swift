@@ -122,6 +122,14 @@ enum FireResolve {
 /// most-recently-created task first, capped. A fixture ledger with entries
 /// missing `run_cwd` (a task filed before this field existed) is skipped
 /// rather than shown as a blank row.
+///
+/// Opens and JSON-parses every file under `tasksDir` -- cheap once, not
+/// cheap called from a view body. Call this from `StatusController.refresh()`
+/// (which already runs off the main thread and already reruns after a
+/// successful fire) and read the cached `StatusController.recentDirs` from
+/// the view; do not call `load` directly from `FireDirectoryChip.body` or
+/// any other `body` again -- that was the typing-lag bug (every keystroke
+/// re-scanned and re-parsed every task file on the main thread).
 enum RecentDirs {
     static func load(tasksDir: URL, cap: Int = 8) -> [String] {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: tasksDir.path) else {
