@@ -1,10 +1,10 @@
 // LoginItem.swift -- the footer's "Start at login" toggle.
 //
-// Does exactly what `./build.sh --agent` does, from inside the app: write
-// ~/Library/LaunchAgents/com.quicktasks.menubar.plist out of the same
-// template, with the real executable path substituted, then bootout and
-// bootstrap it. Turning it off boots it out and deletes the plist, so the
-// toggle is not a one-way door.
+// Writes ~/Library/LaunchAgents/com.quicktasks.menubar.plist out of the same
+// template `./build.sh --agent` uses, with the real executable path
+// substituted, and deletes it again when turned off. launchd loads that
+// directory at login, so the file alone is the whole switch. It never calls
+// launchctl: see `enable`/`disable` for why.
 //
 // KeepAlive stays false in the template on purpose: the dropdown's power
 // button is a real quit, and a KeepAlive agent would relaunch the widget three
@@ -34,17 +34,26 @@ enum LoginItem {
         FileManager.default.fileExists(atPath: plistPath(env: env).path)
     }
 
-    /// The executable the agent should launch. Prefers the installed copy
-    /// under ~/.quicktasks, matching what build.sh --agent registers, so
-    /// toggling this on from a build-directory run still points login at the
-    /// installed app rather than at a scratch build that may be deleted.
+    /// The executable the agent should launch. Prefers the installed copy at
+    /// ${QT_APP_DIR:-/Applications}/Quicktask.app, matching what build.sh's
+    /// install step writes, so toggling this on from a build-directory run
+    /// still points login at the installed app rather than at a scratch
+    /// build that may be deleted. Falls back to the pre-/Applications
+    /// install location under ~/.quicktasks for a machine that has not
+    /// rebuilt since that moved, then to whatever binary is actually running.
     static func targetExecutable(env: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+        let appDir = env["QT_APP_DIR"].flatMap { $0.isEmpty ? nil : $0 }
+            .map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            ?? URL(fileURLWithPath: "/Applications")
+        let installed = appDir
+            .appendingPathComponent("Quicktask.app/Contents/MacOS/QuicktaskStatus")
+        if FileManager.default.isExecutableFile(atPath: installed.path) { return installed }
         let dataDir = env["QT_DATA"].flatMap { $0.isEmpty ? nil : $0 }
             .map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".quicktasks")
-        let installed = dataDir
+        let legacy = dataDir
             .appendingPathComponent("QuicktaskStatus.app/Contents/MacOS/QuicktaskStatus")
-        if FileManager.default.isExecutableFile(atPath: installed.path) { return installed }
+        if FileManager.default.isExecutableFile(atPath: legacy.path) { return legacy }
         return URL(fileURLWithPath: ProcessInfo.processInfo.arguments.first
             ?? Bundle.main.executableURL?.path
             ?? installed.path)
@@ -62,19 +71,17 @@ enum LoginItem {
         if let forced = env["QT_MENUBAR_LOGINITEM_FORCE_FAIL"], !forced.isEmpty {
             return .failure(Problem(forced))
         }
-        // Test-only override, the success twin of the one above: a real
-        // success still writes the plist (safe -- the test-overridden
-        // QT_MENUBAR_AGENT_PLIST path, never the real LaunchAgents one) so
-        // isEnabled()'s read-back keeps telling the truth, but skips both
-        // launchctl calls, which use the constant `label` regardless of
-        // plist path and so could otherwise evict or replace a real login
-        // item loaded under the same name.
-        let skipLaunchctl = env["QT_MENUBAR_LOGINITEM_FORCE_OK"].map { !$0.isEmpty } ?? false
-        return enabled ? enable(env: env, skipLaunchctl: skipLaunchctl)
-                       : disable(env: env, skipLaunchctl: skipLaunchctl)
+        // QT_MENUBAR_LOGINITEM_FORCE_OK used to skip the launchctl calls here.
+        // There are none now, so it is accepted and ignored; a test's writes
+        // still land on its QT_MENUBAR_AGENT_PLIST override, never the real one.
+        return enabled ? enable(env: env) : disable(env: env)
     }
 
-    private static func enable(env: [String: String], skipLaunchctl: Bool = false) -> Result<Void, Problem> {
+    /// Writes the plist and stops there. Bootstrapping it on the spot, as
+    /// this used to, starts a second copy (RunAtLoad) when this one was
+    /// opened from Finder, and its bootout-first kills this very process when
+    /// it is the agent's own job, before the bootstrap ever runs.
+    private static func enable(env: [String: String]) -> Result<Void, Problem> {
         let plist = plistPath(env: env)
         let body = template().replacingOccurrences(of: "__EXECUTABLE__",
                                                    with: targetExecutable(env: env).path)
@@ -85,53 +92,23 @@ enum LoginItem {
         } catch {
             return .failure("could not write \(plist.path): \(error.localizedDescription)")
         }
-        guard !skipLaunchctl else { return .success(()) }
-        // bootout first, so a re-run picks up the new plist instead of
-        // silently keeping the previously loaded definition. It fails when
-        // nothing is loaded, which is the normal case and not an error.
-        _ = launchctl(["bootout", "gui/\(getuid())/\(label)"])
-        if case .failure(let problem) = launchctl(["bootstrap", "gui/\(getuid())", plist.path]) {
-            // The plist is on disk either way, so login will still work next
-            // time; only this session missed the bootstrap.
-            return .failure("wrote the plist but launchctl refused it: \(problem.message)")
-        }
         return .success(())
     }
 
-    private static func disable(env: [String: String], skipLaunchctl: Bool = false) -> Result<Void, Problem> {
+    /// Deletes the plist and never boots the agent out. When this process is
+    /// the agent's job -- the normal case after `build.sh --agent` -- a
+    /// bootout SIGTERMs it before the delete runs (2026-09-28: the switch
+    /// quit the widget, unloaded the agent, and left the plist behind, so
+    /// login would have started it anyway). With the file gone, a job still
+    /// loaded for this session is inert: KeepAlive is off and nothing loads
+    /// it again at the next login.
+    private static func disable(env: [String: String]) -> Result<Void, Problem> {
         let plist = plistPath(env: env)
-        if !skipLaunchctl { _ = launchctl(["bootout", "gui/\(getuid())/\(label)"]) }
-        if FileManager.default.fileExists(atPath: plist.path) {
-            do {
-                try FileManager.default.removeItem(at: plist)
-            } catch {
-                return .failure("booted it out but could not delete \(plist.path)")
-            }
-        }
-        return .success(())
-    }
-
-    @discardableResult
-    private static func launchctl(_ args: [String]) -> Result<Void, Problem> {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        p.arguments = args
-        let err = Pipe()
-        p.standardError = err
-        p.standardOutput = Pipe()
+        guard FileManager.default.fileExists(atPath: plist.path) else { return .success(()) }
         do {
-            try p.run()
+            try FileManager.default.removeItem(at: plist)
         } catch {
-            return .failure("could not run launchctl: \(error.localizedDescription)")
-        }
-        let detail = String(data: err.fileHandleForReading.readDataToEndOfFile(),
-                            encoding: .utf8) ?? ""
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
-            return .failure(Problem(trimmed.isEmpty
-                ? "launchctl exited \(p.terminationStatus)"
-                : trimmed))
+            return .failure("could not delete \(plist.path): \(error.localizedDescription)")
         }
         return .success(())
     }

@@ -541,17 +541,14 @@ struct MenuView: View {
                     .lineLimit(2)
             }
             HStack(spacing: 7) {
-                Picker("", selection: $controller.fireToPass) {
-                    Text("Run now").tag(false)
-                    Text("To Pass").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.small)
-                .disabled(fireState.isFiring)
-                .help("Run now fires it with qt, in the chip's folder. To Pass files it "
-                      + "as an item needing your go. Tab swaps the two; \u{2318}1/\u{2318}2 "
-                      + "pick one directly; \u{2318}\u{21A9} fires the other one once.")
+                // AppKit's own segmented control rather than
+                // `Picker(.segmented)`: see FireModeControl for the leak the
+                // picker caused.
+                FireModeControl(toPass: $controller.fireToPass)
+                    .disabled(fireState.isFiring)
+                    .help("Run now fires it with qt, in the chip's folder. To Pass files it "
+                          + "as an item needing your go. Tab swaps the two; \u{2318}1/\u{2318}2 "
+                          + "pick one directly; \u{2318}\u{21A9} fires the other one once.")
                 FireDirectoryChip(controller: controller)
             }
             Text("Tab swaps \u{00B7} \u{2318}\u{21A9} fires the other way")
@@ -1589,6 +1586,68 @@ struct FooterButton: View {
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
         .help(help)
+    }
+}
+
+/// Run now / To Pass: an NSSegmentedControl with plain string labels, bound
+/// to `StatusController.fireToPass`.
+///
+/// This used to be SwiftUI's `Picker(.segmented)`. On macOS 26 that picker
+/// hosts each segment's label in a nested SwiftUI graph, and AppKit sizes
+/// and draws those labels on every update of the view around them -- every
+/// poll, every ticker second, every keystroke, and in the cached summon
+/// panel even while it is hidden. A sample of a widget five days up
+/// (2026-09-28: 134.7 MB across ~1.08M live allocations) spent its idle
+/// main-thread time inside exactly those label graphs, cancelling and
+/// re-registering Observation tracking against a tracking set big enough
+/// that every cancel copied and freed it -- the signature of registrations
+/// that are never released, so each update left a little more behind for
+/// as long as the widget ran. String labels leave AppKit nothing of
+/// SwiftUI's to host, so there is nothing to register.
+struct FireModeControl: NSViewRepresentable {
+    @Binding var toPass: Bool
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let control = NSSegmentedControl(labels: ["Run now", "To Pass"],
+                                         trackingMode: .selectOne,
+                                         target: context.coordinator,
+                                         action: #selector(Coordinator.changed(_:)))
+        control.controlSize = .small
+        control.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small))
+        // Takes the row's spare width the way the SwiftUI picker did, rather
+        // than hugging its two labels.
+        control.segmentDistribution = .fillEqually
+        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        // A click must never pull focus off the quick-fire field: Tab, Return
+        // and the ⌘ shortcuts are SwiftUI onKeyPress handlers, which an
+        // AppKit first responder would swallow.
+        control.refusesFirstResponder = true
+        control.selectedSegment = toPass ? 1 : 0
+        return control
+    }
+
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        context.coordinator.toPass = $toPass
+        // Written only on a real change, so the poll-cadence updates that
+        // move nothing leave the control alone.
+        let segment = toPass ? 1 : 0
+        if control.selectedSegment != segment { control.selectedSegment = segment }
+        // `.disabled(...)` only reaches a representable through the
+        // environment; AppKit has to be told.
+        let enabled = context.environment.isEnabled
+        if control.isEnabled != enabled { control.isEnabled = enabled }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(toPass: $toPass) }
+
+    final class Coordinator: NSObject {
+        var toPass: Binding<Bool>
+
+        init(toPass: Binding<Bool>) { self.toPass = toPass }
+
+        @objc func changed(_ sender: NSSegmentedControl) {
+            toPass.wrappedValue = sender.selectedSegment == 1
+        }
     }
 }
 

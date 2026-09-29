@@ -54,7 +54,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MENUBAR_DIR = REPO_ROOT / "menubar"
 BUILD_SCRIPT = MENUBAR_DIR / "build.sh"
-BINARY = MENUBAR_DIR / "build" / "QuicktaskStatus.app" / "Contents" / "MacOS" / "QuicktaskStatus"
+BINARY = MENUBAR_DIR / "build" / "Quicktask.app" / "Contents" / "MacOS" / "QuicktaskStatus"
 
 _BUILD_ERROR = None
 
