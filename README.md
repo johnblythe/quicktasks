@@ -31,7 +31,7 @@ resume, and a refreshed-at footer.
 
 ```bash
 cd menubar
-./build.sh --run      # build, install to ~/.quicktasks, launch now
+./build.sh --run      # build, install to /Applications, launch now
 ./build.sh --agent    # ...and start it at every login
 ```
 

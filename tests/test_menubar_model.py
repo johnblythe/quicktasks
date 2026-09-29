@@ -54,7 +54,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MENUBAR_DIR = REPO_ROOT / "menubar"
 BUILD_SCRIPT = MENUBAR_DIR / "build.sh"
-BINARY = MENUBAR_DIR / "build" / "QuicktaskStatus.app" / "Contents" / "MacOS" / "QuicktaskStatus"
+BINARY = MENUBAR_DIR / "build" / "Quicktask.app" / "Contents" / "MacOS" / "QuicktaskStatus"
 
 _BUILD_ERROR = None
 
@@ -3260,8 +3260,10 @@ class TestOutcomeQueue(SettingsSuiteCase):
 class TestLoginItemOutcome(SettingsSuiteCase):
     """`login-on`/`login-off` drive StatusController.setLoginItem exactly as
     the Settings window's "Start at login" toggle does.
-    QT_MENUBAR_LOGINITEM_FORCE_OK/_FAIL keep both the plist write and the
-    launchctl call away from anything real -- see LoginItem.swift."""
+    The switch calls no launchctl, and its plist write lands on the suite's
+    QT_MENUBAR_AGENT_PLIST scratch path, never the real LaunchAgents one;
+    _FORCE_FAIL forces the failure path and _FORCE_OK is ignored -- see
+    LoginItem.swift."""
 
     def outcomes(self, sequence, extra_env=None):
         return json.loads(

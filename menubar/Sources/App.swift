@@ -7,8 +7,12 @@ import AppKit
 /// preferences the dropdown remembers between openings.
 final class StatusController: ObservableObject {
     @Published private(set) var model: MenuModel
-    /// Ticks once a second while anything is in flight, so an open menu counts
-    /// elapsed time up instead of freezing between five-second polls.
+    /// Ticks once a second while anything is in flight and the dropdown or
+    /// the summon panel is on screen, so an open menu counts elapsed time up
+    /// instead of freezing between five-second polls. Nothing draws it while
+    /// both are closed, and every tick re-renders every live MenuView --
+    /// the cached summon panel's included, hidden or not -- so it rests
+    /// then; showing either window stamps it fresh first.
     @Published private(set) var now: Date = Date()
     /// Section keys the user has collapsed. Remembered in UserDefaults.
     @Published private(set) var collapsed: Set<String>
@@ -132,6 +136,16 @@ final class StatusController: ObservableObject {
     /// own dropdown.
     private var hotkeyPanel: NSPanel?
 
+    /// What a second launch posts (`SingleInstanceGuard.enforceOrExit()`,
+    /// called from `Entry.main` before any UI is built) to ask the one real,
+    /// already-running instance to show itself instead of building a second
+    /// one. `init` below listens for it and calls `showHotkeyPanel()` -- the
+    /// same call the summon hotkey and a clicked notification already make --
+    /// so opening the app a second time from Finder, Spotlight, or a stray
+    /// `open Quicktask.app` behaves like pressing the summon hotkey rather
+    /// than doing nothing or drawing a second menu-bar dot.
+    static let showRequestNotification = Notification.Name("com.quicktasks.menubar.show")
+
     init(config: StoreConfig = .resolve(),
          interval: TimeInterval? = nil,
          defaults: UserDefaults = Keys.store(),
@@ -174,7 +188,7 @@ final class StatusController: ObservableObject {
         poll = p
 
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self, self.hasLiveRows else { return }
+            guard let self, self.hasLiveRows, self.anyWindowVisible else { return }
             self.now = Date()
         }
         t.tolerance = 0.2
@@ -189,6 +203,14 @@ final class StatusController: ObservableObject {
             let hotkey = GlobalHotkey { [weak self] in self?.toggleHotkeyPanel() }
             hotkey.register(config.settings.hotkeyCombo)
             globalHotkey = hotkey
+            // Gated the same as the hotkey itself: no seam that passes
+            // activatesGlobalHotkey: false (a snapshot, a --dump-* seam, a
+            // test) should react to a distributed notification either --
+            // see `showRequestNotification`'s own doc comment for who posts
+            // this and why.
+            DistributedNotificationCenter.default().addObserver(
+                forName: Self.showRequestNotification, object: nil, queue: .main
+            ) { [weak self] _ in self?.showHotkeyPanel() }
         }
         // Clicking a notification shows the dropdown "if achievable" -- for
         // this app that is the summon panel, since a MenuBarExtra's own
@@ -386,7 +408,11 @@ final class StatusController: ObservableObject {
     /// summon panel's own visibility is already tracked through
     /// `hotkeyPanel`, so this only needs to cover the one window AppKit has
     /// no query for.
-    func dropdownDidAppear() { dropdownVisible = true }
+    func dropdownDidAppear() {
+        dropdownVisible = true
+        // Same reason as `showHotkeyPanel`: the ticker rested while closed.
+        now = Date()
+    }
 
     func dropdownDidDisappear() { dropdownVisible = false }
 
@@ -450,6 +476,9 @@ final class StatusController: ObservableObject {
     /// screen reader or window switcher sees it as a distinct window titled
     /// "Quicktask Quick Fire" rather than as the menu-bar extra's dropdown.
     func showHotkeyPanel() {
+        // The ticker rests while nothing is on screen (see `now`), so the
+        // panel's stopwatches and freshness line start from the real time.
+        now = Date()
         if let panel = hotkeyPanel {
             NSApp.activate(ignoringOtherApps: true)
             positionNearStatusItem(panel)
@@ -649,7 +678,51 @@ final class StatusController: ObservableObject {
     }
 }
 
+/// Guards the UI launch path only. Every `--dump-*`/`--post-*`/`--snapshot*`/
+/// `--help` seam in `Entry.main` below already calls `exit(...)` before
+/// reaching the one line that calls this, so checking here -- rather than
+/// threading a flag through `QuicktaskStatusApp.main()` -- catches exactly
+/// "this is a normal, UI-bound launch" with nothing else to keep in sync.
+///
+/// If another live instance of this bundle is already running -- a second
+/// Finder double-click, a Spotlight open, a stray `open Quicktask.app` while
+/// the login-agent copy is up -- this one asks that instance to show itself
+/// (`StatusController.showRequestNotification`, observed in `init`) and exits
+/// before creating a status item, a menu-bar dot, or claiming the global
+/// hotkey. Without this, opening the app while it is already running would
+/// either draw a second dot in the menu bar or silently do nothing.
+enum SingleInstanceGuard {
+    static func enforceOrExit() {
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: LoginItem.label)
+            .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+                     && !$0.isTerminated }
+        guard !others.isEmpty else { return }
+        DistributedNotificationCenter.default().postNotificationName(
+            StatusController.showRequestNotification, object: nil, userInfo: nil,
+            deliverImmediately: true)
+        exit(0)
+    }
+}
+
+/// The other half of "opening the app again shows it". A Finder double-click
+/// or Spotlight open of a bundle that is already running usually never
+/// starts a second process for SingleInstanceGuard to catch: LaunchServices
+/// sends the running copy a reopen event instead, and a MenuBarExtra-only
+/// app has no window for SwiftUI to bring forward, so it would do nothing.
+/// Answering it with the same show request the guard posts keeps one path.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        DistributedNotificationCenter.default().postNotificationName(
+            StatusController.showRequestNotification, object: nil, userInfo: nil,
+            deliverImmediately: true)
+        return false
+    }
+}
+
 struct QuicktaskStatusApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var controller = StatusController()
 
     /// Mirrors IconHealth.of's own inputs exactly, the same rule the dot,
@@ -767,6 +840,8 @@ enum Entry {
                                       overrides the directory chip's own last choice
                                       (default $HOME)
               QT_MENUBAR_AGENT_PLIST  LaunchAgent plist (default ~/Library/LaunchAgents)
+              QT_APP_DIR              where Quicktask.app installs (default /Applications);
+                                      also where LoginItem looks for it first
             """)
             return
         }
@@ -846,6 +921,10 @@ enum Entry {
             exit(Snapshot.run(path: args[i + 1]))
         }
         if args.contains("--dump-layout") { exit(LayoutProbe.run()) }
+        // Every seam above exits before this line, so this is reached only
+        // by a normal, UI-bound launch -- exactly the case the guard needs
+        // to cover. See SingleInstanceGuard's own doc comment.
+        SingleInstanceGuard.enforceOrExit()
         QuicktaskStatusApp.main()
     }
 }

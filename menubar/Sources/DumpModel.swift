@@ -793,9 +793,10 @@ enum DumpModel {
     ///   mark-seen                scheduleMarkOutcomesSeen(after: --seen-after,
     ///                            default 2) -- settles past it automatically
     ///   login-on / login-off     setLoginItem(true/false) -- pair with
-    ///                            QT_MENUBAR_LOGINITEM_FORCE_OK or
-    ///                            QT_MENUBAR_LOGINITEM_FORCE_FAIL so nothing
-    ///                            real is ever touched
+    ///                            QT_MENUBAR_AGENT_PLIST at a scratch path so
+    ///                            nothing real is ever touched (the switch
+    ///                            writes that file and calls no launchctl);
+    ///                            QT_MENUBAR_LOGINITEM_FORCE_FAIL forces failure
     ///   restart                  restartPass -- pair with an explicit
     ///                            QT_PASS_URL (a fixture or a dead loopback
     ///                            port), the same discipline every other

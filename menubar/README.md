@@ -41,14 +41,20 @@ project, no SwiftPM manifest, no signing identity, no Python packages.
 
 ```bash
 cd menubar
-./build.sh --run     # build, install to ~/.quicktasks, launch now
+./build.sh --run     # build, install to /Applications, launch now
 ./build.sh --agent   # ...and start it at login
 ```
 
-`build.sh` compiles the sources with `swiftc`, assembles
-`QuicktaskStatus.app`, writes its `Info.plist` (`LSUIElement`, so no Dock icon
-or app-switcher entry), copies the LaunchAgent template into the bundle,
-ad-hoc signs it, and copies it to `~/.quicktasks/QuicktaskStatus.app`.
+`build.sh` compiles the sources with `swiftc`, assembles `Quicktask.app`
+(the executable inside it keeps the name `QuicktaskStatus`, so CLI seams and
+docs stay valid), writes its `Info.plist` (`LSUIElement`, so no Dock icon or
+app-switcher entry), copies the LaunchAgent template into the bundle, ad-hoc
+signs it, and copies it to `/Applications/Quicktask.app` -- overridable with
+`QT_APP_DIR`. That is separate from `QT_DATA` (default `~/.quicktasks`),
+which stays the data dir for tasks, logs, config, and
+`QuicktaskResume.app`, and no longer holds the widget itself. A pre-existing
+install under the old `~/.quicktasks/QuicktaskStatus.app` path is removed on
+the next `build.sh` run, so login can never start a stale copy from there.
 
 Other flags:
 
@@ -58,17 +64,25 @@ Other flags:
 | `--run` | Install and launch immediately. |
 | `--agent` | Install a LaunchAgent that starts it at login. |
 
+Opening the app again while it is already running -- from Finder, Spotlight,
+or a stray `open`ing of the bundle -- does not draw a second menu-bar dot: it
+asks the one running instance to show the same quick-fire panel `⌥Q` opens,
+then exits.
+
 ### Starting it at login
 
 Either `./build.sh --agent` or the footer's **Start at login** switch writes
 `~/Library/LaunchAgents/com.quicktasks.menubar.plist` from the template in this
-directory and bootstraps it. Both read the same template -- the toggle reads it
+directory. `build.sh` also bootstraps it; the switch leaves that to the next
+login, since a bootout or bootstrap from inside the app would kill or double
+the running widget. Both read the same template -- the toggle reads it
 out of the app bundle, which is why `build.sh` copies it in -- so the two
 cannot drift. `KeepAlive` is deliberately off, so the dropdown's power button is
 a real quit and the widget comes back at the next login rather than three
 seconds later.
 
-Turning the switch off boots the agent out and deletes the plist. By hand:
+Turning the switch off deletes the plist, so the next login starts nothing; the
+widget keeps running until you quit it. To also unload the agent now, by hand:
 
 ```bash
 launchctl bootout "gui/$(id -u)/com.quicktasks.menubar"
@@ -76,7 +90,7 @@ rm ~/Library/LaunchAgents/com.quicktasks.menubar.plist
 ```
 
 If you would rather use a login item: System Settings → General → Login Items
-→ **+** → `~/.quicktasks/QuicktaskStatus.app`.
+→ **+** → `/Applications/Quicktask.app`.
 
 ## Using it
 
@@ -630,6 +644,7 @@ Environment:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `QT_DATA` | `~/.quicktasks` | quicktasks data dir |
+| `QT_APP_DIR` | `/Applications` | where `build.sh` installs `Quicktask.app`, and the first place the login switch and `--agent` look for it |
 | `QT_HUB` | `config.json`'s `hub_dir` | hub checkout; empty means the hub feed is off. Also where `.pass-url` is read from, and the hub dir `.pass-url` targets are checked against |
 | `QT_PASS_URL` | discovery: 8811, else `.pass-url` for this hub, else the file ledgers | The Pass's base URL; taken as given and never falls back past it. Empty pins the widget to the file ledgers |
 | `QT_PASS_DEFAULT_URL` | `http://127.0.0.1:8811` | The address discovery probes first; a test seam so 8811-probing never has to touch a real Pass |
@@ -637,8 +652,8 @@ Environment:
 | `QT_MENUBAR_FIRE_DIR` | the directory chip's own choice, else `$HOME` | working directory for quick-fired tasks; outranks the chip, loses to a typed `--in`/`@` prefix |
 | `QT_MENUBAR_AGENT_PLIST` | `~/Library/LaunchAgents/…` | LaunchAgent path the login switch reads and writes |
 | `QT_MENUBAR_DEFAULTS_SUITE` | the app's own | preferences domain for every stored setting -- the remembered collapse/toggle state, the directory chip's last choice, and the summon hotkey combo |
-| `QT_MENUBAR_LOGINITEM_FORCE_OK` | unset | non-empty skips the real `launchctl` call and reports success, so the login-item outcome (and its Settings toggle) can be tested without touching a real LaunchAgent |
-| `QT_MENUBAR_LOGINITEM_FORCE_FAIL` | unset | non-empty fails the toggle before `launchctl` runs, so the toggle's revert-on-failure path is testable on demand |
+| `QT_MENUBAR_LOGINITEM_FORCE_OK` | unset | accepted and ignored: the switch no longer calls `launchctl`, so there is nothing to skip; point `QT_MENUBAR_AGENT_PLIST` at a scratch path instead |
+| `QT_MENUBAR_LOGINITEM_FORCE_FAIL` | unset | non-empty fails the toggle before it touches the plist, so the toggle's revert-on-failure path is testable on demand |
 
 The last four exist so a test or a snapshot can exercise the login read-back,
 the login-item toggle's success and failure outcomes, and the remembered
@@ -728,9 +743,9 @@ LaunchAgent, calls `launchctl`, posts to a real Pass, touches the app's real
 preferences, or posts a real macOS notification: `--dump-outcomes` always
 builds its `StatusController` the same way `--snapshot` does, which is what
 pins it to the `RecordingNotifier` double rather than `SystemNotifier`, and
-the login-item and restart outcome tests force their result through
-`QT_MENUBAR_LOGINITEM_FORCE_OK`/`_FORCE_FAIL` rather than a real `launchctl`
-round trip.
+the login-item outcome tests point `QT_MENUBAR_AGENT_PLIST` at a scratch path
+(the switch calls no `launchctl`) and force failures through
+`QT_MENUBAR_LOGINITEM_FORCE_FAIL`.
 
 The module skips rather than fails when `swiftc` is unavailable.
 
