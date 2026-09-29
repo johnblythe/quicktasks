@@ -35,7 +35,7 @@ for arg in "$@"; do
     --no-install) INSTALL=0 ;;
     --run) RUN=1 ;;
     --agent) AGENT=1 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done

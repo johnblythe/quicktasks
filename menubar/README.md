@@ -743,9 +743,9 @@ LaunchAgent, calls `launchctl`, posts to a real Pass, touches the app's real
 preferences, or posts a real macOS notification: `--dump-outcomes` always
 builds its `StatusController` the same way `--snapshot` does, which is what
 pins it to the `RecordingNotifier` double rather than `SystemNotifier`, and
-the login-item and restart outcome tests force their result through
-`QT_MENUBAR_LOGINITEM_FORCE_OK`/`_FORCE_FAIL` rather than a real `launchctl`
-round trip.
+the login-item outcome tests point `QT_MENUBAR_AGENT_PLIST` at a scratch path
+(the switch calls no `launchctl`) and force failures through
+`QT_MENUBAR_LOGINITEM_FORCE_FAIL`.
 
 The module skips rather than fails when `swiftc` is unavailable.
 
