@@ -29,6 +29,7 @@ Permissions model:
 """
 
 import datetime
+import glob
 import json
 import os
 import plistlib
@@ -969,9 +970,170 @@ def task_prompt(task):
         "Only relevant if the task references the current directory or repo.)"
         f"\n\n(Your quicktask id is {tid}. If you post any Slack message as part "
         "of this task, end that message with this exact final line:\n"
-        f"↩ resume: `qt resume {tid}` · <quicktask://resume/{tid}|open in terminal>\n"
+        f"{_resume_footer(tid)}\n"
         "Slack messages only; do not add this line to your final result text.)"
     )
+
+
+def _resume_footer(tid):
+    """The closing line of every Slack message a task posts: the model's own
+    (per task_prompt()) and the shell's DM fallback below."""
+    return f"↩ resume: `qt resume {tid}` · <quicktask://resume/{tid}|open in terminal>"
+
+
+# --- DM fallback ----------------------------------------------------------
+# "Model proposes, shell acts": task_prompt() tells the model to DM the owner
+# when the task says so, but a run can finish cleanly without ever calling
+# the send tool (2026-10-26: "read this and send me a simple ELI5 summary"
+# ended `done` with the summary only in the result text, and the hub
+# auto-closed it as delivered, so the owner never saw it). _dm_fallback()
+# runs between the claude run and the hub feed and sends the result itself
+# when a DM was asked for and the session transcript shows none went out.
+
+CLAUDE_PROJECTS_DIR = os.path.join(
+    os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")), "projects"
+)
+
+# An imperative verb aimed at the owner, the same wording task_prompt()'s own
+# note uses ("Slack, DM, or message the owner or me"). Literal on purpose;
+# a verb right after a negation ("don't dm me") doesn't count.
+_DM_ASK_RE = re.compile(r"\b(?:send|dm|slack|message|ping)\s+(?:me|the owner)\b", re.I)
+_DM_NEGATION_RE = re.compile(r"(?:don['’]?t|do not|never|no need to)\s+(?:\w+\s+)?$", re.I)
+_DM_FALLBACK_HEADER = "_Sent by qt: the run finished without DMing you._"
+
+
+def _asks_for_dm(prompt):
+    """True when the task text asks for a DM to its owner ("send me", "dm me",
+    "slack me", "message me", "ping me", or the same aimed at "the owner")."""
+    prompt = prompt or ""
+    for m in _DM_ASK_RE.finditer(prompt):
+        if not _DM_NEGATION_RE.search(prompt[max(0, m.start() - 24):m.start()]):
+            return True
+    return False
+
+
+def _is_slack_send_tool(name):
+    """A tool the PreToolUse guard already treats as Slack (SLACK_GUARD_MATCHER)
+    whose own name, past the server prefix, sends or schedules a message:
+    ld_slack_send, slack_send_message, ld_slack_schedule. Not a read (search,
+    history, user_by_email) and not a draft, since neither reaches anyone."""
+    name = name or ""
+    tool = name.rsplit("__", 1)[-1]
+    return (bool(re.match(SLACK_GUARD_MATCHER, name))
+            and bool(re.search(r"send|schedule", tool))
+            and not tool.endswith("draft"))
+
+
+def _slack_send_in_transcript(session_id):
+    """Did the claude session issue a Slack send that didn't error? True or
+    False when the transcript (~/.claude/projects/*/<session_id>.jsonl) was
+    read; None when there's no session id or no transcript to read (unknown,
+    which _dm_fallback() has to decide how to treat)."""
+    if not session_id:
+        return None
+    hits = glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*", glob.escape(session_id) + ".jsonl"))
+    if not hits:
+        return None
+    sends, errored = set(), set()
+    try:
+        with open(hits[0], errors="replace") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = rec.get("message") if isinstance(rec, dict) else None
+                content = msg.get("content") if isinstance(msg, dict) else None
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use" and _is_slack_send_tool(block.get("name")):
+                        sends.add(block.get("id"))
+                    elif block.get("type") == "tool_result" and block.get("is_error"):
+                        errored.add(block.get("tool_use_id"))
+    except OSError:
+        return None
+    # A send whose result came back as an error (guard denial, Slack API
+    # error) delivered nothing, so it doesn't count.
+    return bool(sends - errored)
+
+
+def _send_owner_dm(owner_id, text):
+    """Send `text` as one DM to Slack user id `owner_id` from the shell, no
+    model involved. Hub configured: through the hub's pass-slack.py, the same
+    path (and destination policy: the owner's DM is always allowed) the hub's
+    own Slack posts use -- the Pass bot when a token exists, otherwise the
+    owner via the ld CLI. Otherwise the ld CLI named by config.json's
+    "ld_cli" (a bare `ld` on PATH is the system linker, so never looked up).
+    Raises RuntimeError with the reason on any failure."""
+    hub_dir = resolve_hub_dir()
+    pass_slack = os.path.join(hub_dir, "pass-slack.py") if hub_dir else None
+    if pass_slack and os.path.isfile(pass_slack):
+        argv = [sys.executable, pass_slack, "send", owner_id, text]
+    else:
+        ld_cli = load_config().get("ld_cli")
+        if not ld_cli:
+            raise RuntimeError("no way to send: hub has no pass-slack.py and config.json has no ld_cli")
+        argv = [os.path.expanduser(ld_cli), "slack", "send", "--", owner_id, text]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        # Not str(e): that would carry the whole message text.
+        raise RuntimeError("send timed out after 30s")
+    if proc.returncode != 0:
+        raise RuntimeError(f"send exited {proc.returncode}: {proc.stderr.strip()[-200:]}")
+
+
+def _dm_fallback(task, log_path):
+    """If the task asked for a DM and the model never sent one, DM the
+    result to the owner from the shell. Runs after a finished claude run and
+    before the hub feed, so the DM lands before the item can auto-close.
+
+    Only for a done task with a non-empty result and a resolvable owner id.
+    A transcript that can't be found counts as "not sent": a duplicate DM
+    to the owner costs less than a requested one that never arrives, and
+    the result is all this has to go on. Records "dm_fallback" ("sent" or
+    "failed: <reason>") on the task only when a send was attempted. A failed
+    send raises a notification instead of staying quiet. Never raises and
+    never changes the task's status."""
+    tid = task["id"]
+    try:
+        if task.get("status") != "done" or not _asks_for_dm(task.get("prompt")):
+            return
+        owner_id = resolve_owner_slack_id()
+        result = (task.get("result") or "").strip()
+        if not owner_id or not result:
+            return
+        sent = _slack_send_in_transcript(task.get("session_id"))
+        if sent:
+            _append_log(log_path, "\n--- dm fallback skipped: model already sent a Slack message ---\n")
+            return
+        if sent is None:
+            _append_log(log_path, "\n--- dm fallback: no session transcript found, assuming no DM was sent ---\n")
+        # The header says where this came from, and keeps a result that
+        # opens with a "-" bullet from reaching ld's argv as a flag (the
+        # hub's pass-slack.py passes the text positionally, no "--").
+        _send_owner_dm(owner_id, f"{_DM_FALLBACK_HEADER}\n\n{result}\n\n{_resume_footer(tid)}")
+        task["dm_fallback"] = "sent"
+        _append_log(log_path, "\n--- dm fallback sent ---\n")
+    except Exception as e:
+        reason = (str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}")[:300]
+        task["dm_fallback"] = f"failed: {reason}"
+        _append_log(log_path, f"\n--- dm fallback failed: {reason} ---\n")
+        # Own subtitle, not the bare prompt: terminal-notifier groups by
+        # subtitle, and the normal "Quicktask ✓" notice that follows would
+        # replace this one in Notification Center.
+        execute = "{} {} _resume-launch {}".format(
+            shlex.quote(sys.executable), shlex.quote(os.path.abspath(__file__)), shlex.quote(tid)
+        )
+        notify(
+            "Quicktask ✗ DM not sent",
+            "DM not sent: " + task["prompt"],
+            f"Result not DM'd, open with qt resume {tid} · click to resume",
+            execute=execute,
+        )
+    if task.get("dm_fallback"):
+        save(task)
 
 
 # --- hub feed -------------------------------------------------------------
@@ -1293,6 +1455,9 @@ def run_task(tid, interactive=False):
             finished=now(),
         )
         save(task)
+        # Before the hub feed: the DM must land before deliver.py can
+        # auto-close the item as delivered.
+        _dm_fallback(task, log_path)
         _feed_hub(task, rc=rc)
 
         if status == "blocked":
