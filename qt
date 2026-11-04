@@ -38,6 +38,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 import tempfile
 import time
 
@@ -405,10 +406,78 @@ def detect_terminals():
 
 # --- notifications ------------------------------------------------------
 
-def notify(title, subtitle, body, execute=None):
-    """App-style via terminal-notifier when present; osascript fallback.
-    `execute` = shell string run when the notification is clicked."""
+_MENUBAR_RUNNING_CACHE = None
+
+
+def _menubar_running():
+    """True when the Quicktask menubar app (the notification authority) is
+    up -- the process name is build.sh's EXEC_NAME (QuicktaskStatus); a
+    rename there must update this probe. Any error means 'not running' so
+    notify() falls through to terminal-notifier/osascript rather than
+    dropping banners into an inbox nobody is watching. pgrep answers in
+    milliseconds; the 1s timeout keeps the worst-case notify budget tight."""
     try:
+        return subprocess.run(["pgrep", "-xq", "QuicktaskStatus"],
+                              capture_output=True, timeout=1).returncode == 0
+    except Exception:
+        return False
+
+
+def _menubar_running_cached():
+    """One probe per process: a finish path can ask twice (notify_blocked's
+    branch choice, then notify's inbox drop), and the answer cannot
+    usefully change in between (2026-11-03 review)."""
+    global _MENUBAR_RUNNING_CACHE
+    if _MENUBAR_RUNNING_CACHE is None:
+        _MENUBAR_RUNNING_CACHE = _menubar_running()
+    return _MENUBAR_RUNNING_CACHE
+
+
+def _drop_notify_inbox(title, subtitle, body, kind=None, task_id=None,
+                       denied_tools=None):
+    """Hand the banner to the menubar app's notify inbox (see
+    menubar/Sources/NotifyInbox.swift for the JSON contract): one atomic
+    tmp+rename drop and the app posts it under its own bundle identity
+    with Resume / Always allow / Open in Pass buttons -- the 2026-10-28
+    answer to osascript banners whose click opened Script Editor. False
+    when the app is not running or anything goes wrong."""
+    try:
+        # Kill-switch: tests (where the dev machine's real menubar app would
+        # otherwise swallow banners the test expects to observe) and anyone
+        # who wants the Python paths to fire their own banners again.
+        if os.environ.get("QT_NOTIFY_INBOX") == "0":
+            return False
+        if not _menubar_running_cached():
+            return False
+        inbox = os.path.join(QT_DATA, "notify-inbox")
+        os.makedirs(inbox, exist_ok=True)
+        payload = {"title": title, "subtitle": subtitle, "body": body,
+                   "kind": kind or "info", "source": "qt"}
+        if task_id:
+            payload["task_id"] = task_id
+        if denied_tools:
+            payload["denied_tools"] = list(denied_tools)
+        name = uuid.uuid4().hex + ".json"
+        tmp = os.path.join(inbox, name + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, os.path.join(inbox, name))
+        return True
+    except Exception:
+        return False
+
+
+def notify(title, subtitle, body, execute=None, kind=None, task_id=None,
+           denied_tools=None):
+    """Menubar inbox first (actionable banners under the app's identity),
+    then app-style via terminal-notifier when configured; osascript last.
+    `execute` = shell string run when the notification is clicked
+    (terminal-notifier path only -- the menubar derives its own actions
+    from kind/task_id/denied_tools)."""
+    try:
+        if _drop_notify_inbox(title, subtitle, body, kind=kind,
+                              task_id=task_id, denied_tools=denied_tools):
+            return
         tn = find_notifier()
         if tn:
             cmd = [tn, "-title", title, "-subtitle", subtitle[:60],
@@ -862,7 +931,9 @@ def launch_test_terminal():
 
 def notify_blocked(task, denials):
     names = ", ".join(sorted({d.get("tool_name", "?") for d in denials})) or "a tool call"
-    if find_notifier():
+    tools = sorted({d.get("tool_name", "?") for d in denials})
+    # Probe once, not twice (notify() re-probes inside _drop_notify_inbox).
+    if find_notifier() or _menubar_running_cached():
         qt_bin = os.path.abspath(__file__)
         execute = "{} {} _resume-launch {}".format(
             shlex.quote(sys.executable), shlex.quote(qt_bin), shlex.quote(task["id"])
@@ -873,6 +944,7 @@ def notify_blocked(task, denials):
             task["prompt"],
             f"Denied: {names} · click to resume in {term}",
             execute=execute,
+            kind="blocked", task_id=task["id"], denied_tools=tools,
         )
     else:
         notify(
@@ -961,6 +1033,7 @@ def queue(prompt, wait=False, in_dir=None, model=None):
     task = {
         "id": tid,
         "prompt": prompt,
+        "label": short_label(prompt),
         "status": "queued",
         "created": now(),
         "origin": ORIGIN_ENV if ORIGIN_ENV in QT_ORIGINS else "qt",
@@ -1015,10 +1088,11 @@ def task_prompt(task):
     return task["prompt"] + owner_note + (
         f"\n\n(Context: task fired from directory {task['invoked_from']}. "
         "Only relevant if the task references the current directory or repo.)"
-        f"\n\n(Your quicktask id is {tid}. If you post any Slack message as part "
-        "of this task, end that message with this exact final line:\n"
+        f"\n\n(Your quicktask id is {tid}. If you DM the owner as part of this "
+        "task, end that DM with this exact final line:\n"
         f"{_resume_footer(tid)}\n"
-        "Slack messages only; do not add this line to your final result text.)"
+        "Owner DMs only; never add this line to a channel post, and do not add "
+        "it to your final result text.)"
     )
 
 
@@ -1178,6 +1252,7 @@ def _dm_fallback(task, log_path):
             "DM not sent: " + task["prompt"],
             f"Result not DM'd, open with qt resume {tid} · click to resume",
             execute=execute,
+            kind="failed", task_id=tid,
         )
     if task.get("dm_fallback"):
         save(task)
@@ -1193,10 +1268,79 @@ def _hub_title(prompt):
     return t[:59] + "…" if len(t) > 60 else t
 
 
+# --- task labels ------------------------------------------------------------
+# 2026-10-29: menu rows were showing raw task ids ("qt-261029-093313-send-m…")
+# because the Pass's orphan-job fallback used the item id as the title.
+# Every task now carries a human label: an instant heuristic at queue time,
+# refined by one cheap Haiku call when the run finishes. Read by the
+# menubar (Store.swift prefers "label") and the hub (_hub_item/_hub_job_record).
+
+_LABEL_STRIP_PREFIXES = (
+    "please ", "can you ", "could you ", "would you ", "hey ",
+    "send me ", "tell me ", "give me ", "show me ", "get me ",
+    "find me ", "look up ", "i need ",
+)
+
+
+def short_label(prompt):
+    """Instant, no-LLM label: boilerplate prefixes stripped, first ~7
+    words, sentence case. Good enough that the menu row is never an id,
+    even if the Haiku refinement never lands."""
+    text = " ".join((prompt or "").split())
+    # Repeatedly: "please can you check the deploys" sheds both prefixes.
+    changed = True
+    while changed:
+        changed = False
+        lowered = text.lower()
+        for prefix in _LABEL_STRIP_PREFIXES:
+            if lowered.startswith(prefix):
+                text = text[len(prefix):]
+                changed = True
+                break
+    label = " ".join(text.split(" ")[:7])
+    return (label[:47] + "…") if len(label) > 48 else label
+
+
+def _refine_label(task):
+    """One cheap Haiku call at finish time upgrades the heuristic label to
+    something punchier ("send me a few options for a meeting time" ->
+    "Meeting time options"). Runs once per task (label_refined marker),
+    never raises, and any miss -- no claude, timeout, junk output --
+    leaves the heuristic label in place. QT_LABEL_REFINE=0 disables.
+
+    Sits AFTER _dm_fallback at the finish site and capped at 20s
+    (2026-11-03 review): the owner DM must never wait on a label, and the
+    60s first draft could have held the whole finish path. The hub feed
+    still lands after it, so job/item titles carry the refined label."""
+    if os.environ.get("QT_LABEL_REFINE") == "0":
+        return
+    if task.get("label_refined") or not (task.get("prompt") or "").strip():
+        return
+    claude = find_claude()
+    if not claude:
+        return
+    ask = ("In 3 to 6 words, plain sentence case, output ONLY a short label "
+           "for this task. No quotes, no punctuation at the end.\n\nTask: "
+           + task["prompt"][:500])
+    try:
+        proc = subprocess.run(
+            [claude, "--model", os.environ.get("QT_LABEL_MODEL") or "haiku",
+             "-p", ask],
+            capture_output=True, text=True, timeout=20,
+        )
+        lines = (proc.stdout or "").strip().splitlines()
+        label = lines[0].strip().strip('"\'') if lines else ""
+        if proc.returncode == 0 and 3 <= len(label) <= 60 and "\n" not in label:
+            task["label"] = label
+        task["label_refined"] = True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _hub_item(task):
     return {
         "id": f"qt-{task['id']}",
-        "title": _hub_title(task["prompt"]),
+        "title": task.get("label") or _hub_title(task["prompt"]),
         "quote": task["prompt"],
         "source": "qt",
         "state": "today",
@@ -1239,7 +1383,7 @@ def _hub_job_record(task, item_id, rc, thread=None):
     resume_hint = f"qt resume {task['id']}"
     job = {
         "item_id": item_id,
-        "title": _hub_title(task["prompt"]),
+        "title": task.get("label") or _hub_title(task["prompt"]),
         "started": task.get("started") or task.get("created") or now(),
         "finished": task.get("finished") or now(),
         "home_state": "today",
@@ -1443,7 +1587,8 @@ def run_task(tid, interactive=False):
             task.update(status="failed", result="claude CLI not found on PATH", finished=now())
             save(task)
             _feed_hub(task)
-            notify("Quicktask failed", task["prompt"], "claude CLI not found")
+            notify("Quicktask failed", task["prompt"], "claude CLI not found",
+                   kind="failed", task_id=task["id"])
             return
 
         prompt = task_prompt(task)
@@ -1477,7 +1622,8 @@ def run_task(tid, interactive=False):
                 task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
                 save(task)
                 _feed_hub(task)
-                notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}")
+                notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}",
+                       kind="timeout", task_id=tid)
                 return
         finally:
             if settings_path:
@@ -1502,9 +1648,13 @@ def run_task(tid, interactive=False):
             finished=now(),
         )
         save(task)
-        # Before the hub feed: the DM must land before deliver.py can
-        # auto-close the item as delivered.
+        # The DM lands before anything else optional (deliver.py auto-close
+        # depends on it); the label refinement runs before the hub feed so
+        # job/item titles carry it, but after the DM so a slow Haiku never
+        # delays the result reaching John (2026-11-03 review).
         _dm_fallback(task, log_path)
+        _refine_label(task)
+        save(task)
         _feed_hub(task, rc=rc)
 
         if status == "blocked":
@@ -1517,6 +1667,7 @@ def run_task(tid, interactive=False):
             f"Quicktask {icon}{cost}",
             task["prompt"],
             result_raw.splitlines()[0] if result_raw else status,
+            kind="done" if status == "done" else "failed", task_id=tid,
         )
     except Exception as e:
         # General safety net: whatever broke, a task must never be left at
@@ -1535,8 +1686,16 @@ def run_task(tid, interactive=False):
 # --- commands -----------------------------------------------------------
 
 def age(iso):
-    delta = datetime.datetime.now() - datetime.datetime.fromisoformat(iso)
-    s = int(delta.total_seconds())
+    # fromisoformat before 3.11 rejects a trailing Z; hub stamps may carry
+    # one. Negative deltas (clock skew) clamp to 0 rather than printing
+    # "-3s" (both 2026-11-03 review).
+    dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        # Tasks written by the hub mirror carry tz-aware ISO stamps; mixing
+        # them with naive local now() crashes the subtraction.
+        dt = dt.astimezone().replace(tzinfo=None)
+    delta = datetime.datetime.now() - dt
+    s = max(0, int(delta.total_seconds()))
     for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
         if s >= div:
             return f"{s // div}{unit}"
@@ -1552,13 +1711,45 @@ def cmd_list(n=15):
         print('no quicktasks yet · qt "do a thing"')
         return
     glyph = {"done": "✓", "failed": "✗", "timeout": "⏱", "running": "…",
-             "queued": "·", "blocked": "⊘"}
+             "queued": "·", "blocked": "⊘", "dropped": "—"}
     for f in files:
         with open(os.path.join(TASKS_DIR, f)) as fh:
             t = json.load(fh)
         p = t["prompt"].replace("\n", " ")[:56]
         r = (t.get("result") or "").replace("\n", " ")[:60]
         print(f"{glyph.get(t['status'], '?')} {age(t['created']):>4} {t['id']:<32} {p:<58} {r}")
+
+
+def cmd_open(fragment):
+    """`qt open <id>`: open the task's result artifact in the default
+    viewer. The hub mirror's RESULT.md is the durable copy (a task's own
+    run dir may be the shared workspace); falls back to printing the
+    recorded result text when nothing was written to disk."""
+    bootstrap()
+    tid = match_id(fragment)
+    task = load(tid)
+    candidates = []
+    hub_dir = resolve_hub_dir()
+    if hub_dir:
+        matches = sorted(glob.glob(
+            os.path.join(hub_dir, "jobs", f"qt-{tid}-*", "output", "RESULT.md")))
+        candidates += matches[::-1]  # newest mirror first
+    if task.get("run_cwd"):
+        candidates.append(os.path.join(task["run_cwd"], "output", "RESULT.md"))
+    for path in candidates:
+        if os.path.isfile(path):
+            # 2026-11-03 review: check the rc -- a missing handler used to
+            # print a false success and swallow the fallbacks.
+            r = subprocess.run(["open", path], capture_output=True)
+            if r.returncode == 0:
+                print(f"opened {path}")
+                return
+    result = (task.get("result") or "").strip()
+    if result:
+        print(result)
+    else:
+        sys.exit(f"qt open: {tid} has no result on disk or recorded "
+                 f"(status: {task.get('status')})")
 
 
 def cmd_log(tid):
@@ -1655,7 +1846,8 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
         save(task)
         hub_task = dict(task, result="claude CLI not found")
         _feed_hub(hub_task, rc=None, thread=thread)
-        notify("Quicktask continuation failed ✗", task["prompt"], "claude CLI not found")
+        notify("Quicktask continuation failed ✗", task["prompt"], "claude CLI not found",
+               kind="failed", task_id=tid)
         _log_launch({
             "ts": now(), "outcome": "headless-failed", "requested_terminal": "headless",
             "branch": "headless", "id": tid, "rc": None, "elapsed": _elapsed(),
@@ -1697,7 +1889,7 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
             hub_task = dict(task, result=f"timed out after {TIMEOUT}s")
             _feed_hub(hub_task, rc=None, thread=thread)
             notify("Quicktask continuation timed out", task["prompt"],
-                   f"after {TIMEOUT}s · qt log {tid}")
+                   f"after {TIMEOUT}s · qt log {tid}", kind="timeout", task_id=tid)
             _log_launch({
                 "ts": now(), "outcome": "headless-timeout", "requested_terminal": "headless",
                 "branch": "headless", "id": tid, "rc": None, "elapsed": _elapsed(),
@@ -1734,10 +1926,14 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
     )
     save(task)
 
-    # The hub job for a continuation carries only this continuation's own
-    # result, not the accumulated task["result"] -- a fresh copy of the
-    # task record with result overridden, everything else (id, prompt,
-    # session_id, origin, ...) unchanged.
+    # A continuation is a finish too: the label refinement runs here as
+    # well, or a continued task keeps its heuristic label forever
+    # (2026-11-03 review). Skipped automatically when the original run
+    # already refined it. hub_task is built AFTER, so the job record
+    # carries the refined label along with this continuation's own result
+    # (not the accumulated task["result"]).
+    _refine_label(task)
+    save(task)
     hub_task = dict(task, result=result_text)
     _feed_hub(hub_task, rc=rc, thread=thread)
 
@@ -1750,6 +1946,7 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
             f"Quicktask continued {icon}{cost}",
             task["prompt"],
             result_raw.splitlines()[0] if result_raw else status,
+            kind="done" if status == "done" else "failed", task_id=tid,
         )
 
     _log_launch({
@@ -2720,6 +2917,7 @@ qt · fire-and-forget quicktasks for Claude Code
   qt -m <model> "..."    override the model for this task
   qt list [n]            recent tasks (default 15)
   qt log <id>            full record + raw log path (id fragments ok)
+  qt open <id>           open the task's RESULT.md (or print its result)
   qt resume-log [n]      last n resume-launch records (default 10)
   qt resume <id>         reopen a task as an interactive session
   qt resume <id> --prompt "<text>" [--thread <ts>]
@@ -2766,6 +2964,9 @@ def main():
     elif cmd == "log" and len(args) > 1:
         bootstrap()
         cmd_log(match_id(args[1]))
+    elif cmd == "open" and len(args) > 1:
+        bootstrap()
+        cmd_open(args[1])
     elif cmd == "resume-log":
         cmd_resume_log(args[1] if len(args) > 1 else 10)
     elif cmd == "resume" and len(args) > 1:

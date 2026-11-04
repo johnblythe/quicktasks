@@ -251,6 +251,28 @@ enum FeedSource: String, Codable {
 /// reference design; Done-today is the reference's quiet tail. `earlier` is the
 /// overflow the reference does not have: finished runs from previous days still
 /// have to go somewhere, and dropping them would lose the history v1 showed.
+/// The clear/archive feature's store (2026-10-29): row id -> the moment it
+/// was cleared, persisted in UserDefaults so a relaunch keeps the view the
+/// user left. See MenuModel.clearing for the semantics.
+enum ClearedRows {
+    static let key = "menubar.clearedRows"
+
+    static func load(_ defaults: UserDefaults) -> [String: Date] {
+        let raw = defaults.dictionary(forKey: key) ?? [:]
+        var out: [String: Date] = [:]
+        for (id, stamp) in raw {
+            if let seconds = stamp as? Double {
+                out[id] = Date(timeIntervalSince1970: seconds)
+            }
+        }
+        return out
+    }
+
+    static func save(_ map: [String: Date], _ defaults: UserDefaults) {
+        defaults.set(map.mapValues { $0.timeIntervalSince1970 }, forKey: key)
+    }
+}
+
 enum Section: String, Codable, CaseIterable {
     case running
     case needsYou = "needs_you"
@@ -650,6 +672,39 @@ struct MenuModel: Equatable {
     var headlineText: String {
         guard source == .files, passStaleSince != nil else { return aggregate.headline }
         return "\(aggregate.headline) \u{00B7} file feeds only, Pass down"
+    }
+
+    /// 2026-10-29, Slack-unread semantics for the ledger sections: a cleared
+    /// row leaves the view (and the headline count) without leaving the
+    /// ledger -- the task JSON, the hub job, and the history all stay. A row
+    /// whose activity stamp moves PAST the clear moment reappears on its own:
+    /// a re-fired or re-blocked task is new activity, not a read row. Active
+    /// (running/queued) rows are never clearable. Purely presentational,
+    /// applied after Feed/Store have had their say.
+    func clearing(_ cleared: [String: Date]) -> MenuModel {
+        guard !cleared.isEmpty else { return self }
+        let kept = records.filter { row in
+            guard !row.status.isActive, let when = cleared[row.id] else { return true }
+            // 2026-11-03 review: compare against `activity` only, never
+            // sortStamp -- a clock-less Pass row's sortStamp falls back to
+            // feedStamp (the current poll time), so the row reappeared on
+            // the very next poll and Clear silently did nothing. A row
+            // with no activity stamp has no clock to resurface with, so it
+            // stays cleared until it gains one (a finish, a re-fire).
+            guard let activity = row.activity else { return false }
+            return activity > when
+        }
+        guard kept.count != records.count else { return self }
+        return MenuModel.build(records: kept, now: refreshedAt,
+                               warning: warning, source: source,
+                               passURL: passURL, passError: passError,
+                               groups: groups, itemURLTemplate: itemURLTemplate,
+                               counts: counts, truncated: truncated,
+                               suggestions: suggestions,
+                               suggestionsAvailable: suggestionsAvailable,
+                               visibleSections: visibleSections,
+                               passReachable: passReachable,
+                               passStaleSince: passStaleSince, heldUntil: heldUntil)
     }
 
     /// Rows grouped for display, in section order, empty sections dropped and

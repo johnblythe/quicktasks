@@ -16,6 +16,9 @@ final class StatusController: ObservableObject {
     @Published private(set) var now: Date = Date()
     /// Section keys the user has collapsed. Remembered in UserDefaults.
     @Published private(set) var collapsed: Set<String>
+    /// Row id -> when it was cleared (Slack-unread semantics for the
+    /// ledger sections; see MenuModel.clearing). Persisted in UserDefaults.
+    @Published private(set) var clearedRows: [String: Date] = [:]
     /// Whether the suggestions section is folded shut. Open by default: it
     /// leads the list precisely because those rows are waiting to be decided.
     @Published private(set) var suggestionsCollapsed: Bool
@@ -95,6 +98,10 @@ final class StatusController: ObservableObject {
     /// records (a blip) and then reappears finished is still caught,
     /// instead of reading as "no prior data, nothing to report".
     private let jobTracker = JobTransitionTracker()
+    /// The file-drop inbox qt/hub producers post actionable banners through
+    /// (NotifyInbox.swift). Nil beside a RecordingNotifier, so no seam or
+    /// test ever watches the real filesystem.
+    private var inboxWatcher: InboxWatcher?
 
     enum Keys {
         static let collapsed = "menubar.collapsedSections"
@@ -161,6 +168,7 @@ final class StatusController: ObservableObject {
         self.collapsed = Set(stored ?? Section.allCases
             .filter { $0.collapsedByDefault }
             .map { $0.rawValue })
+        self.clearedRows = ClearedRows.load(defaults)
         self.fireToPass = defaults.bool(forKey: Keys.fireToPass)
         self.suggestionsCollapsed = defaults.bool(forKey: Keys.suggestionsCollapsed)
         self.loginItem = LoginItem.isEnabled()
@@ -176,6 +184,21 @@ final class StatusController: ObservableObject {
         // between launchd and the icon, which for a login item means a menu
         // bar that comes up blank for a second and a half.
         self.model = Store.load(config: config)
+        // The notification-authority inbox lives beside the real notifier
+        // only: qt/hub drop JSON notices into $QT_DATA/notify-inbox and this
+        // app posts them with action buttons under its own bundle identity.
+        // (After self.model: a closure capturing self needs every stored
+        // property initialized first.)
+        if self.notifier is SystemNotifier {
+            let watcher = InboxWatcher(dir: InboxWatcher.defaultDir()) { [weak self] notice in
+                self?.handleInbox(notice)
+            }
+            watcher.start()
+            inboxWatcher = watcher
+        }
+        // Cleared-row filtering applies once every stored property exists
+        // (Swift init rules) -- and on every refresh from here on.
+        model = model.clearing(clearedRows)
 
         // Reading ~40 small JSON files and one loopback GET every few seconds
         // is cheap, and the tolerance lets the system coalesce the wakeups
@@ -219,6 +242,9 @@ final class StatusController: ObservableObject {
         // is the closest thing to "shows the dropdown" that actually exists.
         if let system = self.notifier as? SystemNotifier {
             system.onClicked = { [weak self] in self?.showHotkeyPanel() }
+            // A banner that names its task deep-links: panel opens with the
+            // row highlighted and expanded (2026-11-03).
+            system.onOpenRecord = { [weak self] id in self?.revealRecord(id) }
         }
         // Asked once here if the toggle is already on at launch; `apply`
         // asks again only on an off-to-on flip, so "requested on first
@@ -245,6 +271,10 @@ final class StatusController: ObservableObject {
         // seconds later gets its own chance instead.
         guard !pollInFlight else { return }
         pollInFlight = true
+        // Belt-and-suspenders inbox sweep: the vnode watch is near-instant,
+        // but a directory replace can drop an event, and poll cadence is
+        // already the app's "check everything" heartbeat.
+        inboxWatcher?.sweep()
         // Snapshotted on the main thread before the hop to background, so the
         // hold-timer logic sees exactly what the last poll left on screen,
         // with no race against this same property being read or written back
@@ -267,7 +297,10 @@ final class StatusController: ObservableObject {
             DispatchQueue.main.async {
                 self?.pollInFlight = false
                 self?.config = config
-                self?.model = fresh
+                // clearing(): presentational only -- the job tracker below
+                // still diffs the unfiltered `fresh`, so a cleared row
+                // changing state never re-notifies as a false transition.
+                self?.model = fresh.clearing(self?.clearedRows ?? [:])
                 self?.recentDirs = dirs
                 self?.now = Date()
                 // Health is diffed as an episode, not a raw transition: see
@@ -282,10 +315,17 @@ final class StatusController: ObservableObject {
                     self?.post(kind: result.kind, title: result.title, detail: result.detail,
                               notify: result.notify, seen: result.seen)
                 }
-                for job in self?.jobTracker.detect(fresh: fresh.records) ?? [] {
+                for (job, record) in self?.jobTracker.detectRecords(fresh: fresh.records) ?? [] {
                     // Notification-only -- see JobTransition's own doc
                     // comment -- so straight to notifyIfHidden, never post.
-                    self?.notifyIfHidden(title: job.outcomeTitle, detail: nil)
+                    // A blocked landing gets the actionable banner (Resume
+                    // button, quicktask:// deep link); the rest keep the
+                    // plain title-only notice they always had.
+                    if case .blocked = job {
+                        self?.notifyBlockedIfHidden(record: record)
+                    } else {
+                        self?.notifyIfHidden(title: job.outcomeTitle, detail: nil)
+                    }
                 }
             }
         }
@@ -294,6 +334,27 @@ final class StatusController: ObservableObject {
     // MARK: - sections
 
     func isCollapsed(_ section: Section) -> Bool { collapsed.contains(section.rawValue) }
+
+    /// The section header's Clear button: every non-active row currently in
+    /// the section is marked read as of right now. Rows keep living in the
+    /// ledgers; new activity past this moment re-surfaces them (see
+    /// MenuModel.clearing).
+    func clearSection(_ section: Section) {
+        let now = Date()
+        let rows = model.sections(now: now).first { $0.section == section }?.records ?? []
+        var next = clearedRows
+        for row in rows where !row.status.isActive {
+            next[row.id] = now
+        }
+        // Prune entries for ids no longer in any ledger (2026-11-03
+        // review): clearedRows would otherwise grow forever. A re-fired
+        // task gets a fresh id, so nothing pruned is ever needed again.
+        let live = Set(model.records.map(\.id))
+        next = next.filter { live.contains($0.key) }
+        clearedRows = next
+        ClearedRows.save(next, defaults)
+        model = model.clearing(next)
+    }
 
     func toggle(_ section: Section) {
         if collapsed.contains(section.rawValue) {
@@ -398,6 +459,75 @@ final class StatusController: ObservableObject {
     func notifyIfHidden(title: String, detail: String?) {
         guard settings.notifyWhenHidden, !anyWindowVisible else { return }
         notifier.post(title: title, body: detail)
+    }
+
+    /// A poll-discovered blocked row, with the one action that matters: the
+    /// record's own resume URL (Pass hands it over; file rows derive it
+    /// from the id -- see TaskRecord.resumeURL). No denial detail exists at
+    /// poll time, so no Always-allow button (.blockedNoAllow). taskID rides
+    /// along so a banner click reveals this row in the panel.
+    func notifyBlockedIfHidden(record: TaskRecord) {
+        guard settings.notifyWhenHidden, !anyWindowVisible else { return }
+        let resume = record.resumeURL ?? "quicktask://resume/\(record.id)"
+        notifier.post(Notice(id: "job-\(record.id)#blocked",
+                             title: "Job needs you: \(record.title)",
+                             body: "Blocked on a permission -- tap Resume to approve in your terminal.",
+                             category: .blockedNoAllow,
+                             resumeURL: resume,
+                             taskID: record.id))
+    }
+
+    // MARK: - notification deep link
+
+    /// The row a notification banner click should land on, and a heartbeat so
+    /// two clicks on the same row's banner both fire onChange. MenuView
+    /// watches the tick, then highlights + expands the id.
+    @Published private(set) var revealID: String?
+    @Published private(set) var revealTick: Int = 0
+
+    /// Open the summon panel with one record in view, highlighted and
+    /// expanded. The row's section is un-collapsed first -- a revealed row
+    /// nobody can see is not a reveal. Unknown ids (a stale banner for a
+    /// since-cleared row) still open the panel; the view just finds nothing
+    /// to highlight.
+    func revealRecord(_ id: String) {
+        if let record = model.records.first(where: { $0.id == id }) {
+            // Session-only uncollapse: a banner click must not rewrite the
+            // saved lane layout (toggle() persists; this deliberately does
+            // not), same philosophy as the Pass's deep links.
+            collapsed.remove(record.section(now: now).rawValue)
+        }
+        revealID = id
+        revealTick += 1
+        showHotkeyPanel()
+    }
+
+    /// MenuView calls once it has applied a reveal, so a stale id never
+    /// lingers for the next tick to re-read (2026-11-03 review).
+    func consumeReveal() {
+        revealID = nil
+    }
+
+    /// A producer-initiated banner dropped into the notify inbox by qt or
+    /// the hub (NotifyInbox.swift). These REPLACE the Python paths' own
+    /// osascript banners, which fired unconditionally -- so they post
+    /// regardless of the notifyWhenHidden toggle and window visibility,
+    /// unlike the widget's own poll discoveries above. Authorization is
+    /// requested lazily: a first-ever notice can arrive before the toggle
+    /// ever flipped on. Blocked notices also suppress the job tracker's
+    /// poll-based equivalent, so the same block never banners twice.
+    func handleInbox(_ payload: InboxNotice) {
+        if let tid = payload.task_id {
+            switch payload.kind {
+            case "blocked": jobTracker.suppress(id: tid, status: .blocked)
+            case "failed": jobTracker.suppress(id: tid, status: .failed)
+            case "timeout": jobTracker.suppress(id: tid, status: .timeout)
+            case "done": jobTracker.suppress(id: tid, status: .done)
+            default: break
+            }
+        }
+        notifier.requestAuthorizationIfNeeded()
+        notifier.post(payload.toNotice())
     }
 
     /// "Neither the dropdown nor the summon panel is visible" -- the gate
@@ -897,6 +1027,9 @@ enum Entry {
         }
         if args.contains("--post-decide") {
             exit(DumpModel.runPostDecide(args: args))
+        }
+        if let i = args.firstIndex(of: "--dump-inbox-notice"), i + 1 < args.count {
+            exit(InboxWatcher.runDumpInboxNotice(path: args[i + 1]))
         }
         if args.contains("--dump-restart") {
             exit(DumpModel.runDumpRestart())

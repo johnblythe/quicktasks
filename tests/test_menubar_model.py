@@ -2324,6 +2324,70 @@ class TestCaptureLimits(ModelCase):
         self.assertIn("4000", proc.stderr)
 
 
+class TestInboxNotice(ModelCase):
+    """--dump-inbox-notice: the payload-to-Notice mapping behind the
+    notify-inbox authority (NotifyInbox.swift, 2026-10-28). The seam
+    decodes one producer payload file and prints the notice it would
+    post, so the action surface (Resume / Always allow / Open in Pass)
+    is pinned without a display."""
+
+    def dump_notice(self, payload):
+        f = self.tmp / "notice.json"
+        f.write_text(json.dumps(payload))
+        proc = subprocess.run([str(BINARY), "--dump-inbox-notice", str(f)],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_blocked_with_denials_gets_all_three_actions(self):
+        n = self.dump_notice({
+            "title": "Quicktask \u2298 blocked", "subtitle": "the prompt",
+            "body": "Denied: x", "kind": "blocked", "task_id": "abc123",
+            "denied_tools": ["mcp__claude_ai_Slack__slack_search_users"],
+        })
+        self.assertEqual(n["category"], "QT_BLOCKED")
+        self.assertEqual(n["actions"],
+                         ["Resume in Terminal", "Always Allow Tool", "Open in Pass"])
+        # The resume URL is derived from the task id when the producer
+        # doesn't send one -- same slug `qt resume` takes.
+        self.assertEqual(n["resume_url"], "quicktask://resume/abc123")
+        self.assertEqual(n["allow_tools"],
+                         ["mcp__claude_ai_Slack__slack_search_users"])
+        # Same task re-blocking replaces the banner in place (the id is
+        # the UNNotificationRequest identifier).
+        self.assertEqual(n["id"], "inbox-abc123-blocked")
+        # The task id rides along so a banner click deep-links to the row
+        # (2026-11-03).
+        self.assertEqual(n["task_id"], "abc123")
+
+    def test_blocked_without_denials_hides_the_allow_button(self):
+        n = self.dump_notice({"title": "t", "kind": "blocked", "task_id": "abc"})
+        self.assertEqual(n["category"], "QT_BLOCKED_NOALLOW")
+        self.assertEqual(n["actions"], ["Resume in Terminal", "Open in Pass"])
+
+    def test_failure_kinds_get_open_in_pass_only(self):
+        for kind in ("failed", "timeout", "done"):
+            n = self.dump_notice({"title": "t", "kind": kind, "task_id": "abc",
+                                  "pass_url": "http://127.0.0.1:8811/job/qt-abc"})
+            self.assertEqual(n["category"], "QT_OUTCOME", kind)
+            self.assertEqual(n["actions"], ["Open in Pass"], kind)
+            self.assertEqual(n["pass_url"], "http://127.0.0.1:8811/job/qt-abc")
+
+    def test_info_is_a_plain_banner_that_keeps_its_url(self):
+        n = self.dump_notice({"title": "The Pass → #the-pass", "body": "hi",
+                              "pass_url": "https://example.slack.com/archives/C0/p1"})
+        self.assertEqual(n["category"], "plain")
+        self.assertEqual(n["actions"], [])
+        self.assertEqual(n["pass_url"], "https://example.slack.com/archives/C0/p1")
+
+    def test_malformed_payload_exits_2(self):
+        f = self.tmp / "bad.json"
+        f.write_text("{not json")
+        proc = subprocess.run([str(BINARY), "--dump-inbox-notice", str(f)],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -3744,3 +3808,66 @@ class TestJobTransitionDedup(PassCase):
         result = self.notify_sequence(base, "ok,ok", interval=5)
         job_outcomes = [o for step in result["notifications"] for o in step["job_outcomes"]]
         self.assertEqual(job_outcomes, [])
+
+
+class TestLabelsAndClearing(SettingsSuiteCase):
+    """2026-10-29: (a) qt's task label is the row title when present, ahead
+    of the prompt prefix; (b) the Clear button's mark-as-read semantics --
+    a cleared row leaves the model without leaving the ledger, new activity
+    past the clear moment re-surfaces it, and active rows never clear.
+    Driven through --dump-model with the cleared map seeded into this
+    test's private UserDefaults suite, exactly as the running widget reads
+    it."""
+
+    def model_with_suite(self):
+        return self.model(extra_env={"QT_MENUBAR_DEFAULTS_SUITE": self.suite})
+
+    def seed_cleared(self, *id_epoch_pairs):
+        args = ["defaults", "write", self.suite, "menubar.clearedRows", "-dict"]
+        for row_id, epoch in id_epoch_pairs:
+            args += [row_id, "-float", str(epoch)]
+        subprocess.run(args, check=True, capture_output=True, text=True)
+
+    def test_label_beats_prompt_prefix(self):
+        self.write_task("t1", status="done", label="Meeting time options",
+                        prompt="send me a few options for a meeting time between now and EOW")
+        model = self.model_with_suite()
+        self.assertEqual(self.by_id(model, "t1")["title"], "Meeting time options")
+
+    def test_no_label_falls_back_to_prompt_prefix(self):
+        self.write_task("t1", status="done",
+                        prompt="draft the incident review")
+        model = self.model_with_suite()
+        self.assertEqual(self.by_id(model, "t1")["title"], "draft the incident review")
+
+    def test_cleared_row_leaves_the_model(self):
+        self.write_task("old-done", status="done", created="2026-09-01T10:00:00",
+                        finished="2026-09-01T10:05:00")
+        self.write_task("kept", status="done", created="2026-09-01T10:00:00",
+                        finished="2026-09-01T10:05:00")
+        self.seed_cleared(("old-done", datetime(2026, 9, 2).timestamp()))
+        model = self.model_with_suite()
+        self.assertNotIn("old-done", self.ids(model))
+        self.assertIn("kept", self.ids(model))
+
+    def test_new_activity_past_the_clear_resurfaces_the_row(self):
+        self.write_task("refired", status="done", created="2026-09-01T10:00:00",
+                        finished="2026-09-05T10:05:00")
+        # Cleared on the 2nd; the row's finish on the 5th is newer.
+        self.seed_cleared(("refired", datetime(2026, 9, 2).timestamp()))
+        model = self.model_with_suite()
+        self.assertIn("refired", self.ids(model))
+
+    def test_running_row_is_never_cleared(self):
+        self.write_task("live", status="running", created="2026-09-01T10:00:00")
+        self.seed_cleared(("live", datetime(2026, 9, 2).timestamp()))
+        model = self.model_with_suite()
+        self.assertIn("live", self.ids(model))
+
+    def test_uncleared_model_is_unchanged(self):
+        self.write_task("t1", status="done")
+        self.write_task("t2", status="done")
+        model = self.model_with_suite()
+        self.assertEqual(self.ids(model), self.ids(model))  # sanity
+        self.assertIn("t1", self.ids(model))
+        self.assertIn("t2", self.ids(model))

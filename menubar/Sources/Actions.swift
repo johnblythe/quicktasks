@@ -113,6 +113,36 @@ enum Actions {
         return resume(id: record.id)
     }
 
+    /// The task's RESULT.md on disk, opened in the default viewer -- the
+    /// same artifact `qt open <id>` opens (2026-11-03: "I can't access the
+    /// actual info"). The hub mirror is the durable copy, so the glob runs
+    /// against the hub's jobs dir by item id (jobs/<item-id>-<ts>/), newest
+    /// first. A failure here is not dead-end: callers fall back to the
+    /// report/Pass page.
+    @discardableResult
+    static func openResult(record: TaskRecord, hubJobsDir: URL?) -> Result<Void, Problem> {
+        guard let dir = hubJobsDir else { return .failure("no hub jobs dir configured") }
+        let prefix = (record.itemID ?? record.id) + "-"
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            return .failure("cannot read \(dir.path)")
+        }
+        for name in names.filter({ $0.hasPrefix(prefix) }).sorted().reversed() {
+            let result = dir.appendingPathComponent(name)
+                .appendingPathComponent("output").appendingPathComponent("RESULT.md")
+            if FileManager.default.fileExists(atPath: result.path) {
+                NSWorkspace.shared.open(result)
+                return .success(())
+            }
+        }
+        return .failure("no RESULT.md on disk for \(record.id)")
+    }
+
+    /// Copy-to-clipboard for the peek panel's result text.
+    static func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
     // MARK: - The Pass
 
     static func openPass(_ base: String = PassEndpoint.defaultURL) {
