@@ -41,6 +41,12 @@ QT_SCRIPT = REPO_ROOT / "qt"
 QT_GUARD_SCRIPT = REPO_ROOT / "qt-guard.py"
 TMP_ROOT = REPO_ROOT / "tmp"
 
+# Tests run qt against a fake claude; the finish-time label refinement
+# (2026-10-29) must not consume it. (First landing spot for this pin was
+# INSIDE the FAKE_CLAUDE_VERSION heredoc -- column-0 import lines in a
+# triple-quoted string are not module level. 2026-11-03.)
+os.environ["QT_LABEL_REFINE"] = "0"
+
 
 def _load_qt_module():
     """Import qt as a module (rather than running it), following the same
@@ -92,10 +98,6 @@ sys.exit(0)
 FAKE_CLAUDE_VERSION = """\
 #!/usr/bin/env python3
 import sys
-
-# Tests run qt against a fake claude; the finish-time label
-# refinement (2026-10-29) must not consume it.
-os.environ["QT_LABEL_REFINE"] = "0"
 sys.stdout.write("2.1.266 (Claude Code)\\n")
 sys.exit(0)
 """
