@@ -107,11 +107,17 @@ class QtGuardScriptTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.qt_data = Path(self.tmp.name)
 
-    def _ask(self, tool_name, tool_input, config=None):
+    def _ask(self, tool_name, tool_input, config=None, env_extra=None):
         if config is not None:
             (self.qt_data / "config.json").write_text(json.dumps(config))
         env = dict(os.environ)
         env["QT_DATA"] = str(self.qt_data)
+        # Isolate the allowlist/ledger from any real user env; tests that
+        # exercise them pass their own paths via env_extra.
+        env.pop("QT_ALLOW_FILE", None)
+        env.pop("QT_DENIALS_LOG", None)
+        if env_extra:
+            env.update(env_extra)
         return subprocess.run(
             [sys.executable, str(QT_GUARD_SCRIPT)],
             input=json.dumps({"tool_name": tool_name, "tool_input": tool_input}),
@@ -208,6 +214,90 @@ class QtGuardScriptTests(unittest.TestCase):
         proc = subprocess.run([sys.executable, str(QT_GUARD_SCRIPT)], input="not json",
                                capture_output=True, text=True, env=env, timeout=10)
         self.assertEqual(proc.returncode, 2)
+
+    # --- read parity for non-ld-tools connectors --------------------------
+
+    def test_claude_ai_read_tools_allowed(self):
+        # Read parity: a read has no destination to protect, so gating it
+        # on the write policy only produced spurious blocked tasks.
+        for name in ("slack_search_users", "slack_read_user_profile", "slack_read_thread"):
+            proc = self._ask(f"mcp__claude_ai_Slack__{name}", {},
+                              config={"slack_owner_id": "U123"})
+            self.assertEqual(proc.returncode, 0, f"{name}: {proc.stderr}")
+
+    def test_claude_ai_write_tool_still_denied(self):
+        # "send"/"message" are send-like; read parity must never sweep a
+        # write in, even addressed to the owner's own DM.
+        proc = self._ask("mcp__claude_ai_Slack__slack_send_message",
+                          {"channel": "U123"}, config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("Slack connectors other than ld-tools are off", proc.stderr)
+
+    def test_claude_ai_unrecognized_tool_denied(self):
+        # Conservative classification: a name with no read indicator is
+        # treated as a write.
+        proc = self._ask("mcp__claude_ai_Slack__slack_bespoke_wonder", {},
+                          config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("Slack connectors other than ld-tools are off", proc.stderr)
+
+    # --- user allowlist ---------------------------------------------------
+
+    def test_allowlist_allows_listed_tool(self):
+        (self.qt_data / "allow.json").write_text(
+            json.dumps({"allow": ["mcp__claude_ai_Slack__slack_bespoke_wonder"]}))
+        proc = self._ask("mcp__claude_ai_Slack__slack_bespoke_wonder", {},
+                          config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_allowlist_never_allows_send_like_tool(self):
+        # LD-224: the allowlist is steering for reads; writes keep the
+        # destination checks no matter what the file says.
+        (self.qt_data / "allow.json").write_text(
+            json.dumps({"allow": ["mcp__claude_ai_Slack__slack_send_message"]}))
+        proc = self._ask("mcp__claude_ai_Slack__slack_send_message",
+                          {"channel": "U123"}, config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 2)
+
+    def test_malformed_allowlist_tolerated(self):
+        (self.qt_data / "allow.json").write_text("not json {{{")
+        proc = self._ask("mcp__claude_ai_Slack__slack_bespoke_wonder", {},
+                          config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("Slack connectors other than ld-tools are off", proc.stderr)
+
+    def test_allow_file_env_override_takes_precedence(self):
+        allow_file = self.qt_data / "elsewhere.json"
+        allow_file.write_text(
+            json.dumps({"allow": ["mcp__claude_ai_Slack__slack_bespoke_wonder"]}))
+        proc = self._ask("mcp__claude_ai_Slack__slack_bespoke_wonder", {},
+                          config={"slack_owner_id": "U123"},
+                          env_extra={"QT_ALLOW_FILE": str(allow_file)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    # --- denial ledger ----------------------------------------------------
+
+    def test_denial_appends_ledger_line(self):
+        log = self.qt_data / "denials.jsonl"
+        proc = self._ask("mcp__claude_ai_Slack__slack_send_message",
+                          {"channel": "C0PUBLIC"}, config={"slack_owner_id": "U123"},
+                          env_extra={"QT_DENIALS_LOG": str(log)})
+        self.assertEqual(proc.returncode, 2)
+        lines = log.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual(record["guard"], "qt")
+        self.assertEqual(record["tool_name"], "mcp__claude_ai_Slack__slack_send_message")
+        self.assertEqual(record["reason"], proc.stderr.strip())
+        self.assertTrue(record["ts"].endswith("Z"), record["ts"])
+
+    def test_allow_writes_no_ledger_line(self):
+        log = self.qt_data / "denials.jsonl"
+        proc = self._ask("mcp__claude_ai_Slack__slack_search_users", {},
+                          config={"slack_owner_id": "U123"},
+                          env_extra={"QT_DENIALS_LOG": str(log)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(log.exists())
 
 
 class ResolveSlackGuardCmdUnitTests(unittest.TestCase):
@@ -310,11 +400,19 @@ class ResolveSlackGuardCmdUnitTests(unittest.TestCase):
         the very first quick-fire that touches an ld-tools MCP call is
         denied outright, which is exactly this incident."""
         self.mod.__file__ = str(QT_SCRIPT)
+        # No user allowlist in play: point QT_ALLOW_FILE at a path that
+        # does not exist so the developer machine's real allow.json can
+        # never leak into the assertion.
+        os.environ["QT_ALLOW_FILE"] = str(Path(self.tmp.name) / "no-such-allow.json")
+        self.addCleanup(lambda: os.environ.pop("QT_ALLOW_FILE", None))
         path = self.mod.render_slack_guard_settings("tid-allow")
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         data = json.loads(Path(path).read_text())
         allow = data["permissions"]["allow"]
-        self.assertEqual(allow, self.mod.QT_TOOLS_ALLOW)
+        # Sorted-merged with the (here empty) user allowlist since
+        # 2026-10-28 -- compare as sets, order is no longer contractual.
+        self.assertEqual(set(allow), set(self.mod.QT_TOOLS_ALLOW))
+        self.assertEqual(sorted(allow), allow)
         for name in (
             "Read",
             "mcp__ld-tools__ld_research",
@@ -323,6 +421,16 @@ class ResolveSlackGuardCmdUnitTests(unittest.TestCase):
             "mcp__ld-tools__ld_slack_user_by_email",
         ):
             self.assertIn(name, allow)
+        # With a user allowlist present (qt allow / the menubar's Always
+        # Allow action), its entries ride along with the shipped set.
+        user_allow = Path(self.tmp.name) / "allow.json"
+        user_allow.write_text(json.dumps({"allow": ["mcp__claude_ai_Slack__slack_read_channel"]}))
+        os.environ["QT_ALLOW_FILE"] = str(user_allow)
+        path2 = self.mod.render_slack_guard_settings("tid-allow-user")
+        self.addCleanup(lambda: os.path.exists(path2) and os.remove(path2))
+        merged = json.loads(Path(path2).read_text())["permissions"]["allow"]
+        self.assertIn("mcp__claude_ai_Slack__slack_read_channel", merged)
+        self.assertIn("Read", merged)
         # The hook is still doing the Slack-destination gating; the allow
         # list only fills the fresh-install permission gap.
         self.assertIn("hooks", data)
