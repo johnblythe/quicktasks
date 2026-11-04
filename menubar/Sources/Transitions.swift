@@ -107,8 +107,25 @@ final class JobTransitionTracker {
     /// time, so there is no real "previous" to diff against -- the same
     /// rule JobTransition.detect itself follows, just extended across more
     /// than one poll's gap.
+    /// Marks a job's landing status as already handled by an out-of-band
+    /// notice (a NotifyInbox drop from qt/hub), so the next poll that
+    /// observes the same transition does not fire a duplicate banner on top
+    /// of the producer's own. Seeds lastStatus too: without it the poll
+    /// after the drop would read running -> blocked as a fresh transition.
+    func suppress(id: String, status: TaskStatus) {
+        lastStatus[id] = status
+        fired.insert("\(id)#\(status.rawValue)")
+    }
+
     func detect(fresh: [TaskRecord]) -> [JobTransition] {
-        var out: [JobTransition] = []
+        detectRecords(fresh: fresh).map(\.0)
+    }
+
+    /// detect(fresh:) with the row alongside each transition, for callers
+    /// that act on the landing (a blocked banner needs the row's resume
+    /// URL, not just its title). New transitions only -- same dedup rules.
+    func detectRecords(fresh: [TaskRecord]) -> [(JobTransition, TaskRecord)] {
+        var out: [(JobTransition, TaskRecord)] = []
         for row in fresh {
             let prior = lastStatus[row.id]
             lastStatus[row.id] = row.status
@@ -116,9 +133,9 @@ final class JobTransitionTracker {
             let key = "\(row.id)#\(row.status.rawValue)"
             guard !fired.contains(key) else { continue }
             switch row.status {
-            case .done: out.append(.finished(title: row.title))
-            case .failed, .timeout: out.append(.failed(title: row.title))
-            case .blocked: out.append(.blocked(title: row.title))
+            case .done: out.append((.finished(title: row.title), row))
+            case .failed, .timeout: out.append((.failed(title: row.title), row))
+            case .blocked: out.append((.blocked(title: row.title), row))
             case .running, .queued, .unknown: continue
             }
             fired.insert(key)

@@ -34,6 +34,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# The dev machine's real menubar app would otherwise swallow the banners
+# these tests expect to observe (qt's notify-inbox routing, 2026-10-28).
+os.environ["QT_NOTIFY_INBOX"] = "0"
+# And the finish-time label refinement must not consume the fake claude.
+os.environ["QT_LABEL_REFINE"] = "0"
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QT_SCRIPT = REPO_ROOT / "qt"
 TMP_ROOT = REPO_ROOT / "tmp"

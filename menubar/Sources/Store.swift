@@ -158,9 +158,13 @@ enum Store {
             guard let obj = readJSONObject(dir.appendingPathComponent(name)) else { continue }
             guard let id = obj["id"] as? String, !id.isEmpty else { continue }
             let prompt = (obj["prompt"] as? String) ?? ""
+            // qt writes a human label at queue time (Haiku-refined at
+            // finish, 2026-10-29); it beats the raw prompt prefix, which
+            // beats the last-resort id.
+            let label = (obj["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             out.append(TaskRecord(
                 id: id,
-                title: titleFrom(prompt.isEmpty ? id : prompt),
+                title: (label?.isEmpty == false) ? label! : titleFrom(prompt.isEmpty ? id : prompt),
                 status: TaskStatus(raw: obj["status"] as? String),
                 origin: (obj["source"] as? String) == "pass" ? .pass : .quicktask,
                 created: parseDate(obj["created"]),

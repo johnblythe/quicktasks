@@ -79,6 +79,10 @@ struct MenuView: View {
     @State private var fireState: FireFieldState = .idle
     /// Row id the keyboard highlight sits on, nil when nothing is highlighted.
     @State private var highlighted: String?
+    /// The row with its peek panel open (2026-11-03). One at a time; set by
+    /// the row's eye button or by a notification banner's deep link (the
+    /// controller's revealTick onChange below).
+    @State private var expandedID: String?
     @FocusState private var fieldFocused: Bool
 
     /// The quick-search query. Narrows the rows across every section; the
@@ -209,9 +213,10 @@ struct MenuView: View {
                         ForEach(model.sections(now: controller.now), id: \.section) { entry in
                             SectionHeader(section: entry.section,
                                           count: entry.records.count,
-                                          collapsed: controller.isCollapsed(entry.section)) {
-                                controller.toggle(entry.section)
-                            }
+                                          collapsed: controller.isCollapsed(entry.section),
+                                          clearable: entry.records.contains { !$0.status.isActive },
+                                          onToggle: { controller.toggle(entry.section) },
+                                          onClear: { controller.clearSection(entry.section) })
                             if !controller.isCollapsed(entry.section) {
                                 ForEach(entry.records, id: \.id) { record in
                                     TaskRow(record: record,
@@ -219,6 +224,7 @@ struct MenuView: View {
                                             fetchedAt: controller.model.refreshedAt,
                                             busy: controller.busy.contains(record.id),
                                             highlighted: highlighted == record.id,
+                                            expanded: expandedID == record.id,
                                             onResume: { resume(record) },
                                             onReport: { openReport(record) },
                                             onTitle: { openItem(record) },
@@ -226,7 +232,12 @@ struct MenuView: View {
                                             onRevive: { revive(record) },
                                             onDecide: { action, comment in
                                                 decide(record, action: action, comment: comment)
-                                            })
+                                            },
+                                            onToggleExpand: {
+                                                expandedID = expandedID == record.id ? nil : record.id
+                                            },
+                                            onOpenResult: { openResult(record) },
+                                            onCopyResult: { copyResult(record) })
                                 }
                             }
                         }
@@ -304,6 +315,14 @@ struct MenuView: View {
             // see `resetKeyboardState()`.
             resetKeyboardState()
             if onEscapeExhausted == nil { controller.dropdownDidDisappear() }
+        }
+        .onChange(of: controller.revealTick) { _, _ in
+            // A notification banner's deep link: land the highlight and the
+            // peek panel on the row the banner was about.
+            if let id = controller.revealID {
+                highlighted = id
+                expandedID = id
+            }
         }
         .onChange(of: controller.summonTick) { _, _ in
             // A cached, reused panel (StatusController.showHotkeyPanel keeps
@@ -935,6 +954,28 @@ struct MenuView: View {
         }
     }
 
+    /// Peek panel's Open result: RESULT.md off disk first (`qt open <id>``'s
+    /// artifact), then the rendered report, then the Pass item page -- a
+    /// dead click is never the outcome.
+    private func openResult(_ record: TaskRecord) {
+        if case .success = Actions.openResult(record: record,
+                                              hubJobsDir: controller.config.hubJobsDir) {
+            return
+        }
+        if record.hasReport {
+            openReport(record)
+        } else {
+            openItem(record)
+        }
+    }
+
+    private func copyResult(_ record: TaskRecord) {
+        let text = (record.error ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        Actions.copyToPasteboard(text)
+        controller.post(kind: .info, title: "Result copied")
+    }
+
     private func openReport(_ record: TaskRecord) {
         switch Actions.openReport(base: controller.model.passURL, report: record.report) {
         case .success: break
@@ -1319,7 +1360,11 @@ struct SectionHeader: View {
     let section: Section
     let count: Int
     let collapsed: Bool
+    /// True when the section holds at least one finished/read-able row.
+    var clearable: Bool = false
     let onToggle: () -> Void
+    /// Slack-unread-style "mark this section read"; nil hides the affordance.
+    var onClear: (() -> Void)? = nil
 
     @State private var hovering = false
 
@@ -1345,6 +1390,18 @@ struct SectionHeader: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+        .overlay(alignment: .trailing) {
+            // A sibling of the toggle button, not a child: nested buttons
+            // swallow each other's clicks. Sits left of the count, hover-only.
+            if clearable, let onClear, hovering {
+                Button("Clear", action: onClear)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 26)
+                    .help("Mark this section read (rows stay in the ledger)")
+            }
+        }
         .help(collapsed ? "Show \(section.label.lowercased())" : "Hide \(section.label.lowercased())")
     }
 }
@@ -1358,12 +1415,18 @@ struct TaskRow: View {
     let busy: Bool
     /// Whether the keyboard highlight is on this row.
     var highlighted: Bool = false
+    /// The peek panel (2026-11-03): result text + Open/Copy/Resume inline,
+    /// so a finished quickfire can be read without leaving the menu.
+    var expanded: Bool = false
     let onResume: () -> Void
     let onReport: () -> Void
     let onTitle: () -> Void
     let onRun: () -> Void
     let onRevive: () -> Void
     let onDecide: (_ action: String, _ comment: String) -> Void
+    let onToggleExpand: () -> Void
+    let onOpenResult: () -> Void
+    let onCopyResult: () -> Void
 
     @State private var hovering = false
     /// Reject is two clicks. The first swaps the verdict buttons for a
@@ -1436,6 +1499,11 @@ struct TaskRow: View {
                             .scaleEffect(0.6)
                             .frame(width: 12)
                     } else {
+                        // The eye is every row's first affordance: peek at
+                        // the result without leaving the menu.
+                        RowButton(icon: expanded ? "chevron.up" : "eye",
+                                  help: expanded ? "Hide the result" : "Peek at the result",
+                                  action: onToggleExpand)
                         actions
                     }
                 }
@@ -1449,6 +1517,10 @@ struct TaskRow: View {
                                     : (hovering ? Color.primary.opacity(0.06) : .clear))
             .onHover { hovering = $0 }
             .help(helpText)
+
+            if expanded {
+                peekPanel
+            }
 
             if noting {
                 HStack(spacing: 6) {
@@ -1473,6 +1545,49 @@ struct TaskRow: View {
                 .padding(.bottom, 6)
             }
         }
+    }
+
+    /// The peek panel's text: the qt ledger maps a task's result body onto
+    /// `error` (a naming accident worth knowing before trusting it), so
+    /// quickfire rows have their full result here; Pass-feed rows carry no
+    /// result text in /status.json and get the fallback line instead.
+    private var peekText: String {
+        (record.error ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var peekPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if peekText.isEmpty {
+                Text("No result text on this row -- Open result reads the artifact, or open it in The Pass.")
+                    .font(.system(size: 11))
+                    .italic()
+                    .foregroundStyle(.tertiary)
+            } else {
+                Text(peekText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(8)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack(spacing: 12) {
+                Button("Open result", action: onOpenResult)
+                if !peekText.isEmpty {
+                    Button("Copy", action: onCopyResult)
+                }
+                if record.canResume {
+                    Button("Resume", action: onResume)
+                }
+                Spacer()
+            }
+            .font(.system(size: 11))
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
+        }
+        .padding(.leading, 27)
+        .padding(.trailing, 12)
+        .padding(.bottom, 7)
     }
 
     @ViewBuilder

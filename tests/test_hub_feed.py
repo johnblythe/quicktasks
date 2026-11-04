@@ -20,6 +20,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# The dev machine's real menubar app would otherwise swallow the banners
+# these tests expect to observe (qt's notify-inbox routing, 2026-10-28).
+os.environ["QT_NOTIFY_INBOX"] = "0"
+# And the finish-time label refinement must not consume the fake claude.
+os.environ["QT_LABEL_REFINE"] = "0"
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QT_SCRIPT = REPO_ROOT / "qt"
 HUB_REPO = REPO_ROOT.parent / "hub"
@@ -220,7 +226,9 @@ class HubFeedEndToEndTests(unittest.TestCase):
 
         item = self._the_item(item_id)
         self.assertEqual(item["quote"], prompt)
-        self.assertEqual(item["title"], prompt[:59] + "…")
+        # 2026-10-29: the title is the task's label (short_label: 7-word cap,
+        # 48-char budget), preferred over the old 60-char prompt prefix.
+        self.assertEqual(item["title"], prompt[:47] + "…")
         self.assertEqual(item["source"], "qt")
         self.assertEqual(item["state"], "today")
         self.assertNotIn("prompt", item)  # fire false: no prompt key at all

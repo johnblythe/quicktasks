@@ -24,6 +24,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# Tests run qt against a fake claude; the finish-time label
+# refinement (2026-10-29) must not consume it.
+os.environ["QT_LABEL_REFINE"] = "0"
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QT_SCRIPT = REPO_ROOT / "qt"
 

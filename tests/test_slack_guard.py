@@ -92,6 +92,10 @@ sys.exit(0)
 FAKE_CLAUDE_VERSION = """\
 #!/usr/bin/env python3
 import sys
+
+# Tests run qt against a fake claude; the finish-time label
+# refinement (2026-10-29) must not consume it.
+os.environ["QT_LABEL_REFINE"] = "0"
 sys.stdout.write("2.1.266 (Claude Code)\\n")
 sys.exit(0)
 """

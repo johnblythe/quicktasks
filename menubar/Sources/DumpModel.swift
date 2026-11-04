@@ -52,13 +52,23 @@ enum DumpModel {
         // `--search` runs the same filter the search field runs, over the same
         // model, so the seam tests the filter rather than a copy of it.
         let query = value(args, "--search") ?? ""
-        let model = loaded.filtered(query: query)
+        // Cleared rows come from the same UserDefaults the running widget
+        // writes (QT_MENUBAR_DEFAULTS_SUITE keeps tests in a private suite),
+        // so the seam shows exactly what the menu would show. (Kept as three
+        // statements: one more chained call on `model` tipped the payload
+        // literal below past the compiler's type-check budget.)
+        let searched = loaded.filtered(query: query)
+        let cleared = ClearedRows.load(StatusController.Keys.store())
+        let model = searched.clearing(cleared)
 
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
         func stamp(_ d: Date?) -> Any { d.map { iso.string(from: $0) } ?? NSNull() }
 
-        let payload: [String: Any] = [
+        // Broken into three sub-literals: as one expression this payload sat
+        // at the edge of the compiler's type-check budget, and adding the
+        // clearing() call above tipped it over (2026-10-29).
+        let feedFacts: [String: Any] = [
             "tasks_dir": config.tasksDir.path,
             "hub_jobs_dir": config.hubJobsDir?.path ?? NSNull(),
             "source": model.source.rawValue,
@@ -73,26 +83,37 @@ enum DumpModel {
             "truncated": model.truncated,
             "login_item": LoginItem.isEnabled(),
             "search": query,
+        ]
+        let suggestionsJSON: [[String: Any]] = model.suggestions.map {
+            suggestionJSON($0, stamp: stamp)
+        }
+        let suggestionFacts: [String: Any] = [
             // Whether the payload carried a `suggestions` key at all, which is
             // what decides if the section is drawn. Distinct from the list
             // being empty: a Pass without the engine sends no key.
             "suggestions_available": model.suggestionsAvailable,
             "shows_suggestions": model.showsSuggestions,
-            "suggestions": model.suggestions.map { s in
-                [
-                    "item_id": s.itemID,
-                    "title": s.title,
-                    "rationale": s.rationale,
-                    "confidence": s.confidence,
-                    "confidence_step": s.confidenceStep,
-                    "proposed": s.proposed,
-                    "source": s.source.rawValue,
-                    "source_raw": s.sourceRaw ?? NSNull(),
-                    "source_url": s.sourceURL ?? NSNull(),
-                    "date": stamp(s.date),
-                ] as [String: Any]
-            },
+            "suggestions": suggestionsJSON,
             "suggestions_headline": Suggestion.headline(model.suggestions.count),
+        ]
+        // Hoisted closures: any one literal holding these maps tipped the
+        // compiler's type-check budget over the edge (2026-10-29).
+        let groupsJSON: [[String: Any]] = model.groups.map { g in
+            ["key": g.key, "label": g.label, "count": g.count, "undone": g.undone]
+        }
+        let sectionsJSON: [[String: Any]] = model.sections(now: now).map { entry in
+            [
+                "key": entry.section.rawValue,
+                "label": entry.section.label,
+                "count": entry.records.count,
+                "collapsed_by_default": entry.section.collapsedByDefault,
+                "ids": entry.records.map { $0.id },
+            ] as [String: Any]
+        }
+        let recordsJSON: [[String: Any]] = model.records.map {
+            recordJSON($0, model: model, now: now, stamp: stamp)
+        }
+        var payload: [String: Any] = [
             "headline_preview": model.headlinePreview(limit: 3, now: now),
             "visible_sections": Array(model.visibleSections).sorted(),
             "aggregate": aggregateJSON(model.aggregate),
@@ -105,66 +126,81 @@ enum DumpModel {
             "refreshed_at": iso.string(from: model.refreshedAt),
             "warning": model.warning ?? NSNull(),
             "count": model.records.count,
-            "groups": model.groups.map { g in
-                ["key": g.key, "label": g.label, "count": g.count, "undone": g.undone]
-                    as [String: Any]
-            },
-            "sections": model.sections(now: now).map { entry in
-                [
-                    "key": entry.section.rawValue,
-                    "label": entry.section.label,
-                    "count": entry.records.count,
-                    "collapsed_by_default": entry.section.collapsedByDefault,
-                    "ids": entry.records.map { $0.id },
-                ] as [String: Any]
-            },
+            "groups": groupsJSON,
+            "sections": sectionsJSON,
             // What the keyboard highlight walks, as a freshly opened menu would
             // show it: default collapse rather than whatever is remembered in
             // UserDefaults, so the seam is deterministic.
             "visible_ids": defaultVisibleIDs(model, now: now),
-            "records": model.records.map { r in
-                [
-                    "id": r.id,
-                    "item_id": r.itemID ?? NSNull(),
-                    "title": r.title,
-                    "status": r.status.rawValue,
-                    "state": r.state ?? NSNull(),
-                    "reason": r.reason?.rawValue ?? NSNull(),
-                    "detail": r.detail,
-                    "section": r.section(now: now).rawValue,
-                    "origin": r.origin.rawValue,
-                    "created": stamp(r.created),
-                    "started": stamp(r.started),
-                    "finished": stamp(r.finished),
-                    "session_id": r.sessionId ?? NSNull(),
-                    "resume_url": r.resumeURL ?? NSNull(),
-                    "report": r.report ?? NSNull(),
-                    "report_url": r.report.flatMap {
-                        Actions.reportURL(base: model.passURL, report: $0)?.absoluteString
-                    } ?? NSNull(),
-                    "elapsed_s": r.elapsedAtFetch ?? NSNull(),
-                    "feed_stamp": stamp(r.feedStamp),
-                    "outputs": r.outputCount,
-                    "denials": r.denialCount,
-                    "error": r.error ?? NSNull(),
-                    "can_resume": r.canResume,
-                    "wants_resume": r.wantsResume,
-                    "can_decide": r.canDecide,
-                    "can_run": r.canRun,
-                    "revivable": r.revivable,
-                    "source_app": r.source.rawValue,
-                    "source_raw": r.sourceRaw ?? NSNull(),
-                    "source_symbol": r.source.symbol,
-                    "primary_action": r.primaryAction.rawValue,
-                    "item_url": Actions.itemURL(template: model.itemURLTemplate,
-                                                base: model.passURL,
-                                                itemID: r.itemID ?? r.id)?
-                        .absoluteString ?? NSNull(),
-                ] as [String: Any]
-            },
+            "records": recordsJSON,
         ]
+        payload.merge(feedFacts) { _, new in new }
+        payload.merge(suggestionFacts) { _, new in new }
 
         return emit(payload)
+    }
+
+    /// Same extraction as recordJSON: closure-held dictionary literals in
+    /// run() blew the type-check budget (2026-10-29).
+    private static func suggestionJSON(_ s: Suggestion,
+                                       stamp: (Date?) -> Any) -> [String: Any] {
+        [
+            "item_id": s.itemID,
+            "title": s.title,
+            "rationale": s.rationale,
+            "confidence": s.confidence,
+            "confidence_step": s.confidenceStep,
+            "proposed": s.proposed,
+            "source": s.source.rawValue,
+            "source_raw": s.sourceRaw ?? NSNull(),
+            "source_url": s.sourceURL ?? NSNull(),
+            "date": stamp(s.date),
+        ] as [String: Any]
+    }
+
+    /// One record's --dump-model payload, extracted from run()'s literal:
+    /// the nested dictionary + flatMap closure exceeded the compiler's
+    /// type-check budget when written inline (2026-10-29).
+    private static func recordJSON(_ r: TaskRecord, model: MenuModel, now: Date,
+                                   stamp: (Date?) -> Any) -> [String: Any] {
+        [
+            "id": r.id,
+            "item_id": r.itemID ?? NSNull(),
+            "title": r.title,
+            "status": r.status.rawValue,
+            "state": r.state ?? NSNull(),
+            "reason": r.reason?.rawValue ?? NSNull(),
+            "detail": r.detail,
+            "section": r.section(now: now).rawValue,
+            "origin": r.origin.rawValue,
+            "created": stamp(r.created),
+            "started": stamp(r.started),
+            "finished": stamp(r.finished),
+            "session_id": r.sessionId ?? NSNull(),
+            "resume_url": r.resumeURL ?? NSNull(),
+            "report": r.report ?? NSNull(),
+            "report_url": r.report.flatMap {
+                Actions.reportURL(base: model.passURL, report: $0)?.absoluteString
+            } ?? NSNull(),
+            "elapsed_s": r.elapsedAtFetch ?? NSNull(),
+            "feed_stamp": stamp(r.feedStamp),
+            "outputs": r.outputCount,
+            "denials": r.denialCount,
+            "error": r.error ?? NSNull(),
+            "can_resume": r.canResume,
+            "wants_resume": r.wantsResume,
+            "can_decide": r.canDecide,
+            "can_run": r.canRun,
+            "revivable": r.revivable,
+            "source_app": r.source.rawValue,
+            "source_raw": r.sourceRaw ?? NSNull(),
+            "source_symbol": r.source.symbol,
+            "primary_action": r.primaryAction.rawValue,
+            "item_url": Actions.itemURL(template: model.itemURLTemplate,
+                                        base: model.passURL,
+                                        itemID: r.itemID ?? r.id)?
+                .absoluteString ?? NSNull(),
+        ] as [String: Any]
     }
 
     private static func defaultVisibleIDs(_ model: MenuModel, now: Date) -> [String] {
