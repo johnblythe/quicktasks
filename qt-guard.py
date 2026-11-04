@@ -66,6 +66,7 @@ throwaway config without touching a real install.
 """
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -89,50 +90,62 @@ READ_TOOLS = {
 }
 
 # Name classifiers for the security decision on non-ld-tools Slack
-# connectors and the allowlist's send-like veto. Both match
-# case-insensitively as substrings of the tool name after the final
-# "__". Send-like always wins over read-only, and a name carrying
-# neither indicator is treated as a write -- when in doubt, deny.
-SEND_LIKE_INDICATORS = (
+# connectors and the allowlist's read-only gate.
+#
+# 2026-11-03 review rebuild: the first cut matched indicator SUBSTRINGS
+# ("read", "channel", "list") and trusted "send-like wins" to cover every
+# mutating verb. Both halves were wrong: slack_set_channel_topic,
+# slack_blocklist_add and slack_channel_pin all matched a read substring
+# while their verbs sat outside the send-like list -- writes sailing
+# through the read path with no destination check. Tokens fix the shape:
+# verbs and nouns are different tokens, so a broad noun list ("channel",
+# "pins") is safe the moment the verb token is checked first. A name
+# carrying no known token of either kind is treated as a write: when in
+# doubt, deny. Keep in sync with hub/guard.py's copy.
+def _name_tokens(tool_name):
+    """The tool name after the final "__", lowercased and split on every
+    non-alphanumeric boundary into tokens."""
+    short = tool_name.rsplit("__", 1)[-1].lower()
+    return [t for t in re.split(r"[^a-z0-9]+", short) if t]
+
+
+# Mutating-verb tokens. Over-inclusive on purpose: a read misread as
+# send-like is a block (safe, steerable), a write misread as a read is
+# LD-224 again.
+SEND_LIKE_TOKENS = frozenset({
     "send", "post", "message", "reply", "upload", "share", "invite",
-    "kick", "archive", "join", "leave", "rename", "set_topic",
-    "set_purpose", "create", "delete", "update", "patch", "schedule",
-)
-READ_ONLY_INDICATORS = (
-    "search", "history", "thread", "threads", "channel_info", "channels",
-    "mentions", "unreads", "pins", "reactions_get", "files",
-    "user_by_email", "users_info", "users_list", "user_profile",
-    "usergroups", "users_conversations", "channel_members", "expand",
-    "conversations_history", "conversations_replies", "conversations_list",
-    "search_users", "search_messages", "search_files", "read_thread",
-    "read_user_profile", "list_channels", "list",
-    # 2026-10-28: slack_read_channel slipped past the original set and
-    # blocked a live task hours after it shipped. "read" and "channel"
-    # are broad on purpose: every claude_ai Slack write verb (create,
-    # update, rename, archive, join, ...) is already send-like, and
-    # send-like is checked first and wins, so breadth here is safe.
-    "read", "channel",
-)
-
-
-def _short_name(tool_name):
-    return tool_name.rsplit("__", 1)[-1].lower()
+    "kick", "archive", "unarchive", "join", "leave", "rename", "set",
+    "create", "delete", "update", "patch", "schedule", "add", "remove",
+    "edit", "publish", "move", "mute", "unmute", "pin", "unpin",
+    "bookmark", "mark", "star", "unstar", "close", "open", "approve",
+    "decline", "enable", "disable",
+})
+# Read-noun/verb tokens. None of these appear as the verb of a mutating
+# call in any Slack connector we've seen; a mutator carrying one anyway
+# is still caught, because its verb token is in SEND_LIKE_TOKENS and
+# send-like is checked first.
+READ_ONLY_TOKENS = frozenset({
+    "read", "search", "list", "get", "lookup", "find", "view", "fetch",
+    "describe", "history", "thread", "threads", "channel", "channels",
+    "members", "pins", "files", "mentions", "unreads", "usergroups",
+    "expand", "user", "users", "profile", "conversations", "reactions",
+    "info", "whoami",
+})
 
 
 def is_send_like_tool(tool_name):
-    """True when the tool name carries any send-like indicator -- these
-    are never allowed by the read-parity path or the user allowlist."""
-    short = _short_name(tool_name)
-    return any(ind in short for ind in SEND_LIKE_INDICATORS)
+    """True when any name token is a mutating verb -- these are never
+    allowed by the read-parity path or the user allowlist."""
+    return any(t in SEND_LIKE_TOKENS for t in _name_tokens(tool_name))
 
 
 def is_read_only_tool(tool_name):
     """Conservative read classification: send-like wins first, then a
-    read indicator must be present. Anything unrecognized is NOT a read."""
-    if is_send_like_tool(tool_name):
+    read token must be present. Anything unrecognized is NOT a read."""
+    tokens = _name_tokens(tool_name)
+    if any(t in SEND_LIKE_TOKENS for t in tokens):
         return False
-    short = _short_name(tool_name)
-    return any(ind in short for ind in READ_ONLY_INDICATORS)
+    return any(t in READ_ONLY_TOKENS for t in tokens)
 
 
 def load_config():
@@ -151,7 +164,10 @@ def load_allowlist():
     try:
         with open(ALLOWLIST_PATH) as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # OSError: gone/unreadable. ValueError covers JSONDecodeError AND
+        # UnicodeDecodeError -- a non-UTF-8 file must read as empty, not
+        # crash the guard into a non-blocking exit-1 (2026-11-03 review).
         return set()
     entries = data.get("allow") if isinstance(data, dict) else None
     if not isinstance(entries, list):
@@ -169,7 +185,9 @@ def _append_denial_ledger(reason, tool_name):
     show what headless runs kept hitting. Never raises, never prints,
     never affects the stderr/exit path it decorates."""
     try:
-        os.makedirs(os.path.dirname(DENIALS_LOG_PATH), exist_ok=True)
+        parent = os.path.dirname(DENIALS_LOG_PATH)
+        if parent:  # a bare filename in QT_DENIALS_LOG means cwd; no makedirs
+            os.makedirs(parent, exist_ok=True)
         record = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "guard": "qt",
@@ -239,6 +257,18 @@ def check_write(tool_name, tool_input, cfg):
 
 
 def main():
+    """Fail-closed wrapper: under PreToolUse semantics exit 1 is
+    NON-blocking (the tool call proceeds), so an unexpected error anywhere
+    in the guard must become a deny, never a traceback (2026-11-03 review)."""
+    try:
+        _main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        deny(f"qt-guard: unexpected error ({e!r}); failing closed")
+
+
+def _main():
     try:
         payload = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -257,9 +287,12 @@ def main():
     _CURRENT_TOOL_NAME = tool_name
 
     # User allowlist (steering): an exact tool_name listed in allow.json
-    # is allowed before any routing -- but never a send-like name; writes
-    # always keep the LD-224 destination checks below.
-    if tool_name in load_allowlist() and not is_send_like_tool(tool_name):
+    # is allowed before any routing -- but only for a positively-classified
+    # read-only MCP tool (2026-11-03 review: a send-like veto alone let
+    # allow.json whitelist mutating Slack tools whose verbs sat outside the
+    # old indicator list, e.g. slack_publish_canvas).
+    if (tool_name.startswith("mcp__") and tool_name in load_allowlist()
+            and is_read_only_tool(tool_name)):
         allow()
         return
 

@@ -245,10 +245,45 @@ class QtGuardScriptTests(unittest.TestCase):
 
     def test_allowlist_allows_listed_tool(self):
         (self.qt_data / "allow.json").write_text(
+            json.dumps({"allow": ["mcp__claude_ai_Slack__slack_read_channel"]}))
+        proc = self._ask("mcp__claude_ai_Slack__slack_read_channel", {},
+                          config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_allowlist_refuses_unrecognized_names(self):
+        # 2026-11-03 review: a positive read-only gate, not a send-like veto.
+        (self.qt_data / "allow.json").write_text(
             json.dumps({"allow": ["mcp__claude_ai_Slack__slack_bespoke_wonder"]}))
         proc = self._ask("mcp__claude_ai_Slack__slack_bespoke_wonder", {},
                           config={"slack_owner_id": "U123"})
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 2)
+
+    def test_allowlist_refuses_mutating_read_shaped_names(self):
+        # The classifier hole the 2026-11-03 review caught: these verbs all
+        # mutate what other people see while carrying read-ish nouns.
+        for name in ("slack_set_channel_topic", "slack_add_channel_members",
+                     "slack_blocklist_add", "slack_channel_pin",
+                     "slack_mute_channel", "slack_channel_edit",
+                     "slack_publish_canvas", "slack_add_reaction"):
+            proc = self._ask(f"mcp__claude_ai_Slack__{name}", {},
+                              config={"slack_owner_id": "U123"})
+            self.assertEqual(proc.returncode, 2, f"{name} mutates and must deny")
+
+    def test_read_names_still_allow_after_token_rebuild(self):
+        for name in ("slack_read_channel", "slack_search_users",
+                     "slack_read_user_profile", "slack_read_thread",
+                     "slack_list_channels", "slack_pins"):
+            proc = self._ask(f"mcp__claude_ai_Slack__{name}", {},
+                              config={"slack_owner_id": "U123"})
+            self.assertEqual(proc.returncode, 0, f"{name} is a read: {proc.stderr}")
+
+    def test_non_utf8_allowlist_fails_closed_not_open(self):
+        # Corrupt allow.json used to crash the guard into exit 1, which
+        # under PreToolUse semantics is NON-blocking -- the whole guard off.
+        (self.qt_data / "allow.json").write_bytes(b"\xff\xfe not utf-8")
+        proc = self._ask("mcp__claude_ai_Slack__slack_send_message",
+                          {"channel": "C0PUBLIC"}, config={"slack_owner_id": "U123"})
+        self.assertEqual(proc.returncode, 2)
 
     def test_allowlist_never_allows_send_like_tool(self):
         # LD-224: the allowlist is steering for reads; writes keep the
@@ -269,8 +304,8 @@ class QtGuardScriptTests(unittest.TestCase):
     def test_allow_file_env_override_takes_precedence(self):
         allow_file = self.qt_data / "elsewhere.json"
         allow_file.write_text(
-            json.dumps({"allow": ["mcp__claude_ai_Slack__slack_bespoke_wonder"]}))
-        proc = self._ask("mcp__claude_ai_Slack__slack_bespoke_wonder", {},
+            json.dumps({"allow": ["mcp__claude_ai_Slack__slack_search_users"]}))
+        proc = self._ask("mcp__claude_ai_Slack__slack_search_users", {},
                           config={"slack_owner_id": "U123"},
                           env_extra={"QT_ALLOW_FILE": str(allow_file)})
         self.assertEqual(proc.returncode, 0, proc.stderr)

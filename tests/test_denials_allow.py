@@ -70,7 +70,15 @@ class AllowDenialsTests(unittest.TestCase):
     def test_allow_refuses_write_shaped_tools(self):
         r = self._run("allow", WRITE_TOOL)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("never", r.stderr + r.stdout)
+        self.assertIn("refusing", r.stderr + r.stdout)
+        self.assertFalse(self.allow_file.exists())
+
+    def test_allow_refuses_non_mcp_tools(self):
+        # 2026-11-03 review: `qt allow Bash` would otherwise widen every
+        # future run's permissions beyond the documented scope.
+        r = self._run("allow", "Bash")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("refusing", r.stderr + r.stdout)
         self.assertFalse(self.allow_file.exists())
 
     def test_allow_tolerates_malformed_existing_file(self):
