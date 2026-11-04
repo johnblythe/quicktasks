@@ -406,16 +406,31 @@ def detect_terminals():
 
 # --- notifications ------------------------------------------------------
 
+_MENUBAR_RUNNING_CACHE = None
+
+
 def _menubar_running():
     """True when the Quicktask menubar app (the notification authority) is
-    up. Any error means 'not running' so notify() falls through to
-    terminal-notifier/osascript rather than dropping banners into an inbox
-    nobody is watching."""
+    up -- the process name is build.sh's EXEC_NAME (QuicktaskStatus); a
+    rename there must update this probe. Any error means 'not running' so
+    notify() falls through to terminal-notifier/osascript rather than
+    dropping banners into an inbox nobody is watching. pgrep answers in
+    milliseconds; the 1s timeout keeps the worst-case notify budget tight."""
     try:
         return subprocess.run(["pgrep", "-xq", "QuicktaskStatus"],
-                              capture_output=True, timeout=3).returncode == 0
+                              capture_output=True, timeout=1).returncode == 0
     except Exception:
         return False
+
+
+def _menubar_running_cached():
+    """One probe per process: a finish path can ask twice (notify_blocked's
+    branch choice, then notify's inbox drop), and the answer cannot
+    usefully change in between (2026-11-03 review)."""
+    global _MENUBAR_RUNNING_CACHE
+    if _MENUBAR_RUNNING_CACHE is None:
+        _MENUBAR_RUNNING_CACHE = _menubar_running()
+    return _MENUBAR_RUNNING_CACHE
 
 
 def _drop_notify_inbox(title, subtitle, body, kind=None, task_id=None,
@@ -432,7 +447,7 @@ def _drop_notify_inbox(title, subtitle, body, kind=None, task_id=None,
         # who wants the Python paths to fire their own banners again.
         if os.environ.get("QT_NOTIFY_INBOX") == "0":
             return False
-        if not _menubar_running():
+        if not _menubar_running_cached():
             return False
         inbox = os.path.join(QT_DATA, "notify-inbox")
         os.makedirs(inbox, exist_ok=True)
@@ -917,7 +932,8 @@ def launch_test_terminal():
 def notify_blocked(task, denials):
     names = ", ".join(sorted({d.get("tool_name", "?") for d in denials})) or "a tool call"
     tools = sorted({d.get("tool_name", "?") for d in denials})
-    if find_notifier() or _menubar_running():
+    # Probe once, not twice (notify() re-probes inside _drop_notify_inbox).
+    if find_notifier() or _menubar_running_cached():
         qt_bin = os.path.abspath(__file__)
         execute = "{} {} _resume-launch {}".format(
             shlex.quote(sys.executable), shlex.quote(qt_bin), shlex.quote(task["id"])
@@ -1290,7 +1306,12 @@ def _refine_label(task):
     something punchier ("send me a few options for a meeting time" ->
     "Meeting time options"). Runs once per task (label_refined marker),
     never raises, and any miss -- no claude, timeout, junk output --
-    leaves the heuristic label in place. QT_LABEL_REFINE=0 disables."""
+    leaves the heuristic label in place. QT_LABEL_REFINE=0 disables.
+
+    Sits AFTER _dm_fallback at the finish site and capped at 20s
+    (2026-11-03 review): the owner DM must never wait on a label, and the
+    60s first draft could have held the whole finish path. The hub feed
+    still lands after it, so job/item titles carry the refined label."""
     if os.environ.get("QT_LABEL_REFINE") == "0":
         return
     if task.get("label_refined") or not (task.get("prompt") or "").strip():
@@ -1305,7 +1326,7 @@ def _refine_label(task):
         proc = subprocess.run(
             [claude, "--model", os.environ.get("QT_LABEL_MODEL") or "haiku",
              "-p", ask],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=20,
         )
         lines = (proc.stdout or "").strip().splitlines()
         label = lines[0].strip().strip('"\'') if lines else ""
@@ -1627,12 +1648,13 @@ def run_task(tid, interactive=False):
             finished=now(),
         )
         save(task)
-        # Before the hub feed: the label refinement lands in the job/item
-        # titles the feed writes, and the DM must land before deliver.py
-        # can auto-close the item as delivered.
+        # The DM lands before anything else optional (deliver.py auto-close
+        # depends on it); the label refinement runs before the hub feed so
+        # job/item titles carry it, but after the DM so a slow Haiku never
+        # delays the result reaching John (2026-11-03 review).
+        _dm_fallback(task, log_path)
         _refine_label(task)
         save(task)
-        _dm_fallback(task, log_path)
         _feed_hub(task, rc=rc)
 
         if status == "blocked":
@@ -1664,13 +1686,16 @@ def run_task(tid, interactive=False):
 # --- commands -----------------------------------------------------------
 
 def age(iso):
-    dt = datetime.datetime.fromisoformat(iso)
+    # fromisoformat before 3.11 rejects a trailing Z; hub stamps may carry
+    # one. Negative deltas (clock skew) clamp to 0 rather than printing
+    # "-3s" (both 2026-11-03 review).
+    dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
     if dt.tzinfo is not None:
         # Tasks written by the hub mirror carry tz-aware ISO stamps; mixing
         # them with naive local now() crashes the subtraction.
         dt = dt.astimezone().replace(tzinfo=None)
     delta = datetime.datetime.now() - dt
-    s = int(delta.total_seconds())
+    s = max(0, int(delta.total_seconds()))
     for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
         if s >= div:
             return f"{s // div}{unit}"
@@ -1713,9 +1738,12 @@ def cmd_open(fragment):
         candidates.append(os.path.join(task["run_cwd"], "output", "RESULT.md"))
     for path in candidates:
         if os.path.isfile(path):
-            subprocess.run(["open", path], capture_output=True)
-            print(f"opened {path}")
-            return
+            # 2026-11-03 review: check the rc -- a missing handler used to
+            # print a false success and swallow the fallbacks.
+            r = subprocess.run(["open", path], capture_output=True)
+            if r.returncode == 0:
+                print(f"opened {path}")
+                return
     result = (task.get("result") or "").strip()
     if result:
         print(result)
@@ -1898,10 +1926,14 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
     )
     save(task)
 
-    # The hub job for a continuation carries only this continuation's own
-    # result, not the accumulated task["result"] -- a fresh copy of the
-    # task record with result overridden, everything else (id, prompt,
-    # session_id, origin, ...) unchanged.
+    # A continuation is a finish too: the label refinement runs here as
+    # well, or a continued task keeps its heuristic label forever
+    # (2026-11-03 review). Skipped automatically when the original run
+    # already refined it. hub_task is built AFTER, so the job record
+    # carries the refined label along with this continuation's own result
+    # (not the accumulated task["result"]).
+    _refine_label(task)
+    save(task)
     hub_task = dict(task, result=result_text)
     _feed_hub(hub_task, rc=rc, thread=thread)
 

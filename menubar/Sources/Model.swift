@@ -685,7 +685,14 @@ struct MenuModel: Equatable {
         guard !cleared.isEmpty else { return self }
         let kept = records.filter { row in
             guard !row.status.isActive, let when = cleared[row.id] else { return true }
-            return (row.sortStamp ?? .distantPast) > when
+            // 2026-11-03 review: compare against `activity` only, never
+            // sortStamp -- a clock-less Pass row's sortStamp falls back to
+            // feedStamp (the current poll time), so the row reappeared on
+            // the very next poll and Clear silently did nothing. A row
+            // with no activity stamp has no clock to resurface with, so it
+            // stays cleared until it gains one (a finish, a re-fire).
+            guard let activity = row.activity else { return false }
+            return activity > when
         }
         guard kept.count != records.count else { return self }
         return MenuModel.build(records: kept, now: refreshedAt,

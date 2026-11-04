@@ -346,6 +346,11 @@ final class StatusController: ObservableObject {
         for row in rows where !row.status.isActive {
             next[row.id] = now
         }
+        // Prune entries for ids no longer in any ledger (2026-11-03
+        // review): clearedRows would otherwise grow forever. A re-fired
+        // task gets a fresh id, so nothing pruned is ever needed again.
+        let live = Set(model.records.map(\.id))
+        next = next.filter { live.contains($0.key) }
         clearedRows = next
         ClearedRows.save(next, defaults)
         model = model.clearing(next)
@@ -495,6 +500,12 @@ final class StatusController: ObservableObject {
         revealID = id
         revealTick += 1
         showHotkeyPanel()
+    }
+
+    /// MenuView calls once it has applied a reveal, so a stale id never
+    /// lingers for the next tick to re-read (2026-11-03 review).
+    func consumeReveal() {
+        revealID = nil
     }
 
     /// A producer-initiated banner dropped into the notify inbox by qt or

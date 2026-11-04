@@ -177,10 +177,15 @@ final class SystemNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate
         case Notice.Action.openPass.rawValue:
             openPass(info)
         default:
-            // Banner click: a notice that names its task opens the panel
-            // focused on that row (the 2026-11-03 deep link). Without one,
-            // the older fallbacks: a blocked notice resumes, a URL opens,
-            // anything else just shows the panel.
+            // Only the actual banner click routes anywhere; a dismissal
+            // (or any future system identifier) must not pop the panel
+            // open (2026-11-03 review).
+            guard response.actionIdentifier == UNNotificationDefaultActionIdentifier
+            else { break }
+            // A notice that names its task opens the panel focused on that
+            // row (the 2026-11-03 deep link). Without one, the older
+            // fallbacks: a blocked notice resumes, a URL opens, anything
+            // else just shows the panel.
             if let tid = info["taskID"] as? String {
                 DispatchQueue.main.async { [weak self] in self?.onOpenRecord?(tid) }
             } else if (category == .blocked || category == .blockedNoAllow),

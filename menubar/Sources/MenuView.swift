@@ -323,6 +323,7 @@ struct MenuView: View {
                 highlighted = id
                 expandedID = id
             }
+            controller.consumeReveal()
         }
         .onChange(of: controller.summonTick) { _, _ in
             // A cached, reused panel (StatusController.showHotkeyPanel keeps
@@ -973,7 +974,10 @@ struct MenuView: View {
         let text = (record.error ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         Actions.copyToPasteboard(text)
-        controller.post(kind: .info, title: "Result copied")
+        // The field holds the error on failed rows, the result body on
+        // successful ones -- name the toast accordingly (2026-11-03 review).
+        let isError = record.status == .failed || record.status == .timeout
+        controller.post(kind: .info, title: isError ? "Error copied" : "Result copied")
     }
 
     private func openReport(_ record: TaskRecord) {
