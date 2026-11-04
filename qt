@@ -199,6 +199,45 @@ def resolve_slack_guard_cmd():
     return None, None
 
 
+def allowlist_path():
+    """The user-managed tool allowlist: $QT_ALLOW_FILE > $QT_DATA/allow.json.
+    Written by `qt allow` and the menubar's "Always Allow Tool" action;
+    read here (merged into per-run --settings) and by both Slack guards
+    (consulted before a denial). Shape: {"allow": [tool_name, ...]}."""
+    return os.environ.get("QT_ALLOW_FILE") or os.path.join(QT_DATA, "allow.json")
+
+
+def load_user_allowlist():
+    try:
+        with open(allowlist_path()) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    entries = data.get("allow") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return set()
+    return {e for e in entries if isinstance(e, str)}
+
+
+def _steerable_allowlist():
+    """The user allowlist, filtered to what it's for: positively-classified
+    read-only MCP tools. Imports the guard for the classification; an
+    unloadable guard means an empty set (fail safe), never the raw file."""
+    entries = load_user_allowlist()
+    if not entries:
+        return set()
+    guard_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "qt-guard.py")
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("qt_guard", guard_path)
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+    except Exception:
+        return set()
+    return {t for t in entries
+            if t.startswith("mcp__") and guard.is_read_only_tool(t)}
+
+
 def render_slack_guard_settings(tid):
     """Write a one-off Claude Code --settings file wiring the chosen Slack
     guard (see resolve_slack_guard_cmd()) as a PreToolUse hook on
@@ -215,8 +254,16 @@ def render_slack_guard_settings(tid):
     guard_path, _source = resolve_slack_guard_cmd()
     if not guard_path:
         return None
+    # The user-managed allowlist (~/.quicktasks/allow.json -- written by
+    # `qt allow` and the menubar's "Always Allow Tool" action) joins the
+    # shipped read-only set here, filtered through the same positive
+    # read-only MCP predicate the guards apply (2026-11-03 review: a
+    # hand-edited entry like Write or slack_send_message must not ride
+    # into every run's permissions.allow). The guards also consult the
+    # file directly for the Slack-connector branch, so a listed read
+    # passes even when a hook rather than permissions would have denied.
     settings = {
-        "permissions": {"allow": QT_TOOLS_ALLOW},
+        "permissions": {"allow": sorted(set(QT_TOOLS_ALLOW) | _steerable_allowlist())},
         "hooks": {
             "PreToolUse": [
                 {
@@ -2238,6 +2285,118 @@ def cmd_uninstall_handler():
     print(f"removed {app} and its quicktask:// registration")
 
 
+def cmd_allow(tool):
+    """`qt allow <tool>`: add a tool to the user allowlist both guards
+    consult, so future headless runs stop blocking on it. Write-shaped
+    tools are refused -- the LD-224 destination guard always applies to
+    them; the right knob for a Slack channel is slack_allowed_channels."""
+    tool = tool.strip()
+    if not tool:
+        sys.exit("usage: qt allow <tool_name>")
+    # Import the guard from beside this script's realpath (they ship
+    # together) so the classification is the guard's own logic. 2026-11-03
+    # review: a drifted local fallback list already diverged once, and the
+    # allowlist is a POSITIVE read-only gate, not a send-like veto --
+    # refuse when the guard can't be asked rather than guessing. Scoping to
+    # mcp__* names keeps `qt allow Write`/`qt allow Bash` from silently
+    # widening every future run's permissions beyond what the help text
+    # promises.
+    guard_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "qt-guard.py")
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("qt_guard", guard_path)
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        read_only = guard.is_read_only_tool(tool)
+    except Exception as e:
+        sys.exit(f"qt allow: could not load qt-guard.py for classification "
+                 f"({e}); refusing rather than guessing")
+    if not (tool.startswith("mcp__") and read_only):
+        sys.exit(f"qt allow: refusing {tool!r} -- the allowlist only covers "
+                 "tools the guard can positively classify as read-only MCP "
+                 "tools. Write-shaped tools keep the LD-224 destination "
+                 "guard; to bless a Slack channel, add it to "
+                 "slack_allowed_channels in ~/.quicktasks/config.json")
+    path = allowlist_path()
+    entries = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("allow"), list):
+            entries = [e for e in data["allow"] if isinstance(e, str)]
+    except (OSError, json.JSONDecodeError):
+        pass
+    if tool in entries:
+        print(f"already allowed: {tool}")
+        return
+    entries.append(tool)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"allow": entries}, f, indent=2)
+    os.replace(tmp, path)
+    print(f"allowed: {tool}  ({path})")
+    print("future headless runs will not block on it; already-blocked tasks "
+          "still need `qt resume <id>`")
+
+
+def _printable(s):
+    """Ledger tool names and reasons come from hook payloads (ultimately
+    MCP-connector-influenced); strip anything non-printable before they
+    touch the terminal (2026-11-03 review)."""
+    return "".join(c if c.isprintable() else "?" for c in str(s))
+
+
+def cmd_denials(n=25):
+    """`qt denials [n]`: the steering report over the guard denial ledger
+    ($QT_DENIALS_LOG > $QT_DATA/logs/denials.jsonl) -- which tools headless
+    runs keep getting denied, how often, and the exact `qt allow` / config
+    move that would have prevented each. Read-only."""
+    path = os.environ.get("QT_DENIALS_LOG") or os.path.join(QT_DATA, "logs", "denials.jsonl")
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        print(f"no denials recorded yet ({path})")
+        return
+    if not rows:
+        print(f"no denials recorded yet ({path})")
+        return
+    by_tool = {}
+    for r in rows:
+        name = r.get("tool_name") or "(unparsed payload)"
+        slot = by_tool.setdefault(name, {"count": 0, "last_ts": "", "reason": "",
+                                         "guards": set()})
+        slot["count"] += 1
+        ts = r.get("ts") or ""
+        if ts >= slot["last_ts"]:
+            slot["last_ts"] = ts
+            slot["reason"] = (r.get("reason") or "").strip()
+        if r.get("guard"):
+            slot["guards"].add(r["guard"])
+    ranked = sorted(by_tool.items(), key=lambda kv: (-kv[1]["count"], kv[0]))
+    print(f"{len(rows)} denials, {len(by_tool)} distinct tools  ({path})\n")
+    for name, slot in ranked[:n]:
+        guards = "/".join(sorted(slot["guards"])) or "?"
+        print(f"{slot['count']:4}x  {_printable(name)}  [{guards}]  last {slot['last_ts'][:16]}")
+        if slot["reason"]:
+            print(f"       {_printable(slot['reason'])[:120]}")
+    allowed = load_user_allowlist()
+    print(f"\nallowlist ({allowlist_path()}): "
+          + (", ".join(sorted(allowed)) if allowed else "(empty)"))
+    print("\nsteer it:  qt allow <tool>            -- stop blocking on a read-shaped tool")
+    print("           slack_allowed_channels     -- bless a Slack write destination "
+          "(~/.quicktasks/config.json)")
+
+
 def cmd_doctor():
     """Read-only environment health check. Exits nonzero on a hard failure
     (qt cannot run tasks at all); soft issues are marked "!" with a remedy
@@ -2572,6 +2731,8 @@ qt · fire-and-forget quicktasks for Claude Code
   qt uninstall-handler   remove the quicktask:// handler and registration
   qt trust [dir]         list trusted dirs, or add one (tasks run in place)
   qt untrust <dir>       remove a trusted dir
+  qt denials [n]         rank what guards keep denying + the fix for each
+  qt allow <tool>        stop blocking headless runs on a read-shaped tool
   qt hub <dir>|off|status   feed finished tasks into a Pass ledger, or check
 
 Runs fired from inside a trusted dir run there with "auto" permissions
@@ -2645,6 +2806,11 @@ def main():
         cmd_trust(args[1] if len(args) > 1 else None)
     elif cmd == "untrust" and len(args) > 1:
         cmd_untrust(args[1])
+    elif cmd == "denials":
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 25
+        cmd_denials(n)
+    elif cmd == "allow" and len(args) > 1:
+        cmd_allow(args[1])
     elif cmd == "hub":
         cmd_hub(args[1] if len(args) > 1 else None)
     elif cmd == "_run" and len(args) > 1:
@@ -2674,10 +2840,10 @@ def main():
             launch_resume_terminal(latest_blocked())
     elif cmd == "_test-echo":
         cmd_test_echo()
-    elif cmd in ("log", "resume", "untrust"):
+    elif cmd in ("log", "resume", "untrust", "allow"):
         # without this arm a bare `qt resume` would fall through to the
         # catch-all and queue a paid task with "resume" as the prompt
-        sys.exit(f"usage: qt {cmd} <id>")
+        sys.exit(f"usage: qt {cmd} <{'tool' if cmd == 'allow' else 'id'}>")
     else:
         wait = False
         in_dir = None
