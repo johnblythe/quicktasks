@@ -15,6 +15,13 @@
 //   --ask-post <id> <move> [json]
 //       The real POST /asks/<id>/<move>; prints the MoveResult. Exit 0 when the
 //       move took, 1 when it did not (a 409 is an answer, not a crash).
+//   --ask-dump-rows [--ask-expand <id-substring>] [--ask-done <id-substring>] [--ask-undo]
+//       The ask menu the rows draw (Q3): source, badge (the hub's counts.badge,
+//       verbatim), the sections in plan order with every row's detail and
+//       affordances, and the legacy ids when this hub predates the ask API.
+//       --ask-expand runs the row's expand plan (thread fetch + seen for an
+//       unseen row); --ask-done posts done and prints the undo line the row
+//       shows, and --ask-undo spends the returned token right after.
 //
 // Entry (App.swift) dispatches on `--dump-model` today and does not know these
 // flags, so a test invokes them next to it (`--dump-model --ask-dump-model`);
@@ -26,6 +33,7 @@ import Foundation
 enum AskSeams {
     static func run(args: [String]) -> Int32 {
         if args.contains("--ask-dump-model") { return dumpModel(args: args) }
+        if args.contains("--ask-dump-rows") { return dumpRows(args: args) }
         if args.contains("--ask-dump-thread") { return dumpThread(args: args) }
         if args.contains("--ask-post") { return post(args: args) }
         return fail("unknown --ask-* seam: \(args.filter { $0.hasPrefix("--ask-") }.joined(separator: " "))")
@@ -103,6 +111,147 @@ enum AskSeams {
                          "runs": thread.runs.map(runJSON),
                          "cached": cache.count])
         }
+    }
+
+    // MARK: --ask-dump-rows
+
+    /// The ask menu as data (Q3): the same `AskBoard` the rows draw, plus the
+    /// optional expand/done walkthroughs so a test can prove what a row *does*
+    /// without a display -- the plan and the wording come from the same pure
+    /// code the view runs.
+    private static func dumpRows(args: [String]) -> Int32 {
+        let config = StoreConfig.resolve()
+        let feed = Feed.loadAsks(config: config)
+        let board = AskBoard.build(feed: feed)
+
+        var payload: [String: Any] = [
+            "source": feed.source.rawValue,
+            "speaks_asks": board.speaksAsks,
+            "badge": board.badge,
+            "headline": board.headline,
+            "counts": countsJSON(feed.counts),
+            "footer": board.speaksAsks ? AskFooter.stub : NSNull(),
+            "sections": board.sections.map { entry in
+                [
+                    "key": entry.section.rawValue,
+                    "label": entry.section.label,
+                    "count": entry.rows.count,
+                    "ids": entry.rows.map { $0.id },
+                    "rows": entry.rows.map(rowModelJSON),
+                ] as [String: Any]
+            },
+        ]
+        // The legacy side, so a hub that predates the ask API can be proven
+        // to keep its rows rather than blanking the menu.
+        if let legacy = board.legacy {
+            payload["legacy_source"] = legacy.source.rawValue
+            payload["legacy_ids"] = legacy.records.map { $0.id }
+        } else {
+            payload["legacy_source"] = NSNull()
+            payload["legacy_ids"] = NSNull()
+        }
+
+        if let needle = value(args, "--ask-expand") {
+            guard let row = board.row(matching: needle) else {
+                return fail("no ask id contains \"\(needle)\"")
+            }
+            payload["expanded"] = expandJSON(row: row, feed: feed, config: config)
+        }
+        if let needle = value(args, "--ask-done") {
+            guard let row = board.row(matching: needle) else {
+                return fail("no ask id contains \"\(needle)\"")
+            }
+            payload["done"] = doneJSON(row: row, args: args, config: config)
+        }
+        return emit(payload)
+    }
+
+    /// The expand walkthrough: the same `AskExpand.plan` the row runs, then
+    /// the same I/O in the same order (thread first, `seen` only once the
+    /// answer is in hand).
+    private static func expandJSON(row: AskRowModel,
+                                   feed: AskFeed,
+                                   config: StoreConfig) -> [String: Any] {
+        let plan = AskExpand.plan(ask: row.ask, source: feed.source)
+        var out: [String: Any] = [
+            "id": row.id,
+            "post_seen": plan.postSeen,
+        ]
+        guard plan.fetchThread, let base = config.passURL else {
+            // The file fallback: no thread endpoint, so the peek shows the
+            // excerpt and nothing is posted anywhere.
+            out["from_thread"] = false
+            out["answer_text"] = row.ask.answerExcerpt ?? NSNull()
+            return out
+        }
+        let client = AskClient(base: base)
+        switch client.thread(id: row.id, updatedAt: row.ask.updatedAt) {
+        case .failure(let failure):
+            out["from_thread"] = false
+            out["error"] = failure.problem.message
+            out["answer_text"] = row.ask.answerExcerpt ?? NSNull()
+        case .success(let thread):
+            out["from_thread"] = true
+            out["answer_text"] = thread.answerText
+            out["answer_truncated"] = thread.answerTruncated
+            if plan.postSeen {
+                let seen = client.post(id: row.id, move: "seen")
+                out["seen_posted"] = true
+                out["seen_ok"] = seen.ok
+            } else {
+                out["seen_posted"] = false
+            }
+        }
+        return out
+    }
+
+    /// The done walkthrough: the real POST, the exact line the row draws
+    /// (`AskMoveLine`), and -- with `--ask-undo` -- the Z keystroke's own
+    /// POST spending the returned token.
+    private static func doneJSON(row: AskRowModel,
+                                 args: [String],
+                                 config: StoreConfig) -> [String: Any] {
+        guard let base = config.passURL else {
+            return ["id": row.id, "error": "the Pass feed is off (QT_PASS_URL is empty)"]
+        }
+        let client = AskClient(base: base)
+        let result = client.post(id: row.id, move: "done")
+        var out: [String: Any] = [
+            "id": row.id,
+            "ok": result.ok,
+            "kind": result.kind.rawValue,
+            "message": result.message,
+            "line": AskMoveLine.done(result),
+            "undo_token": result.undo?.token ?? NSNull(),
+        ]
+        if args.contains("--ask-undo"), let token = result.undo?.token {
+            let undone = client.post(id: row.id, move: "undo", body: ["token": token])
+            out["undo"] = [
+                "ok": undone.ok,
+                "message": undone.message,
+                "line": AskMoveLine.undo(undone),
+            ] as [String: Any]
+        }
+        return out
+    }
+
+    /// One row as the seam reports it: exactly the fields the view derives,
+    /// nothing the view does not read.
+    private static func rowModelJSON(_ row: AskRowModel) -> [String: Any] {
+        [
+            "id": row.id,
+            "title": row.title,
+            "state": row.ask.state.raw,
+            "gray": row.gray,
+            "detail": row.detail,
+            "age": row.ageText ?? NSNull(),
+            "now_line": row.nowLine ?? NSNull(),
+            "unseen": row.ask.unseen,
+            "open_url": row.ask.url ?? NSNull(),
+            "open_enabled": row.openEnabled,
+            "can_done": row.canDone,
+            "can_expand": true,
+        ] as [String: Any]
     }
 
     // MARK: --ask-post

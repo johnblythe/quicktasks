@@ -33,10 +33,24 @@ enum Snapshot {
         // Accessory, so rendering never puts an icon in the Dock or steals focus.
         app.setActivationPolicy(.accessory)
 
+        // `--expand <id-substring>` (Q3): render with that ask row's peek
+        // panel already open, so a snapshot can show the answer in place
+        // without a click. Read from argv here rather than passed in,
+        // because Entry hands this function only the PNG path -- the flag
+        // rides along in the same command line. Substring, not equality,
+        // because ids are slugs and a fragment is what a person types.
+        let argv = Array(CommandLine.arguments.dropFirst())
+        var preexpand: String?
+        if let i = argv.firstIndex(of: "--expand"), i + 1 < argv.count,
+           !argv[i + 1].hasPrefix("--") {
+            preexpand = argv[i + 1]
+        }
+
         // A long interval: the initial synchronous load in init() is the data
         // we want, and a polling timer would only add churn during rendering.
         let controller = StatusController(interval: 3600, activatesGlobalHotkey: false)
-        return render(NSHostingView(rootView: MenuView(controller: controller)),
+        return render(NSHostingView(rootView: MenuView(controller: controller,
+                                                       preexpandAsk: preexpand)),
                       width: width,
                       minHeight: 140,
                       to: path)
