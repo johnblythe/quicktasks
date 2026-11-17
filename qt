@@ -240,7 +240,7 @@ def _steerable_allowlist():
             if t.startswith("mcp__") and guard.is_read_only_tool(t)}
 
 
-def render_slack_guard_settings(tid):
+def render_slack_guard_settings(tid, allow_once=()):
     """Write a one-off Claude Code --settings file wiring the chosen Slack
     guard (see resolve_slack_guard_cmd()) as a PreToolUse hook on
     SLACK_GUARD_MATCHER, plus a `permissions.allow` list (QT_TOOLS_ALLOW)
@@ -252,9 +252,18 @@ def render_slack_guard_settings(tid):
     path -- same convention _seed_hub_item() uses for its own per-item
     fragment file. Returns None (skip --settings) when no guard script
     exists at all; the caller is responsible for removing the file once
-    the run finishes."""
+    the run finishes.
+
+    `allow_once` (tool names, `qt continue --allow-once`) is added to this
+    run's permissions.allow only: it is rendered into this per-run file and
+    nowhere else, so it vanishes with the file and never reaches the user
+    allowlist or a later run. Unlike the shipped set it is not filtered to
+    read-only tools: the owner approved exactly that tool for exactly this
+    run (the LD-224 Slack hook below still gates Slack sends). With
+    allow_once set the file is written even when no guard script exists."""
     guard_path, _source = resolve_slack_guard_cmd()
-    if not guard_path:
+    allow_once = sorted({t.strip() for t in (allow_once or ()) if t and t.strip()})
+    if not guard_path and not allow_once:
         return None
     # The user-managed allowlist (~/.quicktasks/allow.json -- written by
     # `qt allow` and the menubar's "Always Allow Tool" action) joins the
@@ -265,8 +274,11 @@ def render_slack_guard_settings(tid):
     # file directly for the Slack-connector branch, so a listed read
     # passes even when a hook rather than permissions would have denied.
     settings = {
-        "permissions": {"allow": sorted(set(QT_TOOLS_ALLOW) | _steerable_allowlist())},
-        "hooks": {
+        "permissions": {"allow": sorted(set(QT_TOOLS_ALLOW) | _steerable_allowlist()
+                                        | set(allow_once))},
+    }
+    if guard_path:
+        settings["hooks"] = {
             "PreToolUse": [
                 {
                     "matcher": SLACK_GUARD_MATCHER,
@@ -277,7 +289,6 @@ def render_slack_guard_settings(tid):
                 }
             ]
         }
-    }
     os.makedirs(TMP_DIR, exist_ok=True)
     path = os.path.join(TMP_DIR, f"slack-guard-{tid}.json")
     tmp = path + ".tmp"
@@ -1065,10 +1076,52 @@ def queue(prompt, wait=False, in_dir=None, model=None):
         if t["status"] == "blocked":
             print(f"\ndenied: {', '.join(d.get('tool_name', '?') for d in t.get('denials', []))}")
             print(f"qt resume {tid}  # approve and continue")
+        elif t["status"] == "question":
+            print(f"\nqt resume {tid} --prompt \"<your answer>\"  # answer and continue")
         sys.exit(0 if t["status"] == "done" else 1)
     _spawn_run(tid)
     trust_note = f" (trusted dir, {perm_mode})" if trusted else ""
     print(f"queued {tid}{trust_note}")
+
+
+# --- question convention ------------------------------------------------
+# Asks contract 1.7: a run that cannot finish without the owner's input ends
+# its final message with one line `ASK: <question>`. The result is then a
+# `question` (not `done`), the ask waits for the owner, and a follow-up
+# (`qt resume <id> --prompt "<answer>"`) answers it. Gated by qt config
+# `questions` (default true); off means the tail is not added and a trailing
+# ASK: line is just text in a normal done result.
+
+QUESTION_TAIL = (
+    "\n\n(If you cannot finish without the owner's input, end your final "
+    "message with one line `ASK: <question>`. Use it only when you are truly "
+    "stuck; otherwise make the most reasonable assumption and finish.)"
+)
+
+# Sent by `qt continue --skip`: the owner declined the denied tool.
+SKIP_PROMPT = ("That tool is not available to you; skip that step and "
+               "finish the rest.")
+
+
+def questions_enabled():
+    """qt config `questions` (default true). Unreadable config = default."""
+    try:
+        v = load_config().get("questions", True)
+    except (OSError, ValueError, AttributeError):
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "0", "off", "no")
+    return v is not False and v != 0
+
+
+def _question_from_result(result_raw):
+    """The question when the last non-empty line of a result starts `ASK:`
+    and has text after it, else None."""
+    lines = [ln.strip() for ln in (result_raw or "").splitlines() if ln.strip()]
+    if lines and lines[-1].startswith("ASK:"):
+        q = lines[-1][len("ASK:"):].strip()
+        return q or None
+    return None
 
 
 def task_prompt(task):
@@ -1101,7 +1154,7 @@ def task_prompt(task):
         f"{_resume_footer(tid)}\n"
         "Owner DMs only; never add this line to a channel post, and do not add "
         "it to your final result text.)"
-    )
+    ) + (QUESTION_TAIL if questions_enabled() else "")
 
 
 def _resume_footer(tid):
@@ -1404,6 +1457,17 @@ def _hub_job_record(task, item_id, rc, thread=None):
         job["rc"] = rc
     if thread:
         job["thread_ts"] = thread
+    # Optional run descriptors (hub job.json additions): set only by
+    # cmd_resume_prompt on the transient hub_task copy, never persisted.
+    # resume_session is the session THIS run resumed (--resume <sid>), not
+    # the new session_id the run produced -- by feed time task["session_id"]
+    # has already moved on to the new one.
+    if task.get("_run_kind"):
+        job["kind"] = task["_run_kind"]
+    if task.get("_allow_once"):
+        job["allow_once"] = list(task["_allow_once"])
+    if task.get("_resume_session"):
+        job["resume_session"] = task["_resume_session"]
 
     if status == "done":
         job["status"] = "done"
@@ -1415,6 +1479,10 @@ def _hub_job_record(task, item_id, rc, thread=None):
     elif status == "stopped":
         job["status"] = "stopped"
         body = task.get("result") or "Stopped by you."
+    elif status == "question":
+        job["status"] = "question"
+        job["question"] = task.get("question") or _question_from_result(task.get("result")) or ""
+        body = task.get("result") or job["question"] or "(no result text)"
     elif status == "blocked":
         denials = task.get("denials") or []
         names = ", ".join(sorted({d.get("tool_name") or "?" for d in denials})) or "a tool call"
@@ -1548,7 +1616,7 @@ def _append_log(log_path, text):
         pass
 
 
-def _parse_claude_run(stdout, stderr, rc):
+def _parse_claude_run(stdout, stderr, rc, questions=None):
     """Parse a claude --output-format json run's stdout into the
     status/result mapping shared by run_task() and headless resume's
     post-run bookkeeping (qt resume <id> --prompt): (status, result_raw,
@@ -1558,7 +1626,11 @@ def _parse_claude_run(stdout, stderr, rc):
     result_text is what gets persisted as the task's result: result_raw,
     or -- when the run wasn't ok -- the tail of stderr as a fallback.
     denials_out is the {"tool_name", "tool_input"} shape both callers
-    store on the task record."""
+    store on the task record.
+
+    An otherwise-ok run whose result ends in an `ASK: <question>` line maps
+    to status "question" (callers read the text with _question_from_result);
+    `questions` None defers to questions_enabled()."""
     data = {}
     for line in reversed(stdout.strip().splitlines()):
         line = line.strip()
@@ -1576,6 +1648,9 @@ def _parse_claude_run(stdout, stderr, rc):
         status = "blocked"
     elif ok:
         status = "done"
+        if _question_from_result(result_raw) and (
+                questions_enabled() if questions is None else questions):
+            status = "question"
     else:
         status = "failed"
     result_text = result_raw or (stderr.strip()[-300:] if not ok else "")
@@ -1665,6 +1740,8 @@ def run_task(tid, interactive=False):
             denials=denials_out,
             finished=now(),
         )
+        if status == "question":
+            task["question"] = _question_from_result(result_raw)
         save(task)
         # The DM lands before anything else optional (deliver.py auto-close
         # depends on it); the label refinement runs before the hub feed so
@@ -1678,6 +1755,10 @@ def run_task(tid, interactive=False):
         if status == "blocked":
             if not interactive:
                 notify_blocked(task, denials_out)
+            return
+        if status == "question":
+            notify("Quicktask has a question ?", task["prompt"], task.get("question") or status,
+                   kind="question", task_id=tid)
             return
         icon = "✓" if status == "done" else "✗"
         cost = f" · ${task['cost_usd']:.2f}" if task.get("cost_usd") else ""
@@ -1729,7 +1810,8 @@ def cmd_list(n=15):
         print('no quicktasks yet · qt "do a thing"')
         return
     glyph = {"done": "✓", "failed": "✗", "timeout": "⏱", "running": "…",
-             "queued": "·", "blocked": "⊘", "dropped": "—", "stopped": "■"}
+             "queued": "·", "blocked": "⊘", "dropped": "—", "stopped": "■",
+             "question": "?"}
     for f in files:
         with open(os.path.join(TASKS_DIR, f)) as fh:
             t = json.load(fh)
@@ -1933,7 +2015,7 @@ def cmd_resume(tid):
     os.execvp(claude, [claude, "--resume", sid])
 
 
-def cmd_resume_prompt(fragment, prompt_text, thread=None):
+def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=None):
     """`qt resume <id> --prompt "<text>" [--thread <ts>]`: continue a
     finished task's Claude session headlessly, with `prompt_text` as the
     next user turn, then mirror the result into the hub as a new job (so
@@ -1944,7 +2026,11 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
 
     Refuses (non-zero exit, one-line message) when the task is currently
     running or has no recorded session_id -- resuming either would either
-    race a live run or have nothing to resume."""
+    race a live run or have nothing to resume.
+
+    `allow_once` / `kind` are for `qt continue`: the tools go into this run's
+    --settings allow list only, and kind="continue" is stamped on the
+    resumes[] entry and the hub job record."""
     bootstrap()
     tid = match_id(fragment)
     task = load(tid)
@@ -1963,7 +2049,14 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
 
     task["status"] = "running"
     task["pid"] = os.getpid()
+    task["question"] = None
     save(task)
+    allow_once = [t for t in (allow_once or ()) if t]
+    extra = {}
+    if kind:
+        extra["kind"] = kind
+    if allow_once:
+        extra["allow_once"] = list(allow_once)
 
     def _elapsed():
         return round(time.monotonic() - start_monotonic)
@@ -1976,7 +2069,8 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
         task.update(status="failed", result=(f"{previous}\n\n{heading}" if previous else heading),
                     finished=now())
         save(task)
-        hub_task = dict(task, result="claude CLI not found")
+        hub_task = dict(task, result="claude CLI not found", _run_kind=kind,
+                        _allow_once=allow_once, _resume_session=sid)
         _feed_hub(hub_task, rc=None, thread=thread)
         notify("Quicktask continuation failed ✗", task["prompt"], "claude CLI not found",
                kind="failed", task_id=tid)
@@ -1994,7 +2088,7 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
     ]
     if task.get("model"):
         cmd += ["--model", task["model"]]
-    settings_path = render_slack_guard_settings(tid)
+    settings_path = render_slack_guard_settings(tid, allow_once=allow_once)
     if settings_path:
         cmd += ["--settings", settings_path]
 
@@ -2013,12 +2107,14 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
             heading = (f"## Continuation {started}\n\n**Prompt:** {prompt_text}\n\n"
                        f"timed out after {TIMEOUT}s")
             resumes = task.get("resumes") or []
-            resumes.append({"at": started, "prompt": prompt_text, "rc": None, "thread": thread})
+            resumes.append({"at": started, "prompt": prompt_text, "rc": None, "thread": thread,
+                            **extra})
             task.update(status="timeout",
                         result=(f"{previous}\n\n{heading}" if previous else heading),
                         finished=now(), resumes=resumes)
             save(task)
-            hub_task = dict(task, result=f"timed out after {TIMEOUT}s")
+            hub_task = dict(task, result=f"timed out after {TIMEOUT}s", _run_kind=kind,
+                            _allow_once=allow_once, _resume_session=sid)
             _feed_hub(hub_task, rc=None, thread=thread)
             notify("Quicktask continuation timed out", task["prompt"],
                    f"after {TIMEOUT}s · qt log {tid}", kind="timeout", task_id=tid)
@@ -2045,7 +2141,8 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
     previous = task.get("result") or ""
     heading = f"## Continuation {started}\n\n**Prompt:** {prompt_text}\n\n{result_text}"
     resumes = task.get("resumes") or []
-    resumes.append({"at": started, "prompt": prompt_text, "rc": rc, "thread": thread})
+    resumes.append({"at": started, "prompt": prompt_text, "rc": rc, "thread": thread,
+                    **extra})
 
     task.update(
         status=status,
@@ -2056,6 +2153,8 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
         finished=now(),
         resumes=resumes,
     )
+    if status == "question":
+        task["question"] = _question_from_result(result_raw)
     save(task)
 
     # A continuation is a finish too: the label refinement runs here as
@@ -2066,11 +2165,15 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
     # (not the accumulated task["result"]).
     _refine_label(task)
     save(task)
-    hub_task = dict(task, result=result_text)
+    hub_task = dict(task, result=result_text, _run_kind=kind,
+                    _allow_once=allow_once, _resume_session=sid)
     _feed_hub(hub_task, rc=rc, thread=thread)
 
     if status == "blocked":
         notify_blocked(task, denials_out)
+    elif status == "question":
+        notify("Quicktask has a question ?", task["prompt"], task.get("question") or status,
+               kind="question", task_id=tid)
     else:
         icon = "✓" if status == "done" else "✗"
         cost = f" · ${cost_usd:.2f}" if cost_usd else ""
@@ -2086,8 +2189,32 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
         "branch": "headless", "id": tid, "rc": rc, "elapsed": _elapsed(),
     })
 
-    if status != "done":
+    if status not in ("done", "question"):
         sys.exit(1)
+
+
+def cmd_continue(fragment, allow_once=(), skip=False, prompt_text=None):
+    """`qt continue <id> (--allow-once <tool>)... | --skip [--prompt <text>]`:
+    the move after a blocked run. Headless `--resume <session>` exactly like
+    `qt resume <id> --prompt`, but --allow-once puts the tools in this one
+    run's --settings allow list (nothing persisted; `qt allow` is the
+    permanent version) and --skip sends the standard skip instruction.
+    --prompt replaces the default wording. Same exit codes as resume."""
+    allow_once = [t.strip() for t in allow_once if t and t.strip()]
+    if skip and allow_once:
+        sys.exit("usage: qt continue <id> (--allow-once <tool>)... | --skip [--prompt <text>]"
+                 " (--allow-once and --skip are exclusive)")
+    if not skip and not allow_once:
+        sys.exit("usage: qt continue <id> (--allow-once <tool>)... | --skip [--prompt <text>]")
+    if prompt_text is not None and prompt_text.strip():
+        text = prompt_text.strip()
+    elif skip:
+        text = SKIP_PROMPT
+    else:
+        names = ", ".join(allow_once)
+        text = (f"You now have permission to use {names} for this run. "
+                "Continue where you left off and finish the task.")
+    cmd_resume_prompt(fragment, text, allow_once=allow_once, kind="continue")
 
 
 def cmd_trust(path=None):
@@ -3058,6 +3185,9 @@ qt · fire-and-forget quicktasks for Claude Code
   qt resume <id> --prompt "<text>" [--thread <ts>]
                           continue headlessly with <text> as the next turn,
                           mirrored into the hub; --prompt - reads stdin
+  qt continue <id> --allow-once <tool> [--allow-once <tool>]... | --skip
+                          [--prompt "<text>"|-]  continue a blocked run
+                          headlessly; the tools are allowed for that run only
   qt setup               pick terminal, trusted dirs, permission mode
   qt doctor              read-only environment health check
   qt install-handler     register quicktask:// links (clickable Slack resume)
@@ -3130,6 +3260,29 @@ def main():
             cmd_resume_prompt(fragment, prompt_text, thread=thread)
         else:
             cmd_resume(match_id(fragment))
+    elif cmd == "continue" and len(args) > 1:
+        rest = args[2:]
+        allow_once, skip, prompt_text = [], False, None
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--allow-once":
+                if i + 1 >= len(rest):
+                    sys.exit("qt continue: --allow-once needs a tool name")
+                allow_once.append(rest[i + 1])
+                i += 2
+            elif rest[i] == "--skip":
+                skip = True
+                i += 1
+            elif rest[i] == "--prompt":
+                if i + 1 >= len(rest):
+                    sys.exit("qt continue: --prompt needs text (or - to read stdin)")
+                prompt_text = rest[i + 1]
+                i += 2
+            else:
+                sys.exit("usage: qt continue <id> (--allow-once <tool>)... | --skip [--prompt <text>|-]")
+        if prompt_text == "-":
+            prompt_text = sys.stdin.read()
+        cmd_continue(args[1], allow_once=allow_once, skip=skip, prompt_text=prompt_text)
     elif cmd == "stop" and len(args) > 1:
         cmd_stop(args[1])
     elif cmd == "retry" and len(args) > 1:
@@ -3188,7 +3341,7 @@ def main():
             launch_resume_terminal(latest_blocked())
     elif cmd == "_test-echo":
         cmd_test_echo()
-    elif cmd in ("log", "resume", "untrust", "allow", "stop", "retry"):
+    elif cmd in ("log", "resume", "untrust", "allow", "stop", "retry", "continue"):
         # without this arm a bare `qt resume` would fall through to the
         # catch-all and queue a paid task with "resume" as the prompt
         sys.exit(f"usage: qt {cmd} <{'tool' if cmd == 'allow' else 'id'}>")
