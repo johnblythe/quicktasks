@@ -236,6 +236,111 @@ enum Actions {
         PassClient(base: base).capture(text: text)
     }
 
+    // MARK: - asks: yours, find, desk (Q11)
+
+    /// `GET /asks/search?q=` (contract 1.6, H11): every ask ever -- done and
+    /// archived included, unlike the list -- whose words, answer, or title
+    /// match the query. Refusals and transport failures come back as plain
+    /// Problems; an empty query is not a request at all.
+    static func searchAsks(base: URL, query: String) -> Result<[AskSearchHit], Problem> {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return .success([]) }
+        var parts = URLComponents(url: base.appendingPathComponent("asks/search"),
+                                  resolvingAgainstBaseURL: false)
+        parts?.queryItems = [URLQueryItem(name: "q", value: q)]
+        guard let url = parts?.url else { return .failure("bad search URL") }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        switch AskClient.send(request, timeout: 8) {
+        case .success(let reply):
+            return AskSearchHit.decode(reply.data)
+        case .failure(let failure):
+            // A refusal that carried the hub's own message shows that
+            // message -- "search is off" -- never "HTTP 500: {…}".
+            if let obj = (try? JSONSerialization.jsonObject(with: failure.body)) as? [String: Any],
+               let message = obj["message"] as? String, !message.isEmpty {
+                return .failure(Problem(message))
+            }
+            return .failure(failure.code == 404
+                            ? Problem("this Pass has no ask search")
+                            : failure.problem)
+        }
+    }
+
+    /// The body POST /asks carries for mode "remind" (contract 1.6, H12):
+    /// the same shape askFirst sends -- text, mode, door, the directory a
+    /// Run-now fire of the same words would use -- plus the reminder time.
+    static func remindBody(text: String, dir: URL?, remindAt: Date) -> [String: Any] {
+        var body: [String: Any] = [
+            "text": text,
+            "mode": "remind",
+            // Section 1.3's door table: menubar (widget or summon) -> typed.
+            "door": "typed",
+        ]
+        if let dir { body["dir"] = dir.path }
+        body["remind_at"] = isoStamp(remindAt)
+        return body
+    }
+
+    /// ⌥⏎ Remind me instead: `POST /asks {mode: "remind"}` -- the typed
+    /// words become a todo of John's with a reminder time, not a run. Every
+    /// refusal comes back as a MoveResult so the hub's own message is what
+    /// shows ("creating an ask is not built yet", on a hub that has not
+    /// shipped H12) -- never a dead button, and no /capture fallback: a
+    /// silently captured item is not a reminder.
+    static func remind(text: String, dir: URL?, remindAt: Date, base: URL) -> MoveResult {
+        let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stripped.isEmpty else { return .transportFailure("nothing to ask") }
+        guard let body = try? JSONSerialization.data(
+                withJSONObject: remindBody(text: stripped, dir: dir, remindAt: remindAt)) else {
+            return .transportFailure("the ask body is not JSON")
+        }
+        var request = URLRequest(url: base.appendingPathComponent("asks"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        request.timeoutInterval = 8
+        switch AskClient.send(request, timeout: 8) {
+        case .success(let reply):
+            return MoveResult.parse(status: reply.code, data: reply.data)
+        case .failure(let failure) where failure.code == 0:
+            return .transportFailure(failure.problem.message)
+        case .failure(let failure):
+            return MoveResult.parse(status: failure.code, data: failure.body)
+        }
+    }
+
+    /// The `remind` move on an existing ask (contract 1.6: `at|null`) -- the
+    /// knob a yours row carries. `at` nil clears the reminder.
+    static func remindMove(id: String, at: Date?, base: URL) -> MoveResult {
+        AskClient(base: base).post(id: id, move: "remind",
+                                   body: ["at": at.map(Self.isoStamp) ?? NSNull()])
+    }
+
+    /// The one ISO 8601 shape the hub speaks for `remind_at` (and every
+    /// other stamp): internet date-time, local offset, no sub-second drift.
+    static func isoStamp(_ date: Date) -> String {
+        Self.isoFormatter.string(from: date)
+    }
+
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        // Local offset, the shape every stamp in the contract carries
+        // ("2026-11-17T09:45:12-05:00"). ISO8601DateFormatter's own default
+        // is GMT, which would hand the hub a time five hours off the clock
+        // the reminder is meant for.
+        f.timeZone = .current
+        return f
+    }()
+
+    /// ⌘D's target: the hub's desk (H9) lives at base + /desk, on the same
+    /// base every ask read and write uses.
+    static func deskURL(base: URL) -> URL {
+        base.appendingPathComponent("desk")
+    }
+
     // MARK: - asks (Q12)
 
     /// What one Ask-me-first send came back as: which of the two routes took
@@ -394,5 +499,158 @@ enum Actions {
         case "deny": return "reject"
         default: return nil
         }
+    }
+}
+
+// MARK: - search hits (Q11)
+
+/// One `GET /asks/search` result: a full ask row -- the same shape every
+/// other list serves, so a found ask renders as a row with its own moves and
+/// opens at its one address -- plus where the query matched and a snippet of
+/// the matching text. Tolerant row by row: one bad hit never costs the rest.
+struct AskSearchHit: Equatable, Identifiable {
+    let ask: Ask
+    let match: String?
+    let snippet: String?
+
+    var id: String { ask.id }
+
+    /// Where the query hit, as a person reads it. The hub's own word kept
+    /// verbatim when it is not one of the three the contract names.
+    var matchLabel: String? {
+        switch match {
+        case "words": return "in the words"
+        case "answer": return "in the answer"
+        case "title": return "in the title"
+        case nil: return nil
+        default: return "in the \(match ?? "")"
+        }
+    }
+
+    static func decode(_ data: Data) -> Result<[AskSearchHit], Problem> {
+        guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let rawHits = obj["asks"] as? [Any] else {
+            return .failure("/asks/search did not return a list of asks")
+        }
+        var hits: [AskSearchHit] = []
+        for raw in rawHits {
+            guard let row = raw as? [String: Any],
+                  JSONSerialization.isValidJSONObject(row),
+                  let bytes = try? JSONSerialization.data(withJSONObject: row),
+                  let ask = try? JSONDecoder().decode(Ask.self, from: bytes) else { continue }
+            hits.append(AskSearchHit(ask: ask,
+                                     match: row["match"] as? String,
+                                     snippet: row["snippet"] as? String))
+        }
+        return .success(hits)
+    }
+}
+
+// MARK: - reminder times (Q11)
+
+/// The time a reminder fires at, read from the few shapes a person types
+/// into the ⌥⏎ picker -- "3:30", "3p", "15:30", "in 2h", "tonight",
+/// "tomorrow 9a". Pure, so the picker, the view, and the `--ask-remind` seam
+/// all read one parser and cannot disagree about what a time means.
+///
+/// A time of day lands on its next occurrence (3:30 already past today is
+/// tomorrow's 3:30); a bare hour without an am/pm marker is taken as the
+/// 24-hour clock, so "9a"/"9p" are how an ambiguous hour says which it
+/// meant. `nil` from a non-empty spec means unreadable; an *empty* spec is
+/// nil too, and the caller decides what that defaults to.
+enum RemindTime {
+    /// Whether a spec means "clear the reminder" rather than "set one".
+    static func isClear(_ raw: String) -> Bool {
+        let spec = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["none", "clear", "off", "never"].contains(spec)
+    }
+
+    static func parse(_ raw: String, now: Date) -> Date? {
+        let spec = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !spec.isEmpty, !isClear(spec) else { return nil }
+        if let relative = relative(spec, now: now) { return relative }
+        if spec == "tonight" { return date(hour: 18, minute: 0, onOrAfter: now) }
+        if spec == "tomorrow" { return date(hour: 9, minute: 0, onOrAfter: now, dayOffset: 1) }
+        if spec.hasPrefix("tomorrow ") {
+            guard let time = clockTime(String(spec.dropFirst("tomorrow ".count))) else { return nil }
+            return date(hour: time.hour, minute: time.minute, onOrAfter: now, dayOffset: 1)
+        }
+        guard let time = clockTime(spec) else { return nil }
+        return date(hour: time.hour, minute: time.minute, onOrAfter: now)
+    }
+
+    /// The picker's display shape, fixed locale so a test reads what the
+    /// menu will draw whatever the machine is set to.
+    static func text(for date: Date) -> String {
+        Self.display.string(from: date)
+    }
+
+    private static let display: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "h:mm a"
+        return f
+    }()
+
+    /// "in 2h" / "45m" / "in 1 hour" / "in 30 minutes": now plus the span.
+    /// Unit words count as much as their letters -- a person types the word
+    /// the placeholder shows.
+    private static func relative(_ spec: String, now: Date) -> Date? {
+        var text = spec
+        if text.hasPrefix("in ") { text = String(text.dropFirst(3)) }
+        text = text.replacingOccurrences(of: " ", with: "")
+        let unitWords: [(String, String)] = [
+            ("hours", "h"), ("hour", "h"), ("hrs", "h"), ("hr", "h"),
+            ("minutes", "m"), ("minute", "m"), ("mins", "m"), ("min", "m"),
+            ("days", "d"), ("day", "d"),
+        ]
+        for (word, letter) in unitWords where text.hasSuffix(word) {
+            text = String(text.dropLast(word.count)) + letter
+            break
+        }
+        guard let unit = text.last, "hmd".contains(unit),
+              let span = Double(text.dropLast()), span > 0, span <= 24 * 30 else { return nil }
+        let seconds: TimeInterval
+        switch unit {
+        case "h": seconds = span * 3600
+        case "m": seconds = span * 60
+        default: seconds = span * 86400
+        }
+        return now.addingTimeInterval(seconds)
+    }
+
+    /// "9", "9a", "9p", "9am", "9:30", "9:30p", "9:30 pm", "15:30".
+    private static func clockTime(_ spec: String) -> (hour: Int, minute: Int)? {
+        var text = spec.replacingOccurrences(of: " ", with: "").lowercased()
+        var pm: Bool?
+        if text.hasSuffix("pm") { pm = true; text = String(text.dropLast(2)) }
+        else if text.hasSuffix("am") { pm = false; text = String(text.dropLast(2)) }
+        else if text.hasSuffix("p") { pm = true; text = String(text.dropLast()) }
+        else if text.hasSuffix("a") { pm = false; text = String(text.dropLast()) }
+        let parts = text.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 1 || parts.count == 2,
+              let hour = Int(parts[0]) else { return nil }
+        let minute = parts.count == 2 ? Int(parts[1]) ?? -1 : 0
+        guard minute >= 0, minute < 60 else { return nil }
+        if pm != nil {
+            guard hour >= 1, hour <= 12 else { return nil }
+            return (hour % 12 + (pm! ? 12 : 0), minute)
+        }
+        guard hour >= 0, hour <= 23 else { return nil }
+        return (hour, minute)
+    }
+
+    /// A time of day on today's date (or `dayOffset` days out), rolled to
+    /// tomorrow when today's has already passed.
+    private static func date(hour: Int, minute: Int, onOrAfter now: Date,
+                             dayOffset: Int = 0) -> Date? {
+        let calendar = Calendar.current
+        let day = calendar.date(byAdding: .day, value: dayOffset, to: now) ?? now
+        var comps = calendar.dateComponents([.year, .month, .day], from: day)
+        comps.hour = hour
+        comps.minute = minute
+        guard let at = calendar.date(from: comps) else { return nil }
+        if at <= now { return calendar.date(byAdding: .day, value: 1, to: at) }
+        return at
     }
 }

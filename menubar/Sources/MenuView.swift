@@ -139,6 +139,32 @@ struct MenuView: View {
     /// it. Held as @State because consuming it mutates view state.
     @State private var preexpand: String?
 
+    // MARK: Q11 -- the yours section, the remind picker, find, the desk
+
+    /// The ⌥⏎ picker Q12's seam comment left open: which words the reminder
+    /// is for (the field's draft, POST /asks mode "remind") or which ask it
+    /// retimes (a yours row, the `remind` move), plus the time text being
+    /// typed. nil at rest.
+    @State private var remindPick: RemindPick?
+    @State private var remindPickError: String?
+    @FocusState private var remindSpecFocused: Bool
+    /// ⌘F in the ask menu is find across every ask ever (GET /asks/search,
+    /// H11), not the local row filter the legacy menu keeps. The results are
+    /// ask rows -- they open at their own address, and the eye reads the
+    /// answer in place, exactly like a section row.
+    @State private var findOpen = false
+    @State private var findQuery = ""
+    @State private var findResults: [AskSearchHit]?
+    @State private var findMessage: String?
+    @State private var findLoading = false
+    /// Debounces the query; cancelled by the next keystroke so a typed
+    /// phrase is one request, not one per key.
+    @State private var findDebounce: DispatchWorkItem?
+    /// Counted per fetch so a stale answer cannot land over a newer query.
+    @State private var findTick = 0
+    @FocusState private var findFocused: Bool
+
+
     /// The quick-search query. Narrows the rows across every section; the
     /// header keeps counting the whole feed, because a search box that also
     /// retallied "6 tasks need you" would be answering a question nobody asked.
@@ -216,6 +242,9 @@ struct MenuView: View {
             if searching {
                 Divider()
                 searchField
+            } else if findOpen {
+                Divider()
+                findField
             }
             Divider()
             if let latest = controller.outcomes.first, !latest.seen {
@@ -328,13 +357,22 @@ struct MenuView: View {
         // bare. Z stays special: undo is about the last write, not the row
         // under the cursor.
         .onKeyPress(phases: .down) { press in
-            guard !fieldFocused, !searchFocused, !searching, !askFieldFocused else { return .ignored }
+            guard !fieldFocused, !searchFocused, !searching, !askFieldFocused,
+                  !findFocused, !remindSpecFocused, remindPick == nil else { return .ignored }
             guard press.modifiers.isEmpty || press.modifiers == .shift else { return .ignored }
             guard let c = press.characters.first, c.isLetter || c.isNumber else {
                 return .ignored
             }
             if let hit = askKeyTarget(press.characters) {
                 performAskButton(hit.button, on: hit.row)
+                return .handled
+            }
+            // Q11: a yours row carries its own bare keys (E done, R remind,
+            // D drop -- and Run when the hub offers it), resolved the same
+            // way the action rows' are: the hub's `moves` list gates every
+            // one, and a field with focus owns the keystroke first.
+            if let hit = yoursKeyTarget(press.characters) {
+                performYoursButton(hit.button, id: hit.id)
                 return .handled
             }
             if press.characters.lowercased() == "z", zActsOnAsk {
@@ -369,6 +407,24 @@ struct MenuView: View {
             // this used to happen on every read instead.
             filteredModel = controller.model.filtered(query: newValue)
         }
+        .onChange(of: findQuery) { _, _ in
+            // Q11: find across every ask, asked on a debounce so typing a
+            // phrase is one request. An emptied field clears the results and
+            // cancels whatever is in flight; the ⌘F toggle owns closing.
+            guard findOpen else { return }
+            if trimmedFindQuery.isEmpty {
+                findDebounce?.cancel()
+                findTick += 1
+                findLoading = false
+                findResults = nil
+                findMessage = nil
+                return
+            }
+            findDebounce?.cancel()
+            let work = DispatchWorkItem { fetchFind() }
+            findDebounce = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+        }
     }
 
     // MARK: - keyboard
@@ -381,10 +437,19 @@ struct MenuView: View {
     /// same way when the feed speaks asks (Q3): the same narrowed list the
     /// ask sections are drawing.
     private var visibleIDs: [String] {
+        // While find is showing results, they are the list: the arrows and
+        // the eye walk the found asks, not the sections behind them.
+        if findOpen, let hits = findResults { return hits.map(\.id) }
         if asksLive, let board = controller.askBoard {
-            return board.sections
+            let sectionIDs = board.sections
                 .map { AskFilter.apply($0.rows, query: search) }
                 .flatMap { $0.map(\.id) }
+            // The yours section walks the same way (Q11), narrowed by the
+            // same query, so the arrows and the eye stay on one list.
+            let yoursIDs = yoursRows
+                .filter { AskFilter.matches($0.ask, query: search) }
+                .map(\.id)
+            return sectionIDs + yoursIDs
         }
         return model
             .visibleRecords(collapsed: controller.collapsed, now: controller.now)
@@ -399,27 +464,41 @@ struct MenuView: View {
         guard !ids.isEmpty else { return .ignored }
         // The arrows belong to the list once it is being navigated. Dropping
         // the field's focus is what lets return act on the row rather than
-        // firing whatever is half-typed in the field. Both fields are
-        // dropped: whichever one had focus (quick-fire, or search while a
-        // query is being narrowed) has to give up Return the same way.
+        // firing whatever is half-typed in the field. Every field is dropped:
+        // whichever one had focus (quick-fire, search while a query is being
+        // narrowed, find or the remind picker while they are being typed
+        // into) has to give up Return the same way.
         fieldFocused = false
         searchFocused = false
+        findFocused = false
+        remindSpecFocused = false
         highlighted = KeyboardNav.move(ids: ids, from: highlighted, delta: delta)
         return .handled
     }
 
     private func triggerHighlighted() -> KeyPress.Result {
+        // ⏎ on a find result opens it at its one address (Q11): results are
+        // rows, and reading a thread is the one thing every ask allows.
+        if findOpen, let hits = findResults, let id = highlighted,
+           let hit = hits.first(where: { $0.id == id }) {
+            openFindHit(hit)
+            return .handled
+        }
         // ⏎ on an ask row acts on the row's own return-key button when it
         // has one (Q9: Try with changes on a failed row, Open on an answer)
         // and opens the ask's one address otherwise -- always enabled, never
-        // dimmed. Return falls through to the legacy record path only when
-        // the feed is not speaking asks.
+        // dimmed. A yours row opens the same way (Q11). Return falls through
+        // to the legacy record path only when the feed is not speaking asks.
         if asksLive, let board = controller.askBoard,
-           let id = highlighted, let row = board.row(id: id) {
-            if let button = AskKeys.returnTarget(ask: row.ask, fieldHasFocus: false) {
-                performAskButton(button, on: row)
-            } else {
-                openAsk(row)
+           let id = highlighted {
+            if let row = board.row(id: id) {
+                if let button = AskKeys.returnTarget(ask: row.ask, fieldHasFocus: false) {
+                    performAskButton(button, on: row)
+                } else {
+                    openAsk(row)
+                }
+            } else if let yours = yoursRows.first(where: { $0.id == id }) {
+                openYours(yours)
             }
             return .handled
         }
@@ -443,6 +522,10 @@ struct MenuView: View {
     /// summon refocuses the field. Only once no field owns the keystroke
     /// does a highlighted row get to act.
     private func handleReturn() -> KeyPress.Result {
+        // The two Q11 fields own Return the same way the search field does
+        // (KeyboardNav.returnTarget does not know them): their own
+        // .onSubmit runs, never a highlight left over from earlier.
+        if findFocused || remindSpecFocused { return .ignored }
         switch KeyboardNav.returnTarget(highlighted: highlighted,
                                         fieldFocused: fieldFocused,
                                         searchFocused: searchFocused,
@@ -492,6 +575,22 @@ struct MenuView: View {
             cancelEdit()
             return .handled
         }
+        // Q11: the remind picker backs out before anything older -- it is
+        // the most transient thing on screen, the row editor excepted.
+        if remindPick != nil {
+            remindPick = nil
+            remindPickError = nil
+            return .handled
+        }
+        // And find before the legacy filter, same rule: innermost first.
+        if findOpen {
+            if !trimmedFindQuery.isEmpty {
+                findQuery = ""
+            } else {
+                closeFind()
+            }
+            return .handled
+        }
         if confirmingSuggestion != nil {
             confirmingSuggestion = nil
             return .handled
@@ -527,9 +626,16 @@ struct MenuView: View {
         return .ignored
     }
 
-    /// Command-F. Opens the field and takes focus; closes it and drops the
-    /// query when it is already open, so the same key puts the list back.
+    /// Command-F. In the ask menu (Q11) it is the plan's find: across every
+    /// ask ever, off the hub's own search -- the same key closes it and puts
+    /// the sections back. The legacy menu keeps the local row filter it has
+    /// always had, because a hub that predates the ask API has nothing to
+    /// search but the rows on screen.
     private func toggleSearch() {
+        if asksLive {
+            if findOpen { closeFind() } else { openFind() }
+            return
+        }
         if searching {
             searching = false
             search = ""
@@ -560,10 +666,17 @@ struct MenuView: View {
     /// budget -- the same treatment `feedFacts` got in DumpModel (2026-10-29).
     @ViewBuilder private var rowList: some View {
         if let board = controller.askBoard, board.speaksAsks {
-            // Q3: the feed speaks asks -- the list is ask sections. The
-            // legacy branches below stay exactly as they were for the hubs
-            // and fallbacks that do not.
-            askList(board)
+            // Q11: while find is open on a query, the results are the list;
+            // the sections wait behind them until ⌘F or Escape closes it.
+            if findOpen, !trimmedFindQuery.isEmpty || findMessage != nil {
+                findList
+            } else {
+                // Q3: the feed speaks asks -- the list is ask sections, with
+                // the yours section under them (Q11). The legacy branches
+                // below stay exactly as they were for the hubs and fallbacks
+                // that do not.
+                askList(board)
+            }
         } else if controller.model.records.isEmpty {
             Text(emptyText)
                 .font(.system(size: 12))
@@ -725,6 +838,13 @@ struct MenuView: View {
                     }
                 }
             }
+            // Q11: the ⌥⏎ picker, drawn under the receipt. It is the one
+            // thing between the words and their reminder: a time field with
+            // the few presets a person means by "later", return sends it,
+            // Escape leaves the words exactly as they were.
+            if let pick = remindPick {
+                remindPicker(pick)
+            }
             HStack(spacing: 7) {
                 // AppKit's own segmented control rather than
                 // `Picker(.segmented)`: see FireModeControl for the leak the
@@ -848,6 +968,40 @@ struct MenuView: View {
         .help("Matches on title, status, reason, and source. Escape clears it.")
     }
 
+    /// ⌘F in the ask menu (Q11): the find field. Unlike the legacy filter
+    /// above it narrows nothing locally -- the hub searches every ask ever
+    /// (done and archived included, H11) and the results arrive as rows.
+    private var findField: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            TextField("Find any ask\u{2026}", text: $findQuery)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .focused($findFocused)
+                .onSubmit(submitFind)
+            if findLoading {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.6)
+                    .frame(width: 12)
+            } else if let hits = findResults, !trimmedFindQuery.isEmpty {
+                Text("\(hits.count)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            RowButton(icon: "xmark.circle.fill", help: "Close find (\u{2318}F)") {
+                closeFind()
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .help("Searches every ask ever -- done and archived included -- through "
+              + "the hub. \u{23CE} opens the first result; the eye reads one in place.")
+    }
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
@@ -859,7 +1013,8 @@ struct MenuView: View {
                     .lineLimit(1)
                 Spacer(minLength: 6)
                 FooterButton(icon: searching ? "magnifyingglass.circle.fill" : "magnifyingglass",
-                             help: "Filter the rows (\u{2318}F)",
+                             help: asksLive ? "Find any ask (\u{2318}F)"
+                                            : "Filter the rows (\u{2318}F)",
                              action: toggleSearch)
             }
             // "6 tasks need you" names nothing John can act on. The titles do,
@@ -901,9 +1056,16 @@ struct MenuView: View {
                 .keyboardShortcut("2", modifiers: .command)
             Button("", action: fireOtherMode)
                 .keyboardShortcut(.return, modifiers: .command)
-            // Q11 (slice 5) lands Remind me here: an .option-modifier
-            // return button in this same zero-sized stack, posting
-            // mode "remind". Nothing to wire yet -- the seam stays open.
+            // Q11 (slice 5): the seam Q12 left open. ⌥⏎ opens the "Remind me
+            // instead" picker over the typed words -- POST /asks mode
+            // "remind", an H12 hub's todo-with-a-time; a hub that has not
+            // built it answers in its own words on the field's refusal line.
+            // ⌘D opens the hub's desk. Same hidden-button trick, same reason:
+            // onKeyPress never sees a command- or option-modified key.
+            Button("", action: openRemindPicker)
+                .keyboardShortcut(.return, modifiers: .option)
+            Button("", action: openDesk)
+                .keyboardShortcut("d", modifiers: .command)
         }
         .opacity(0)
         .frame(width: 0, height: 0)
@@ -1002,7 +1164,7 @@ struct MenuView: View {
                 Text(AskFooter.stub)
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
-                    .help("Find across every ask and the desk land with slice 5.")
+                    .help("\u{2318}F finds across every ask ever; \u{2318}D opens the desk.")
             }
             // The Pass caps jobs[] at 200. Said out loud, because a widget
             // quietly showing a slice of the history is the kind of thing you
@@ -1138,6 +1300,11 @@ struct MenuView: View {
         askMoveLine = nil
         askEdit = nil
         askFieldFocused = false
+        // And for the two Q11 overlays: no picker left half-typed, no find
+        // left open on a query from some other visit.
+        remindPick = nil
+        remindPickError = nil
+        closeFind()
     }
 
     private func send() {
@@ -1554,6 +1721,384 @@ struct MenuView: View {
         }
     }
 
+    // MARK: - yours, remind, find, desk (Q11)
+
+    /// The yours section's rows: the feed's yours-place asks -- John's own
+    /// to-dos, no live agent work -- which AskSections keeps out of the
+    /// three action sections. Built from the feed the controller polled (the
+    /// board holds only those sections), pure over the same rows the hub
+    /// sent, by the same builder the `--ask-dump-rows` seam reports.
+    private var yoursRows: [YoursRowModel] {
+        guard asksLive, let feed = controller.askFeed else { return [] }
+        return AskYours.rows(in: feed.asks)
+    }
+
+    /// A yours row's title click and ⏎: the ask's one address, always --
+    /// the same rule every other row opens by.
+    private func openYours(_ row: YoursRowModel) {
+        guard let url = row.openURL else {
+            controller.post(kind: .error, title: "This ask has no address",
+                            detail: "The hub is down; the row shows what the ledger knows.")
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// One bare key against the highlighted yours row (E done, R remind,
+    /// D drop), resolved the same way the action rows' keys are: the hub's
+    /// own `moves` list gates every one.
+    private func yoursKeyTarget(_ key: String) -> (id: String, button: AskMoveButton)? {
+        guard asksLive, let id = highlighted,
+              let row = yoursRows.first(where: { $0.id == id }) else { return nil }
+        guard let button = YoursMoves.target(ask: row.ask, key: key) else { return nil }
+        return (row.id, button)
+    }
+
+    /// Runs one yours row's button: a plain move posts straight out (the
+    /// shared verdict line lands under the row), and Remind opens the same
+    /// picker ⌥⏎ opens, prefilled with the reminder the row already carries.
+    /// Copy/open are not offered here -- a yours row has no answer to copy,
+    /// and its title already opens.
+    private func performYoursButton(_ button: AskMoveButton, id: String) {
+        switch button.act {
+        case .post(let move):
+            postAskMove(id: id, move: move)
+        case .text(let move, _) where move == "remind":
+            openRowRemindPicker(id: id)
+        case .text:
+            // No other text move is on a yours row's list (YoursMoves emits
+            // none), so there is nothing here to send -- and no button to
+            // dead-end, because the row never drew one.
+            break
+        case .copyAnswer, .openThread:
+            break
+        }
+    }
+
+    /// Opens the ⌥⏎ picker over the field's typed words -- the seam Q12's
+    /// comment left for this unit. Same guards as the one-shot ⌘⏎ fire: the
+    /// field owns the keystroke, nothing is firing, and there are words.
+    private func openRemindPicker() {
+        guard fieldFocused, !fireState.isFiring else { return }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        remindPickError = nil
+        remindPick = RemindPick(target: .field(text))
+        remindSpecFocused = true
+    }
+
+    /// Opens the picker for one yours row's `remind` move, prefilled with
+    /// the time that row already carries so adjusting a reminder is a
+    /// one-keystroke edit, not a re-entry.
+    private func openRowRemindPicker(id: String) {
+        guard let row = yoursRows.first(where: { $0.id == id }) else { return }
+        remindPickError = nil
+        remindPick = RemindPick(target: .row(id),
+                                spec: row.remindDate.map(RemindTime.text(for:)) ?? "")
+        remindSpecFocused = true
+    }
+
+    /// The picker itself: a time field, the three presets a person means by
+    /// "later", return to send, x to leave everything as it was.
+    @ViewBuilder private func remindPicker(_ pick: RemindPick) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "clock")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                TextField("At 3:00 PM, in 2h, tonight, tomorrow 9a\u{2026}", text: Binding(
+                    get: { remindPick?.spec ?? "" },
+                    set: { if remindPick != nil { remindPick?.spec = $0 } }))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .focused($remindSpecFocused)
+                    .onSubmit(submitRemind)
+                ForEach(Self.remindPresets, id: \.spec) { preset in
+                    Button(preset.label) {
+                        remindPick?.spec = preset.spec
+                        remindSpecFocused = true
+                    }
+                    .font(.system(size: 10))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
+                RowButton(icon: "arrow.up.circle", help: "Set the reminder (\u{23CE})") {
+                    submitRemind()
+                }
+                RowButton(icon: "xmark", help: "Cancel (Esc)") {
+                    remindPick = nil
+                    remindPickError = nil
+                }
+            }
+            if let error = remindPickError {
+                Text(error)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.red)
+                    .lineLimit(2)
+            }
+        }
+        .help("Remind me instead: the words become a to-do of yours that "
+              + "nudges you at the time typed here. \"none\" clears a row's "
+              + "existing reminder.")
+    }
+
+    /// The picker's presets: the three distances a reminder usually means.
+    private static let remindPresets: [(label: String, spec: String)] = [
+        ("1h", "in 1 hour"),
+        ("Tonight", "tonight"),
+        ("Tomorrow 9a", "tomorrow 9a"),
+    ]
+
+    /// The picker's send. An empty time is not a refusal -- it is the
+    /// default the placeholder promises, one hour from now. An unreadable
+    /// one keeps the picker open and says so in place; nothing posts until
+    /// a time parsed. On a yours row, "none" clears the reminder instead.
+    private func submitRemind() {
+        guard let pick = remindPick else { return }
+        let spec = pick.spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        let at: Date?
+        if spec.isEmpty {
+            at = Date().addingTimeInterval(3600)
+        } else if RemindTime.isClear(spec) {
+            guard case .row = pick.target else {
+                remindPickError = "Type a time, or leave it empty for one hour from now."
+                return
+            }
+            at = nil
+        } else if let parsed = RemindTime.parse(spec, now: Date()) {
+            at = parsed
+        } else {
+            remindPickError = "Couldn't read \u{201C}\(spec)\u{201D} as a time -- "
+                + "try 3p, 15:30, in 2h, tonight, tomorrow 9a."
+            return
+        }
+        switch pick.target {
+        case .field(let words): postFieldRemind(words: words, at: at ?? Date().addingTimeInterval(3600))
+        case .row(let id): postRowRemind(id: id, at: at)
+        }
+    }
+
+    /// The picker's write for the field's words: POST /asks mode "remind",
+    /// exactly the fire's own shape -- the prefix parsed and stripped, the
+    /// resolved directory sent along. A refusal lands on the field's
+    /// failure line in the hub's own words, draft intact; a success lands
+    /// as the receipt's honest cousin and clears the field the way a landed
+    /// fire does.
+    private func postFieldRemind(words: String, at: Date) {
+        remindPick = nil
+        remindPickError = nil
+        guard let base = askClientBase() else {
+            controller.post(kind: .error, title: "Cannot set a reminder",
+                            detail: "The Pass feed is off; there is no hub to hold the to-do.")
+            return
+        }
+        let isPanel = onEscapeExhausted != nil
+        let (prefixDir, stripped) = FireResolve.parsePrefix(words)
+        let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: controller.settings)
+        controller.perform(key: "askRemind", {
+            let result = Actions.remind(text: stripped, dir: resolved.url, remindAt: at, base: base)
+            return result.ok ? .success(result.ask?.id ?? "")
+                             : .failure(Problem(result.message))
+        }) { outcome in
+            switch outcome {
+            case .success:
+                let line = "Got it. It will nudge you at \(RemindTime.text(for: at))."
+                postFireOutcome(.success(line))
+                controller.refreshAsks()
+                settle(.success(line), hidesPanel: isPanel)
+            case .failure(let problem):
+                // The hub's own words -- a 501's "creating an ask is not
+                // built yet" -- on the field's refusal line, never a dead
+                // button, and no capture fallback to turn a refused
+                // reminder into a silently different thing.
+                postFireOutcome(.failure(problem.message))
+                fireState = .failure(problem.message)
+            }
+        }
+    }
+
+    /// The picker's write for a yours row: the `remind` move, `{at}` -- nil
+    /// clears -- landing the same verdict line every other move leaves.
+    private func postRowRemind(id: String, at: Date?) {
+        remindPick = nil
+        remindPickError = nil
+        guard let base = askClientBase() else {
+            controller.post(kind: .error, title: "Cannot set a reminder",
+                            detail: "The Pass feed is off; there is no hub to hold it.")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Actions.remindMove(id: id, at: at, base: base)
+            DispatchQueue.main.async {
+                landMoveLine(id: id, move: "remind", result: result)
+            }
+        }
+    }
+
+    /// ⌘D: the hub's desk (H9), on the same base every ask read and write
+    /// uses -- the menu and the desk can never point at different hubs.
+    /// Without a hub there is nothing to open, and the outcome says so
+    /// rather than a key that quietly does nothing.
+    private func openDesk() {
+        guard let base = askClientBase() ?? controller.config.passURL else {
+            controller.post(kind: .error, title: "No Pass for the desk",
+                            detail: "The desk is served by the hub; the Pass feed is off.")
+            return
+        }
+        NSWorkspace.shared.open(Actions.deskURL(base: base))
+    }
+
+    /// ⌘F's open: the find field takes focus, and any local filter still
+    /// open steps aside -- the two answer different questions and never
+    /// share the panel.
+    private func openFind() {
+        findOpen = true
+        findFocused = true
+        fieldFocused = false
+        if searching {
+            searching = false
+            search = ""
+            searchFocused = false
+        }
+    }
+
+    /// ⌘F's close: results, message, and any highlight on a result row go
+    /// with it, so the sections come back exactly as they were.
+    private func closeFind() {
+        findDebounce?.cancel()
+        findTick += 1
+        findOpen = false
+        findQuery = ""
+        findResults = nil
+        findMessage = nil
+        findLoading = false
+        findFocused = false
+        // A highlight sitting on a result row must not survive into the
+        // sections: the row under that id may be a different ask now.
+        highlighted = nil
+    }
+
+    private var trimmedFindQuery: String {
+        findQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The find query, asked of the hub on a debounce (see the onChange in
+    /// `body`). Stale answers cannot land: each fetch carries the tick it
+    /// was issued under, and only the newest one draws.
+    private func fetchFind() {
+        guard let base = askClientBase() else {
+            findLoading = false
+            findMessage = "The Pass feed is off; there is nothing to search."
+            return
+        }
+        let query = trimmedFindQuery
+        guard !query.isEmpty else { return }
+        findLoading = true
+        findTick += 1
+        let tick = findTick
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Actions.searchAsks(base: base, query: query)
+            DispatchQueue.main.async {
+                guard tick == findTick else { return }
+                findLoading = false
+                switch result {
+                case .success(let hits):
+                    findResults = hits
+                    findMessage = nil
+                case .failure(let problem):
+                    findResults = nil
+                    findMessage = problem.message
+                }
+            }
+        }
+    }
+
+    /// Return in the find field: opens the highlighted result, or the first
+    /// when no arrow has moved the highlight yet -- the same one-match-
+    /// is-unambiguous rule submitSearch has always had.
+    private func submitFind() {
+        guard let hits = findResults, !hits.isEmpty else { return }
+        let id = highlighted ?? hits.first?.id
+        if let hit = hits.first(where: { $0.id == id }) {
+            openFindHit(hit)
+        }
+    }
+
+    private func openFindHit(_ hit: AskSearchHit) {
+        guard let url = hit.ask.url.flatMap(URL.init(string:)) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// The eye on a find result: the same one-peek-at-a-time expand the
+    /// section rows use, through the same thread cache and the same `seen`
+    /// rule -- a found unseen answer stops counting toward the badge the
+    /// moment it is read here too.
+    private func toggleFindExpand(_ hit: AskSearchHit) {
+        // The row model the expand machinery reads. The section field is
+        // inert bookkeeping here -- AskSection has no find case, and none is
+        // needed: nothing downstream reads it, the section a find result
+        // draws in is the find list itself.
+        let row = AskRowModel(ask: hit.ask, section: .needsYou)
+        if expandedID == row.id {
+            expandedID = nil
+        } else {
+            expandedID = row.id
+            expand(row)
+        }
+    }
+
+    /// The find results as the row list (Q11): one row per found ask, drawn
+    /// in the same measured, capped scroll the sections use.
+    @ViewBuilder private var findList: some View {
+        if let message = findMessage {
+            Text(message)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+        } else if findLoading, findResults == nil {
+            Text("Searching\u{2026}")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+        } else if let hits = findResults {
+            if hits.isEmpty {
+                Text("No ask matches \u{201C}\(trimmedFindQuery)\u{201D}")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(hits) { hit in
+                            FindRowView(
+                                hit: hit,
+                                highlighted: highlighted == hit.id,
+                                expanded: expandedID == hit.id,
+                                loading: askLoadingThreads.contains(hit.id),
+                                thread: askThreads[hit.id],
+                                moveLine: askMoveLine?.id == hit.id ? askMoveLine?.line : nil,
+                                onTitle: { openFindHit(hit) },
+                                onToggleExpand: { toggleFindExpand(hit) })
+                        }
+                    }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(key: ListHeightKey.self,
+                                                   value: geo.size.height)
+                        }
+                    )
+                }
+                .frame(height: renderedListHeight)
+                .onPreferenceChange(ListHeightKey.self) { measured in
+                    if abs(measured - listHeight) > 0.5 { listHeight = measured }
+                }
+            }
+        }
+    }
+
     // MARK: - asks (Q3)
 
     /// Spends the snapshot seam's `--expand <id-substring>` on the first
@@ -1681,7 +2226,7 @@ struct MenuView: View {
     private func performAskButton(_ button: AskMoveButton, on row: AskRowModel) {
         switch button.act {
         case .post(let move):
-            postAskMove(row, move: move)
+            postAskMove(id: row.id, move: move)
         case .text(let move, _):
             openEditor(row: row, move: move)
         case .copyAnswer:
@@ -1713,23 +2258,25 @@ struct MenuView: View {
         guard !trimmed.isEmpty else { return }
         askEdit = nil
         askFieldFocused = false
-        guard let row = liveAskBoard?.row(id: edit.id) else { return }
-        postAskMove(row, move: edit.move, text: (key: edit.bodyKey, value: trimmed))
+        guard liveAskBoard?.row(id: edit.id) != nil else { return }
+        postAskMove(id: edit.id, move: edit.move, text: (key: edit.bodyKey, value: trimmed))
     }
 
     /// Posts one move and lands its verdict line under the row -- the same
     /// line E has always left, generalized to every write: the hub's own
     /// undo token becomes "Z to undo", its refusal (409, 501, 503) becomes
-    /// its own words, never a dead button.
-    private func postAskMove(_ row: AskRowModel, move: String,
+    /// its own words, never a dead button. Id-keyed (Q11) so the yours
+    /// section's rows -- which are not AskRowModels -- land the same line
+    /// through the same code.
+    private func postAskMove(id: String, move: String,
                              text: (key: String, value: String)? = nil) {
         guard let base = askClientBase() else { return }
         var body: [String: Any] = [:]
         if let text { body[text.key] = text.value }
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = AskClient(base: base).post(id: row.id, move: move, body: body)
+            let result = AskClient(base: base).post(id: id, move: move, body: body)
             DispatchQueue.main.async {
-                landMoveLine(row: row, move: move, result: result)
+                landMoveLine(id: id, move: move, result: result)
             }
         }
     }
@@ -1773,9 +2320,9 @@ struct MenuView: View {
     /// posts to the outcome queue -- the panel can close mid-read, and a
     /// refused write is the one thing worth following the user out of the
     /// menu.
-    private func landMoveLine(row: AskRowModel, move: String, result: MoveResult) {
+    private func landMoveLine(id: String, move: String, result: MoveResult) {
         let line = AskMoveLine.line(move: move, result: result)
-        askMoveLine = (row.id, line, result.undo?.token)
+        askMoveLine = (id, line, result.undo?.token)
         if result.ok {
             controller.refreshAsks()
         } else {
@@ -1827,12 +2374,28 @@ struct MenuView: View {
                                     onToggleExpand: { toggleExpand(row) },
                                     onButton: { button in performAskButton(button, on: row) },
                                     onAnswer: { text in
-                                        postAskMove(row, move: "follow_up",
+                                        postAskMove(id: row.id, move: "follow_up",
                                                     text: (key: "text", value: text))
                                     },
                                     onEditSubmit: submitEdit,
                                     onEditCancel: cancelEdit,
                                     onFieldFocus: { askFieldFocused = $0 })
+                            }
+                        }
+                        // Q11: "Yours today" -- the feed's yours-place asks,
+                        // the ones AskSections keeps out of the three action
+                        // sections, in their own section under them: the
+                        // plan's slice-5 addition to the menu's shape.
+                        let yours = yoursRows.filter { AskFilter.matches($0.ask, query: search) }
+                        if !yours.isEmpty {
+                            YoursSectionHeader(count: yours.count)
+                            ForEach(yours) { row in
+                                YoursRowView(
+                                    row: row,
+                                    highlighted: highlighted == row.id,
+                                    moveLine: askMoveLine?.id == row.id ? askMoveLine?.line : nil,
+                                    onTitle: { openYours(row) },
+                                    onButton: { button in performYoursButton(button, id: row.id) })
                             }
                         }
                     }
@@ -2970,5 +3533,350 @@ struct ListHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+// MARK: - Yours today (Q11)
+
+/// The ⌥⏎ picker's open state: what the reminder is for -- the field's
+/// words (POST /asks mode "remind") or a yours row's ask (the `remind`
+/// move) -- plus the time text being typed into it.
+struct RemindPick: Equatable {
+    enum Target: Equatable {
+        case field(String)
+        case row(String)
+    }
+
+    let target: Target
+    var spec: String = ""
+}
+
+/// The yours section's rows, built pure over the feed's asks so the view and
+/// the `--ask-dump-rows` seam draw the same section: the yours-place asks
+/// (contract 1.2 -- John's own to-dos, no live agent work), the ones
+/// `AskSections` keeps out of the three action sections. Sorted with the
+/// soonest reminder first -- a section that exists to say *when* leads with
+/// the nearest *when* -- then newest activity, then id.
+enum AskYours {
+    /// The plan's own name for the section.
+    static let label = "Yours today"
+
+    static func rows(in asks: [Ask]) -> [YoursRowModel] {
+        func remindDate(_ ask: Ask) -> Date? { ask.remindAt.flatMap(Store.parseDate) }
+        func activity(_ ask: Ask) -> Date {
+            ask.finishedDate ?? ask.updatedDate ?? ask.createdDate ?? .distantPast
+        }
+        return asks.filter { $0.place == "yours" }
+            .sorted { lhs, rhs in
+                let l = remindDate(lhs) ?? .distantFuture
+                let r = remindDate(rhs) ?? .distantFuture
+                if l != r { return l < r }
+                let la = activity(lhs), ra = activity(rhs)
+                if la != ra { return la > ra }
+                return lhs.id < rhs.id
+            }
+            .map(YoursRowModel.init)
+    }
+}
+
+/// One yours-place ask as the menu draws it. The section's two facts are the
+/// plan's two words: the title, and the time -- the reminder when one is
+/// set, the coarse age otherwise.
+struct YoursRowModel: Equatable, Identifiable {
+    let ask: Ask
+
+    var id: String { ask.id }
+    var title: String { ask.title }
+    var remindDate: Date? { ask.remindAt.flatMap(Store.parseDate) }
+    var openURL: URL? { ask.url.flatMap(URL.init(string:)) }
+
+    /// The right-hand column: when the nudge comes, or how old the to-do is.
+    var timeText: String? {
+        if let at = remindDate { return RemindTime.text(for: at) }
+        guard let at = ask.finishedDate ?? ask.updatedDate ?? ask.createdDate else { return nil }
+        return shortAge(from: at)
+    }
+
+    /// The sub-line under the title, nil without a reminder: says when in
+    /// the section's own plain words.
+    var remindLine: String? {
+        guard let at = remindDate else { return nil }
+        return "Reminds you at \(RemindTime.text(for: at))"
+    }
+}
+
+/// The buttons a yours row offers (contract 1.2: done, remind, run when
+/// `can_run`, drop), gated on the hub's own `moves` list exactly the way
+/// `AskRowMoves` gates the action states -- a move the hub did not offer is
+/// a button the row does not draw, and a refusal that comes back anyway
+/// shows in the hub's words.
+enum YoursMoves {
+    static func buttons(for ask: Ask) -> [AskMoveButton] {
+        var out: [AskMoveButton] = []
+        if ask.moves.contains("done") {
+            out.append(AskMoveButton(act: .post("done"), title: "Done", key: "e"))
+        }
+        if ask.moves.contains("remind") {
+            out.append(AskMoveButton(act: .text(move: "remind", bodyKey: "at"),
+                                     title: "Remind me\u{2026}", key: "r"))
+        }
+        if ask.canRun, ask.moves.contains("run") {
+            out.append(AskMoveButton(act: .post("run"), title: "Run it", key: nil))
+        }
+        if ask.moves.contains("drop") {
+            out.append(AskMoveButton(act: .post("drop"), title: "Drop", key: "d"))
+        }
+        return out
+    }
+
+    static func target(ask: Ask, key: String) -> AskMoveButton? {
+        buttons(for: ask).first { $0.key == key }
+    }
+}
+
+/// The yours section's header. A quiet label and a count, like the ask
+/// sections' own -- the section is a standing part of the day, not an alarm.
+struct YoursSectionHeader: View {
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "person.crop.circle")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+            Text(AskYours.label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text("\(count)")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help("Your own to-dos -- asks with no agent work on them. "
+              + "E files one done; R sets when it should nudge you; D drops it.")
+    }
+}
+
+/// One yours row: the title opens the ask's one address, the time sits where
+/// every row's right-hand fact sits, and the tail carries the row's own
+/// moves (Done, Remind, Run when the hub offers it, Drop). No peek panel --
+/// a to-do has no answer to read; the title's page is where its thread
+/// lives.
+struct YoursRowView: View {
+    let row: YoursRowModel
+    var highlighted: Bool = false
+    /// The verdict line a move left under this row, nil when there is none.
+    var moveLine: String?
+    let onTitle: () -> Void
+    let onButton: (AskMoveButton) -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Color.secondary.opacity(0.6))
+                    .frame(width: 7, height: 7)
+                Button(action: onTitle) {
+                    Text(row.title)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 8)
+                if let time = row.timeText {
+                    Text(time)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(YoursMoves.buttons(for: row.ask)) { button in
+                    RowButton(icon: Self.symbol(for: button), help: button.helpText) {
+                        onButton(button)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(highlighted ? Color.accentColor.opacity(0.18)
+                                    : (hovering ? Color.primary.opacity(0.06) : .clear))
+            .onHover { hovering = $0 }
+            .help(helpText)
+            if let line = row.remindLine {
+                Text(line)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 27)
+                    .padding(.bottom, 3)
+            }
+            if let line = moveLine {
+                Text(line)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 27)
+                    .padding(.bottom, 3)
+            }
+        }
+    }
+
+    /// The row's own glyphs: remind draws the clock the move is, run the
+    /// play triangle a fire is -- AskMoveButton's generic table (Q9) has no
+    /// cases for the yours moves, and a made-up icon would say less.
+    private static func symbol(for button: AskMoveButton) -> String {
+        switch button.move {
+        case "done": return "checkmark.circle"
+        case "remind": return "clock"
+        case "run": return "play.circle"
+        case "drop": return "xmark.circle"
+        default: return "circle"
+        }
+    }
+
+    private var helpText: String {
+        var parts = [row.title, "id: \(row.id)", "state: \(row.ask.state.raw)"]
+        if let at = row.remindDate { parts.append("reminds at \(RemindTime.text(for: at))") }
+        if let url = row.ask.url { parts.append(url) }
+        parts.append("click the title (or \u{23CE}) to open the thread")
+        return parts.joined(separator: "\n")
+    }
+}
+
+// MARK: - one find result (Q11)
+
+/// One find result: a row like every other ask row -- the title opens the
+/// ask's one address, the eye reads the answer in place through the same
+/// thread fetch and `seen` rule the section rows use -- with where the
+/// query matched and the snippet standing where a row would put its reason.
+struct FindRowView: View {
+    let hit: AskSearchHit
+    var highlighted: Bool = false
+    var expanded: Bool = false
+    var loading: Bool = false
+    var thread: AskThread?
+    /// The verdict line a move left under this row, nil when there is none.
+    var moveLine: String?
+    let onTitle: () -> Void
+    let onToggleExpand: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 7, height: 7)
+                Button(action: onTitle) {
+                    Text(hit.ask.title)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 8)
+                if let label = hit.matchLabel {
+                    Text(label)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                RowButton(icon: expanded ? "chevron.up" : "eye",
+                          help: expanded ? "Hide the answer" : "Read the answer here",
+                          action: onToggleExpand)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(highlighted ? Color.accentColor.opacity(0.18)
+                                    : (hovering ? Color.primary.opacity(0.06) : .clear))
+            .onHover { hovering = $0 }
+            .help(helpText)
+            if let line = moveLine {
+                Text(line)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 27)
+                    .padding(.bottom, 3)
+            }
+            Text(snippetText)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.tail)
+                .padding(.leading, 27)
+                .padding(.trailing, 12)
+                .padding(.bottom, 3)
+            if expanded {
+                peek
+            }
+        }
+    }
+
+    /// No colour claim about a state this build cannot read (unknown draws
+    /// gray, like the dot); the named states keep the palette the rows
+    /// trained. A found done ask is quiet gray -- it is history, not news.
+    private var dotColor: Color {
+        switch hit.ask.state {
+        case .question, .blocked, .failed: return .orange
+        case .answer: return hit.ask.unseen ? .accentColor : .secondary.opacity(0.6)
+        case .working: return .green
+        case .wantsOk: return .blue
+        default: return .secondary.opacity(0.6)
+        }
+    }
+
+    /// The snippet the hub matched, or the best the row itself carries.
+    private var snippetText: String {
+        if let snippet = hit.snippet, !snippet.isEmpty { return snippet }
+        return hit.ask.answerExcerpt ?? hit.ask.words
+    }
+
+    /// The same peek the section rows draw, same capped scroll: the thread's
+    /// answer once it lands, the snippet until then.
+    private var peek: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if loading {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.6)
+                    Text("Reading the answer\u{2026}")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                ScrollView {
+                    Text(answerText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 2)
+                }
+                .frame(height: AskRowView.expandMaxHeight)
+            }
+        }
+        .padding(.leading, 27)
+        .padding(.trailing, 12)
+        .padding(.bottom, 7)
+    }
+
+    private var answerText: String {
+        if let thread, !thread.answerText.isEmpty { return thread.answerText }
+        if let excerpt = hit.ask.answerExcerpt, !excerpt.isEmpty { return excerpt }
+        return "No answer text on this row \u{2014} the title opens the thread."
+    }
+
+    private var helpText: String {
+        var parts = [hit.ask.title, "id: \(hit.id)", "state: \(hit.ask.state.raw)"]
+        if let door = hit.ask.door { parts.append("came in by: \(door)") }
+        if let label = hit.matchLabel { parts.append("matched \(label)") }
+        if let url = hit.ask.url { parts.append(url) }
+        parts.append("click the title (or \u{23CE}) to open the thread")
+        return parts.joined(separator: "\n")
     }
 }

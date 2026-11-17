@@ -61,6 +61,32 @@
 //       that land in the field, and the fire they would make in either
 //       mode (FireResolve.describe, the same pure call the field runs).
 //
+//   --ask-remind <text> [--ask-at <spec>] | [--ask-row <id-substring>] (Q11)
+//       [--ask-at <spec>]
+//       The ⌥⏎ picker's write, really performed. Without --ask-row it is
+//       the field's gesture: POST /asks mode "remind" through the same
+//       Actions.remind the picker runs (text stripped of its --in prefix,
+//       dir resolved, remind_at parsed from the spec -- "in 2h", "3p",
+//       "15:30", "tonight", "tomorrow 9a"; default "in 1 hour"). With
+//       --ask-row it is the yours row's own knob: the `remind` move with
+//       {"at": ...} -- spec "none" clears. Exit 0 when the reminder
+//       landed, 1 when the hub refused (its message is the answer, e.g.
+//       the 501 "creating an ask is not built yet" a pre-H12 hub sends),
+//       2 when the seam itself could not run.
+//
+//   --ask-find <query> [--ask-expand <id-substring>] (Q11)
+//       ⌘F's query, really performed: GET /asks/search through the same
+//       Actions.searchAsks the find field fetches with. Results print as
+//       rows -- id, title, where the query matched, the snippet, the
+//       address a click opens -- and --ask-expand runs one result's expand
+//       plan (thread fetch, `seen` when the found ask is still unseen),
+//       the same walkthrough --ask-dump-rows gives a section row.
+//
+//   --ask-desk (Q11)
+//       ⌘D's target: the desk the hub serves (H9), on the base every ask
+//       read and write uses. Prints the URL; opening it is the panel's
+//       business, never a test's.
+//
 // Entry (App.swift) dispatches on `--dump-model` today and does not know these
 // flags, so a test invokes them next to it (`--dump-model --ask-dump-model`);
 // DumpModel.run hands any `--ask-*` argument to `AskSeams.run`. Since Q6,
@@ -73,6 +99,9 @@ enum AskSeams {
         if args.contains("--ask-notice") { return askNotice(args: args) }
         if args.contains("--ask-fire") { return fireField(args: args) }
         if args.contains("--ask-again") { return askAgain(args: args) }
+        if args.contains("--ask-remind") { return remindField(args: args) }
+        if args.contains("--ask-find") { return find(args: args) }
+        if args.contains("--ask-desk") { return desk(args: args) }
         if args.contains("--ask-dump-model") { return dumpModel(args: args) }
         if args.contains("--ask-dump-rows") { return dumpRows(args: args) }
         if args.contains("--ask-dump-thread") { return dumpThread(args: args) }
@@ -526,6 +555,21 @@ enum AskSeams {
                 ] as [String: Any]
             },
         ]
+        // Q11: the yours section, from the same feed the view builds it out
+        // of. Reported beside `sections`, not inside them: the sections list
+        // is Q3's shape and its order is pinned by test_asks_rows, and the
+        // yours section is a slice-5 addition that AskSections (Q3) keeps
+        // out of the three action sections on purpose.
+        if board.speaksAsks {
+            let yours = AskYours.rows(in: feed.asks)
+            payload["yours"] = [
+                "label": AskYours.label,
+                "count": yours.count,
+                "rows": yours.map(yoursRowJSON),
+            ] as [String: Any]
+        } else {
+            payload["yours"] = NSNull()
+        }
         // The legacy side, so a hub that predates the ask API can be proven
         // to keep its rows rather than blanking the menu.
         if let legacy = board.legacy {
@@ -691,6 +735,45 @@ enum AskSeams {
         return out
     }
 
+    /// One yours row as the seam reports it (Q11): the section's two facts
+    /// -- title and time -- plus the reminder the time came from, the
+    /// address the title opens, and the row's own buttons off the hub's
+    /// `moves` list. `YoursRowView`'s body is the other copy of this shape.
+    private static func yoursRowJSON(_ row: YoursRowModel) -> [String: Any] {
+        [
+            "id": row.id,
+            "title": row.title,
+            "state": row.ask.state.raw,
+            "time": row.timeText ?? NSNull(),
+            "remind_at": row.ask.remindAt ?? NSNull(),
+            "remind_line": row.remindLine ?? NSNull(),
+            "open_url": row.ask.url ?? NSNull(),
+            "buttons": YoursMoves.buttons(for: row.ask).map(yoursButtonJSON),
+        ] as [String: Any]
+    }
+
+    /// A yours row's button as the seam reports it. Unlike buttonJSON, the
+    /// body key comes from the button's own act -- the remind move's typed
+    /// time travels under `at` (contract 1.6), not the `prompt`/`text` keys
+    /// AskRowMoves derives for the action states.
+    private static func yoursButtonJSON(_ button: AskMoveButton) -> [String: Any] {
+        var out: [String: Any] = [
+            "title": button.title,
+            "key": button.key ?? NSNull(),
+        ]
+        switch button.act {
+        case .post(let move):
+            out["move"] = move
+        case .text(let move, let bodyKey):
+            out["move"] = move
+            out["text_input"] = true
+            out["body_key"] = bodyKey
+        default:
+            break
+        }
+        return out
+    }
+
     // MARK: --ask-press (Q9)
 
     /// The key walkthrough: resolve one bare key against a row the way the
@@ -788,6 +871,172 @@ enum AskSeams {
             out["undo"] = ["ok": undone.ok, "line": AskMoveLine.undo(undone)] as [String: Any]
         }
         return out
+    }
+
+    // MARK: --ask-remind (Q11)
+
+    /// The ⌥⏎ picker's write, really performed. Without --ask-row it is the
+    /// field's own gesture -- POST /asks mode "remind" through the same
+    /// Actions.remind the picker's send runs, prefix stripped, directory
+    /// resolved, time parsed from the spec -- and with --ask-row it is the
+    /// yours row's knob, the `remind` move with `{"at": ...}` ("none"
+    /// clears). Prints the parsed time and the hub's answer; exit 0 when the
+    /// reminder landed, 1 when the hub refused (its message *is* the
+    /// answer), 2 when the seam could not run at all.
+    private static func remindField(args: [String]) -> Int32 {
+        let config = StoreConfig.resolve()
+        let spec = value(args, "--ask-at") ?? "in 1 hour"
+        var out: [String: Any] = [
+            "spec": spec,
+            "remind_at": NSNull(),
+            "at_text": NSNull(),
+        ]
+
+        // The row leg first, so a picker opened on a row needs no text.
+        if let needle = value(args, "--ask-row") {
+            guard let base = config.passURL else {
+                return fail("the Pass feed is off (QT_PASS_URL is empty)")
+            }
+            let feed = Feed.loadAsks(config: config)
+            let board = AskBoard.build(feed: feed)
+            // Yours rows are not on the board's sections (AskSections keeps
+            // them out), so the row is looked for there first -- the same
+            // rows the view's section draws.
+            guard let yoursHit = AskYours.rows(in: feed.asks)
+                    .first(where: { $0.id.contains(needle) }) else {
+                // Not a yours row; the move still works on any ask the board
+                // carries, the same way --ask-press does.
+                guard let row = board.row(matching: needle) else {
+                    return fail("no ask id contains \"\(needle)\"")
+                }
+                return remindRowMove(id: row.id, spec: spec, base: base, out: &out)
+            }
+            return remindRowMove(id: yoursHit.id, spec: spec, base: base, out: &out)
+        }
+
+        // The field leg: same shape a fire resolves by.
+        let ownFlags: Set<String> = ["--ask-at", "--ask-row"]
+        guard let i = args.firstIndex(of: "--ask-remind"), i + 1 < args.count,
+              !ownFlags.contains(args[i + 1]) else {
+            return fail("--ask-remind needs some text (or --ask-row <id-substring>)")
+        }
+        let raw = args[i + 1]
+        guard let base = config.passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        guard let parsed = RemindTime.parse(spec, now: Date()) else {
+            return fail("could not read \"\(spec)\" as a time")
+        }
+        let (prefixDir, stripped) = FireResolve.parsePrefix(raw)
+        let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: config.settings)
+        out["text"] = stripped
+        out["dir"] = resolved.url.path
+        out["dir_source"] = resolved.source
+        out["mode"] = "remind"
+        out["remind_at"] = Actions.isoStamp(parsed)
+        out["at_text"] = RemindTime.text(for: parsed)
+        let result = Actions.remind(text: stripped, dir: resolved.url,
+                                    remindAt: parsed, base: base)
+        out["ok"] = result.ok
+        out["kind"] = result.kind.rawValue
+        out["message"] = result.message
+        out["ask_id"] = result.ask?.id ?? NSNull()
+        _ = emit(out)
+        return result.ok ? 0 : 1
+    }
+
+    /// The row leg of --ask-remind: the `remind` move with `{"at": ...}` on
+    /// one ask -- "none"/"clear" sends `at: null` and clears. Exit 0 when it
+    /// landed, 1 when the hub refused (its message is the answer).
+    private static func remindRowMove(id: String, spec: String,
+                                      base: URL, out: inout [String: Any]) -> Int32 {
+        out["id"] = id
+        let at: Date?
+        if RemindTime.isClear(spec) {
+            out["clears"] = true
+            at = nil
+        } else {
+            guard let parsed = RemindTime.parse(spec, now: Date()) else {
+                return fail("could not read \"\(spec)\" as a time")
+            }
+            out["remind_at"] = Actions.isoStamp(parsed)
+            out["at_text"] = RemindTime.text(for: parsed)
+            at = parsed
+        }
+        let result = Actions.remindMove(id: id, at: at, base: base)
+        out["ok"] = result.ok
+        out["kind"] = result.kind.rawValue
+        out["message"] = result.message
+        out["line"] = AskMoveLine.line(move: "remind", result: result)
+        _ = emit(out)
+        return result.ok ? 0 : 1
+    }
+
+    // MARK: --ask-find (Q11)
+
+    /// ⌘F's query, really performed: GET /asks/search through the same
+    /// Actions.searchAsks the find field fetches with. Results print as rows
+    /// -- id, title, where the query matched, the snippet, the address a
+    /// click opens -- and --ask-expand runs one result's expand plan (the
+    /// thread fetch, `seen` when the found ask is still unseen), the same
+    /// walkthrough --ask-dump-rows gives a section row.
+    private static func find(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--ask-find"), i + 1 < args.count,
+              !args[i + 1].hasPrefix("--") else {
+            return fail("--ask-find needs a query")
+        }
+        let query = args[i + 1]
+        guard let base = StoreConfig.resolve().passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        var out: [String: Any] = ["query": query]
+        switch Actions.searchAsks(base: base, query: query) {
+        case .failure(let problem):
+            out["ok"] = false
+            out["error"] = problem.message
+            _ = emit(out)
+            return 1
+        case .success(let hits):
+            out["ok"] = true
+            out["count"] = hits.count
+            out["results"] = hits.map { hit in
+                [
+                    "id": hit.id,
+                    "title": hit.ask.title,
+                    "state": hit.ask.state.raw,
+                    "place": hit.ask.place,
+                    "match": hit.match ?? NSNull(),
+                    "match_label": hit.matchLabel ?? NSNull(),
+                    "snippet": hit.snippet ?? NSNull(),
+                    "open_url": hit.ask.url ?? NSNull(),
+                ] as [String: Any]
+            }
+            if let needle = value(args, "--ask-expand") {
+                guard let hit = hits.first(where: { $0.id.contains(needle) }) else {
+                    return fail("no result id contains \"\(needle)\"")
+                }
+                let config = StoreConfig.resolve()
+                let feed = Feed.loadAsks(config: config)
+                // The same row the view's find list builds: the expand plan
+                // and the row JSON read one construction.
+                let row = AskRowModel(ask: hit.ask, section: .needsYou)
+                out["expanded"] = expandJSON(row: row, feed: feed, config: config)
+            }
+        }
+        return emit(out)
+    }
+
+    // MARK: --ask-desk (Q11)
+
+    /// ⌘D's target: the desk the hub serves (H9), on the same base every
+    /// ask read and write uses. Prints the URL; opening it is the panel's
+    /// business, never a test's.
+    private static func desk(args: [String]) -> Int32 {
+        guard let base = StoreConfig.resolve().passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        return emit(["ok": true,
+                     "desk_url": Actions.deskURL(base: base).absoluteString] as [String: Any])
     }
 
     // MARK: --ask-post
