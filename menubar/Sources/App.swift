@@ -117,6 +117,14 @@ final class StatusController: ObservableObject {
     /// (NotifyInbox.swift). Nil beside a RecordingNotifier, so no seam or
     /// test ever watches the real filesystem.
     private var inboxWatcher: InboxWatcher?
+    /// Bumped by every apply() so a refresh() that was already in flight
+    /// when the settings changed cannot write its resolve back over the
+    /// just-applied config. Without it, the launch-time poll's write-back
+    /// could land mid-`--dump-outcomes` sequence and resurrect the
+    /// pre-apply toggle -- the off -> on authorization edge then reads as
+    /// a no-op and "requested exactly once more" intermittently fails
+    /// (~15% under load, a queue-timing race, nothing environmental).
+    private var configGen = 0
 
     enum Keys {
         static let collapsed = "menubar.collapsedSections"
@@ -315,23 +323,33 @@ final class StatusController: ObservableObject {
         // with no race against this same property being read or written back
         // on the main thread while the background block is in flight.
         let previous = model
+        // Snapshotted on the main thread, like `previous`: the settings the
+        // controller holds right now, and the generation they belong to. The
+        // background resolve pins its settings to this snapshot -- a disk
+        // re-read could race the very apply() that triggered this refresh and
+        // load a stale toggle back -- and the write-back below only lands
+        // when no apply() has since bumped the generation.
+        let settingsNow = config.settings
+        let gen = configGen
         // Feed.load blocks on a loopback request, so it must never run on the
         // main thread: a wedged Pass would freeze the open menu. The config is
-        // resolved out here too, so re-reading .pass-url and the settings costs
-        // the main thread nothing either.
+        // resolved out here too, so re-reading .pass-url costs the main thread
+        // nothing either.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             // Probed here, off the main thread: this is the path that lets
             // the running widget self-heal from a stale `.pass-url` left
             // behind by a Pass that has since died, rather than polling a
             // dead port until the app is relaunched.
-            let config = StoreConfig.resolve(probeDiscovery: true)
+            let config = StoreConfig.resolve(settings: settingsNow, probeDiscovery: true)
             let fresh = Feed.load(config: config, previous: previous)
             // Same tasksDir scan the chip's menu used to run from `body`;
             // done here instead, off the main thread, at poll cadence.
             let dirs = RecentDirs.load(tasksDir: config.tasksDir)
             DispatchQueue.main.async {
                 self?.pollInFlight = false
-                self?.config = config
+                if let self, self.configGen == gen {
+                    self.config = config
+                }
                 // clearing(): presentational only -- the job tracker below
                 // still diffs the unfiltered `fresh`, so a cleared row
                 // changing state never re-notifies as a false transition.
@@ -453,6 +471,9 @@ final class StatusController: ObservableObject {
         let oldCombo = config.settings.hotkeyCombo
         let oldNotify = config.settings.notifyWhenHidden
         new.save(defaults)
+        // Any refresh() already in flight must not write its resolve back
+        // over this: bump the generation its write-back checks first.
+        configGen += 1
         config = StoreConfig.resolve(settings: new)
         if abs(new.pollInterval - oldInterval) > 0.01 { restartPoll(new.pollInterval) }
         if new.hotkeyCombo != oldCombo { globalHotkey?.register(new.hotkeyCombo) }
