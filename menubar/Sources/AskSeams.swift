@@ -17,11 +17,18 @@
 //       move took, 1 when it did not (a 409 is an answer, not a crash).
 //   --ask-dump-rows [--ask-expand <id-substring>] [--ask-done <id-substring>] [--ask-undo]
 //       The ask menu the rows draw (Q3): source, badge (the hub's counts.badge,
-//       verbatim), the sections in plan order with every row's detail and
-//       affordances, and the legacy ids when this hub predates the ask API.
-//       --ask-expand runs the row's expand plan (thread fetch + seen for an
-//       unseen row); --ask-done posts done and prints the undo line the row
-//       shows, and --ask-undo spends the returned token right after.
+//       verbatim), the sections in plan order with every row's detail,
+//       affordances, move buttons (Q9, from the hub's own moves list), and the
+//       legacy ids when this hub predates the ask API. --ask-expand runs the
+//       row's expand plan (thread fetch + seen for an unseen row); --ask-done
+//       posts done and prints the undo line the row shows, and --ask-undo
+//       spends the returned token right after.
+//   --ask-press <id-substring> <key> [--ask-text <text>] [--ask-in-field] [--ask-undo] (Q9)
+//       The key walkthrough: the same AskKeys.target the root handler runs,
+//       then the same POST the resolved button would make. A text move posts
+//       the words its field opens with (the original words, for a redo) when
+//       no --ask-text overrides them. --ask-in-field proves the inert case:
+//       a field with focus owns every key, nothing resolves, nothing posts.
 //
 //   --ask-notice <payload.json> [--ask-action <id>] [--ask-text <text>] (Q6)
 //       One bell payload (v2 or v1) as the notice it becomes: category,
@@ -47,6 +54,7 @@ enum AskSeams {
         if args.contains("--ask-dump-model") { return dumpModel(args: args) }
         if args.contains("--ask-dump-rows") { return dumpRows(args: args) }
         if args.contains("--ask-dump-thread") { return dumpThread(args: args) }
+        if args.contains("--ask-press") { return press(args: args) }
         if args.contains("--ask-post") { return post(args: args) }
         return fail("unknown --ask-* seam: \(args.filter { $0.hasPrefix("--ask-") }.joined(separator: " "))")
     }
@@ -401,7 +409,136 @@ enum AskSeams {
             "open_enabled": row.openEnabled,
             "can_done": row.canDone,
             "can_expand": true,
+            // Q9: the row's move buttons, from the hub's own moves list, and
+            // the two state-specific extras the row draws around them.
+            "buttons": row.moveButtons.map { buttonJSON($0, ask: row.ask) },
+            "last_attempt": row.lastAttempt ?? NSNull(),
+            "answer_field": row.answersInline,
         ] as [String: Any]
+    }
+
+    /// One move button as the seam reports it: what it does, its key, and
+    /// for a text move the body key and the words its field opens with.
+    private static func buttonJSON(_ button: AskMoveButton, ask: Ask) -> [String: Any] {
+        var out: [String: Any] = [
+            "title": button.title,
+            "key": button.key ?? NSNull(),
+            "inline": button.inline,
+            "text_input": false,
+        ]
+        switch button.act {
+        case .post(let move):
+            out["move"] = move
+        case .text(let move, _):
+            out["move"] = move
+            out["text_input"] = true
+            out["body_key"] = AskRowMoves.bodyKey(for: move)
+            out["prefill"] = AskRowMoves.prefill(for: ask, move: move) ?? ""
+        case .copyAnswer:
+            out["client"] = "copy"
+        case .openThread:
+            out["client"] = "open"
+        }
+        return out
+    }
+
+    // MARK: --ask-press (Q9)
+
+    /// The key walkthrough: resolve one bare key against a row the way the
+    /// root handler does (`AskKeys.target`), then perform it the way its
+    /// button does. A plain move POSTs `{}`; a text move POSTs its body key
+    /// with the words the field would carry (the prefill, unless --ask-text
+    /// overrides), and posts nothing when those words are empty -- an empty
+    /// follow-up is a slip of the return key, not a move. --ask-in-field
+    /// proves the keys go inert while a field has focus: nothing resolves,
+    /// nothing posts. --ask-undo spends the token right after, the way Z
+    /// does. Client-only buttons (copy, open) report themselves without
+    /// posting anything anywhere.
+    private static func press(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--ask-press"), i + 2 < args.count,
+              !args[i + 1].hasPrefix("--") else {
+            return fail("--ask-press needs <id-substring> <key>")
+        }
+        let needle = args[i + 1]
+        let key = args[i + 2]
+        let config = StoreConfig.resolve()
+        let feed = Feed.loadAsks(config: config)
+        let board = AskBoard.build(feed: feed)
+        guard let row = board.row(matching: needle) else {
+            return fail("no ask id contains \"\(needle)\"")
+        }
+        let inField = args.contains("--ask-in-field")
+        var out: [String: Any] = [
+            "id": row.id,
+            "key": key,
+            "in_field": inField,
+            "state": row.ask.state.raw,
+        ]
+        guard let button = AskKeys.target(ask: row.ask, key: key, fieldHasFocus: inField) else {
+            // Nothing resolved: a key this row does not carry, or a field
+            // that owns the keystroke. Either way, nothing posts.
+            out["pressed"] = NSNull()
+            out["posted"] = false
+            return emit(out)
+        }
+        out["pressed"] = ["title": button.title, "move": button.move ?? NSNull()] as [String: Any]
+        switch button.act {
+        case .copyAnswer, .openThread:
+            out["client"] = button.act == .copyAnswer ? "copy" : "open"
+            out["posted"] = false
+            return emit(out)
+        case .post(let move):
+            guard let base = config.passURL else {
+                return fail("the Pass feed is off (QT_PASS_URL is empty)")
+            }
+            let result = AskClient(base: base).post(id: row.id, move: move)
+            out["posted"] = true
+            out["move"] = move
+            return emit(pressOutcome(row: row, move: move, result: result,
+                                     args: args, base: base, out: out))
+        case .text(let move, _):
+            let bodyKey = AskRowMoves.bodyKey(for: move)
+            let prefill = AskRowMoves.prefill(for: row.ask, move: move) ?? ""
+            out["move"] = move
+            out["text_input"] = true
+            out["body_key"] = bodyKey
+            out["prefill"] = prefill
+            let typed = value(args, "--ask-text") ?? prefill
+            guard !typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                out["posted"] = false
+                out["needs_text"] = true
+                return emit(out)
+            }
+            guard let base = config.passURL else {
+                return fail("the Pass feed is off (QT_PASS_URL is empty)")
+            }
+            let result = AskClient(base: base).post(id: row.id, move: move,
+                                                    body: [bodyKey: typed])
+            out["posted"] = true
+            out["sent_text"] = typed
+            return emit(pressOutcome(row: row, move: move, result: result,
+                                     args: args, base: base, out: out))
+        }
+    }
+
+    /// What a press's POST came back as, in the same words the row draws:
+    /// the line (`AskMoveLine`), the token Z spends, and --ask-undo's own
+    /// POST when it was asked for and there is a token to spend.
+    private static func pressOutcome(row: AskRowModel, move: String, result: MoveResult,
+                                     args: [String], base: URL,
+                                     out: [String: Any]) -> [String: Any] {
+        var out = out
+        out["ok"] = result.ok
+        out["kind"] = result.kind.rawValue
+        out["message"] = result.message
+        out["line"] = AskMoveLine.line(move: move, result: result)
+        out["undo_token"] = result.undo?.token ?? NSNull()
+        if args.contains("--ask-undo"), let token = result.undo?.token {
+            let undone = AskClient(base: base).post(id: row.id, move: "undo",
+                                                    body: ["token": token])
+            out["undo"] = ["ok": undone.ok, "line": AskMoveLine.undo(undone)] as [String: Any]
+        }
+        return out
     }
 
     // MARK: --ask-post

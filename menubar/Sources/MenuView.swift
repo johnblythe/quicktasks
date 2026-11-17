@@ -104,6 +104,16 @@ struct MenuView: View {
     /// line to draw, and the undo token Z spends. Token nil when the hub
     /// refused -- the line still shows its words, but Z has nothing to do.
     @State private var askMoveLine: (id: String, line: String, token: String?)?
+    /// The row whose text editor is open (Q9): which row, the move its field
+    /// feeds, that move's body key, and the words the field holds. One at a
+    /// time, like the peek panel; the plan's two ask-first writes (Follow
+    /// up, Try with changes) open here rather than posting blind.
+    @State private var askEdit: AskEditState?
+    /// Whether a row's own field -- the editor, or a question's answer box
+    /// -- currently has focus. While one does, every root key handler is
+    /// inert, exactly the way quick-fire's field is: the field owns Return
+    /// and the letters, so R/E/Z can never fire a move under the typing.
+    @State private var askFieldFocused = false
     /// The id-substring the snapshot seam asked to pre-expand (`--snapshot
     /// <png> --expand <id>`), consumed by the first board that can satisfy
     /// it. Held as @State because consuming it mutates view state.
@@ -241,10 +251,13 @@ struct MenuView: View {
         }
         .onChange(of: controller.revealTick) { _, _ in
             // A notification banner's deep link: land the highlight and the
-            // peek panel on the row the banner was about.
+            // peek panel on the row the banner was about, and fetch its
+            // thread so the peek shows the answer itself rather than the
+            // row's excerpt (the one gap Q6 left in the reveal).
             if let id = controller.revealID {
                 highlighted = id
                 expandedID = id
+                if let row = controller.askBoard?.row(id: id) { expand(row) }
             }
             controller.consumeReveal()
         }
@@ -280,20 +293,26 @@ struct MenuView: View {
         // that field has focus it owns every character, which is what keeps
         // "type, press return, task fired" working.
         //
-        // E and Z are verbs before they are search starters (Q3): E files the
-        // highlighted ask done, Z spends the undo token a move left behind.
-        // Handled here rather than in their own onKeyPress modifiers so there
-        // is exactly one place a bare letter is interpreted -- the place that
-        // already knows whether a field owns the keystroke and whether the
-        // modifiers are bare.
+        // Q9 made the ask rows' own keys verbs before they are search
+        // starters: on the highlighted row, R follows up, ⇧R redoes with
+        // changes, C copies, E files done, A allows once, ⇧A allows always,
+        // X stops (the hub's `moves` list gates every one of them, so a key
+        // the row cannot honour falls through to search). Handled here
+        // rather than in per-key onKeyPress modifiers so there is exactly
+        // one place a bare letter is interpreted -- the place that already
+        // knows whether a field owns the keystroke (a row's editor and a
+        // question's answer box included) and whether the modifiers are
+        // bare. Z stays special: undo is about the last write, not the row
+        // under the cursor.
         .onKeyPress(phases: .down) { press in
-            guard !fieldFocused, !searchFocused, !searching else { return .ignored }
+            guard !fieldFocused, !searchFocused, !searching, !askFieldFocused else { return .ignored }
             guard press.modifiers.isEmpty || press.modifiers == .shift else { return .ignored }
             guard let c = press.characters.first, c.isLetter || c.isNumber else {
                 return .ignored
             }
-            if press.characters.lowercased() == "e", eActsOnAsk {
-                return pressE()
+            if let hit = askKeyTarget(press.characters) {
+                performAskButton(hit.button, on: hit.row)
+                return .handled
             }
             if press.characters.lowercased() == "z", zActsOnAsk {
                 return pressZ()
@@ -347,6 +366,9 @@ struct MenuView: View {
     }
 
     private func moveHighlight(_ delta: Int) -> KeyPress.Result {
+        // A row's own field owns the arrows too (Q9): they move the caret in
+        // the follow-up text, not the highlight under the row.
+        if askFieldFocused { return .ignored }
         let ids = visibleIDs
         guard !ids.isEmpty else { return .ignored }
         // The arrows belong to the list once it is being navigated. Dropping
@@ -361,12 +383,18 @@ struct MenuView: View {
     }
 
     private func triggerHighlighted() -> KeyPress.Result {
-        // An ask row's one action is opening the ask's own address (Q3):
-        // always enabled, never dimmed. Return falls through to the legacy
-        // record path only when the feed is not speaking asks.
+        // ⏎ on an ask row acts on the row's own return-key button when it
+        // has one (Q9: Try with changes on a failed row, Open on an answer)
+        // and opens the ask's one address otherwise -- always enabled, never
+        // dimmed. Return falls through to the legacy record path only when
+        // the feed is not speaking asks.
         if asksLive, let board = controller.askBoard,
            let id = highlighted, let row = board.row(id: id) {
-            openAsk(row)
+            if let button = AskKeys.returnTarget(ask: row.ask, fieldHasFocus: false) {
+                performAskButton(button, on: row)
+            } else {
+                openAsk(row)
+            }
             return .handled
         }
         guard let id = highlighted,
@@ -381,16 +409,18 @@ struct MenuView: View {
     }
 
     /// The root `.onKeyPress(.return)` handler. Routes through
-    /// `KeyboardNav.returnTarget` first: while quick-fire's own field or the
-    /// search field has focus, Return is `.ignored` here so the field's own
-    /// `.onSubmit` (`send`/`submitSearch`) is what actually runs -- a
-    /// highlight left over from an earlier visit must never hijack the key
-    /// the moment a fresh summon refocuses the field. Only once neither
-    /// field owns the keystroke does a highlighted row get to act.
+    /// `KeyboardNav.returnTarget` first: while quick-fire's own field, the
+    /// search field, or a row's editor/answer field has focus, Return is
+    /// `.ignored` here so the field's own `.onSubmit` (`send`/`submitSearch`/
+    /// the editor's submit) is what actually runs -- a highlight left over
+    /// from an earlier visit must never hijack the key the moment a fresh
+    /// summon refocuses the field. Only once no field owns the keystroke
+    /// does a highlighted row get to act.
     private func handleReturn() -> KeyPress.Result {
         switch KeyboardNav.returnTarget(highlighted: highlighted,
                                         fieldFocused: fieldFocused,
-                                        searchFocused: searchFocused) {
+                                        searchFocused: searchFocused,
+                                        rowFieldFocused: askFieldFocused) {
         case .field: return .ignored
         case .row: return triggerHighlighted()
         case .none: return .ignored
@@ -425,11 +455,17 @@ struct MenuView: View {
         }
     }
 
-    /// Escape backs out of one thing at a time, innermost first: a pending
-    /// Go/Deny confirmation, then the search, then the quick-fire draft, then
-    /// the highlight. One key undoing everything at once would make it
-    /// impossible to abandon a confirmation without also losing the search.
+    /// Escape backs out of one thing at a time, innermost first: the row's
+    /// open editor (Q9 -- the most transient thing on screen), then a
+    /// pending Go/Deny confirmation, then the search, then the quick-fire
+    /// draft, then the highlight. One key undoing everything at once would
+    /// make it impossible to abandon a confirmation without also losing the
+    /// search.
     private func clearDraft() -> KeyPress.Result {
+        if askEdit != nil {
+            cancelEdit()
+            return .handled
+        }
         if confirmingSuggestion != nil {
             confirmingSuggestion = nil
             return .handled
@@ -985,8 +1021,10 @@ struct MenuView: View {
         // A move line from an earlier visit is not carried into the next
         // one: the dropdown tears down on close anyway (state lost with it),
         // so the cached summon panel starting equally clean is the same
-        // rule, not a second one.
+        // rule, not a second one. Same for a row editor left open (Q9).
         askMoveLine = nil
+        askEdit = nil
+        askFieldFocused = false
     }
 
     private func send() {
@@ -1336,20 +1374,6 @@ struct MenuView: View {
         NSWorkspace.shared.open(url)
     }
 
-    /// E on a row: files it done through the real move route. The verdict
-    /// lands under the row as a line -- with "Z to undo" while the hub's
-    /// token holds -- rather than as a banner, because undo is about the
-    /// row, and the row is what the eye is on.
-    private func doneAsk(_ row: AskRowModel) {
-        guard let base = askClientBase() else { return }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = AskClient(base: base).post(id: row.id, move: "done")
-            DispatchQueue.main.async {
-                landMoveLine(row: row, result: result)
-            }
-        }
-    }
-
     /// Z: spends the undo token the last move left. Any row's token, not
     /// only the highlighted one's -- undoing is about the write, and the
     /// write named its row in the line.
@@ -1364,18 +1388,10 @@ struct MenuView: View {
                     askMoveLine = nil
                     controller.refreshAsks()
                 } else {
-                    askMoveLine = (pending.id, AskMoveLine.failure(result), nil)
+                    askMoveLine = (pending.id, AskMoveLine.undo(result), nil)
                 }
             }
         }
-    }
-
-    /// Whether the E key currently has ask work to do: asks are live, a row
-    /// is highlighted, and the hub's own moves list offers `done` for it.
-    private var eActsOnAsk: Bool {
-        guard let board = liveAskBoard, let id = highlighted,
-              let row = board.row(id: id) else { return false }
-        return row.canDone
     }
 
     /// Whether the Z key currently has a token to spend.
@@ -1384,19 +1400,120 @@ struct MenuView: View {
         return !token.isEmpty
     }
 
-    private func pressE() -> KeyPress.Result {
-        guard !fieldFocused, !searchFocused, eActsOnAsk else { return .ignored }
-        if let board = liveAskBoard, let id = highlighted, let row = board.row(id: id) {
-            doneAsk(row)
-            return .handled
-        }
-        return .ignored
-    }
-
     private func pressZ() -> KeyPress.Result {
-        guard !fieldFocused, !searchFocused, zActsOnAsk else { return .ignored }
+        guard !fieldFocused, !searchFocused, !askFieldFocused, zActsOnAsk else { return .ignored }
         undoAsk()
         return .handled
+    }
+
+    // MARK: - asks: moves in the row (Q9)
+
+    /// Resolves one bare key against the highlighted ask row: the same
+    /// `AskKeys.target` the seam drives, so a key can never mean one thing
+    /// in a test and another in the menu. The focus guard lives in the
+    /// letter handler, which is what keeps this lookup from ever running
+    /// while a field owns the keystroke.
+    private func askKeyTarget(_ key: String) -> (row: AskRowModel, button: AskMoveButton)? {
+        guard asksLive, let board = controller.askBoard,
+              let id = highlighted, let row = board.row(id: id) else { return nil }
+        guard let button = AskKeys.target(ask: row.ask, key: key, fieldHasFocus: false) else {
+            return nil
+        }
+        return (row, button)
+    }
+
+    /// Runs one row button: a plain move posts straight out, a text move
+    /// opens the row's editor, copy lands the answer on the pasteboard,
+    /// open goes to the ask's one address. Every path is one click; the two
+    /// that ask for words first open the field instead of posting blind.
+    private func performAskButton(_ button: AskMoveButton, on row: AskRowModel) {
+        switch button.act {
+        case .post(let move):
+            postAskMove(row, move: move)
+        case .text(let move, _):
+            openEditor(row: row, move: move)
+        case .copyAnswer:
+            copyAskAnswer(row)
+        case .openThread:
+            openAsk(row)
+        }
+    }
+
+    /// Opens the row's editor for a text move, prefilled per the plan: a
+    /// try-with-changes opens on the original words, everything else empty.
+    private func openEditor(row: AskRowModel, move: String) {
+        askEdit = AskEditState(id: row.id, move: move,
+                               bodyKey: AskRowMoves.bodyKey(for: move),
+                               text: AskRowMoves.prefill(for: row.ask, move: move) ?? "")
+    }
+
+    private func cancelEdit() {
+        askEdit = nil
+        askFieldFocused = false
+    }
+
+    /// Submits the open editor: its move, with the field's words under the
+    /// move's own body key. An empty field submits nothing -- an empty
+    /// follow-up is a slip of the return key, not a move.
+    private func submitEdit(_ text: String) {
+        guard let edit = askEdit else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        askEdit = nil
+        askFieldFocused = false
+        guard let row = liveAskBoard?.row(id: edit.id) else { return }
+        postAskMove(row, move: edit.move, text: (key: edit.bodyKey, value: trimmed))
+    }
+
+    /// Posts one move and lands its verdict line under the row -- the same
+    /// line E has always left, generalized to every write: the hub's own
+    /// undo token becomes "Z to undo", its refusal (409, 501, 503) becomes
+    /// its own words, never a dead button.
+    private func postAskMove(_ row: AskRowModel, move: String,
+                             text: (key: String, value: String)? = nil) {
+        guard let base = askClientBase() else { return }
+        var body: [String: Any] = [:]
+        if let text { body[text.key] = text.value }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = AskClient(base: base).post(id: row.id, move: move, body: body)
+            DispatchQueue.main.async {
+                landMoveLine(row: row, move: move, result: result)
+            }
+        }
+    }
+
+    /// Copy C: the answer as the row can read it -- the thread's full text
+    /// once it is in hand (fetching it if it is not), the excerpt as the
+    /// fallback, and an honest nothing when neither exists.
+    private func copyAskAnswer(_ row: AskRowModel) {
+        if let thread = askThreads[row.id], !thread.answerText.isEmpty {
+            Actions.copyToPasteboard(thread.answerText)
+            controller.post(kind: .info, title: "Answer copied")
+            return
+        }
+        guard let base = askClientBase() else {
+            copyAskExcerpt(row)
+            return
+        }
+        AskClient(base: base).threadAsync(id: row.id, updatedAt: row.ask.updatedAt) { result in
+            switch result {
+            case .success(let thread) where !thread.answerText.isEmpty:
+                askThreads[row.id] = thread
+                Actions.copyToPasteboard(thread.answerText)
+                controller.post(kind: .info, title: "Answer copied")
+            default:
+                copyAskExcerpt(row)
+            }
+        }
+    }
+
+    private func copyAskExcerpt(_ row: AskRowModel) {
+        guard let excerpt = row.ask.answerExcerpt, !excerpt.isEmpty else {
+            controller.post(kind: .info, title: "No answer text to copy")
+            return
+        }
+        Actions.copyToPasteboard(excerpt)
+        controller.post(kind: .info, title: "Copied the excerpt")
     }
 
     /// Lands a move's verdict under the row: the undo line when the hub
@@ -1404,8 +1521,8 @@ struct MenuView: View {
     /// posts to the outcome queue -- the panel can close mid-read, and a
     /// refused write is the one thing worth following the user out of the
     /// menu.
-    private func landMoveLine(row: AskRowModel, result: MoveResult) {
-        let line = AskMoveLine.done(result)
+    private func landMoveLine(row: AskRowModel, move: String, result: MoveResult) {
+        let line = AskMoveLine.line(move: move, result: result)
         askMoveLine = (row.id, line, result.undo?.token)
         if result.ok {
             controller.refreshAsks()
@@ -1439,6 +1556,10 @@ struct MenuView: View {
                         ForEach(board.sections, id: \.section) { entry in
                             AskSectionHeader(section: entry.section, count: entry.rows.count)
                             ForEach(AskFilter.apply(entry.rows, query: search)) { row in
+                                // The row's open editor, when it is this
+                                // row's: the move its field feeds and the
+                                // binding into the field's own text.
+                                let edit = askEdit?.id == row.id ? askEdit : nil
                                 AskRowView(
                                     row: row,
                                     highlighted: highlighted == row.id,
@@ -1446,8 +1567,20 @@ struct MenuView: View {
                                     loading: askLoadingThreads.contains(row.id),
                                     thread: askThreads[row.id],
                                     moveLine: askMoveLine?.id == row.id ? askMoveLine?.line : nil,
+                                    editing: edit.map { (move: $0.move, bodyKey: $0.bodyKey) },
+                                    editText: edit.map { _ in Binding(
+                                        get: { askEdit?.text ?? "" },
+                                        set: { if askEdit != nil { askEdit?.text = $0 } }) },
                                     onTitle: { openAsk(row) },
-                                    onToggleExpand: { toggleExpand(row) })
+                                    onToggleExpand: { toggleExpand(row) },
+                                    onButton: { button in performAskButton(button, on: row) },
+                                    onAnswer: { text in
+                                        postAskMove(row, move: "follow_up",
+                                                    text: (key: "text", value: text))
+                                    },
+                                    onEditSubmit: submitEdit,
+                                    onEditCancel: cancelEdit,
+                                    onFieldFocus: { askFieldFocused = $0 })
                             }
                         }
                     }
@@ -2071,9 +2204,10 @@ struct AskSectionHeader: View {
 
 /// One ask row: the title opens the ask's own address (always -- that is the
 /// row's one guaranteed action), the eye expands the answer in place, and
-/// working rows carry their age and live line. The keyboard highlight and
-/// the peek panel are the same affordances the legacy TaskRow has, so the
-/// two menus still feel like one widget.
+/// the row's tail carries its move buttons -- from the hub's own `moves`
+/// list (Q9), so a row offers exactly what the server says it can do. The
+/// keyboard highlight and the peek panel are the same affordances the legacy
+/// TaskRow has, so the two menus still feel like one widget.
 struct AskRowView: View {
     let row: AskRowModel
     var highlighted: Bool = false
@@ -2083,8 +2217,25 @@ struct AskRowView: View {
     /// The verdict line a move left under this row (E's undo line, or the
     /// hub's refusal), nil when there is none to draw.
     var moveLine: String?
+    /// The row's open editor (Q9): the move its field feeds and that move's
+    /// body key, nil when this row is not editing. The field's text itself
+    /// is MenuView's `askEdit`, bound in through `editText` so one source
+    /// of truth holds it.
+    var editing: (move: String, bodyKey: String)? = nil
+    var editText: Binding<String>? = nil
     let onTitle: () -> Void
     let onToggleExpand: () -> Void
+    /// A tail button (Q9). The inline answer field's submit arrives as
+    /// `onAnswer`, the editor's as `onEditSubmit`.
+    let onButton: (AskMoveButton) -> Void
+    /// The question's inline answer field, submitted.
+    let onAnswer: (String) -> Void
+    /// The editor's field, submitted.
+    let onEditSubmit: (String) -> Void
+    let onEditCancel: () -> Void
+    /// Whether a field of this row (editor or answer box) has focus, so the
+    /// root key handlers can go inert while it does.
+    let onFieldFocus: (Bool) -> Void
 
     /// The peek's answer area: tall enough to read a real answer, short
     /// enough that a long one scrolls inside the row instead of growing the
@@ -2092,6 +2243,15 @@ struct AskRowView: View {
     static let expandMaxHeight: CGFloat = 170
 
     @State private var hovering = false
+    @State private var answerDraft = ""
+    @FocusState private var answerFocused: Bool
+    @FocusState private var editorFocused: Bool
+
+    /// The buttons that draw in the row's tail (the inline answer field is
+    /// drawn under the title instead, so it gets the row's full width).
+    private var tailButtons: [AskMoveButton] {
+        row.moveButtons.filter { !$0.inline }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -2107,11 +2267,22 @@ struct AskRowView: View {
                 }
                 .buttonStyle(.plain)
                 Spacer(minLength: 8)
-                Text(rightDetail)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .fixedSize()
+                if tailButtons.isEmpty {
+                    Text(rightDetail)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize()
+                } else {
+                    // A row with moves spends its tail on them; the state
+                    // word and the age stay one hover away in the tooltip,
+                    // where they were always second-choice reading.
+                    ForEach(tailButtons) { button in
+                        RowButton(icon: button.symbol, help: button.helpText) {
+                            onButton(button)
+                        }
+                    }
+                }
                 RowButton(icon: expanded ? "chevron.up" : "eye",
                           help: expanded ? "Hide the answer" : "Read the answer here",
                           action: onToggleExpand)
@@ -2131,6 +2302,13 @@ struct AskRowView: View {
                     .padding(.leading, 27)
                     .padding(.bottom, 3)
             }
+            if let attempt = row.lastAttempt {
+                Text(attempt)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 27)
+                    .padding(.bottom, 3)
+            }
             if let line = moveLine {
                 Text(line)
                     .font(.system(size: 10))
@@ -2138,10 +2316,84 @@ struct AskRowView: View {
                     .padding(.leading, 27)
                     .padding(.bottom, 3)
             }
+            if let question = row.ask.question, !question.isEmpty, row.ask.state == .question {
+                Text(question)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .padding(.leading, 27)
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 3)
+            }
+            if row.answersInline {
+                answerField
+            }
+            if let edit = editing, let text = editText {
+                editorField(edit, text)
+            }
             if expanded {
                 peek
             }
         }
+    }
+
+    /// A question's one affordance: the answer box right on the row, return
+    /// sends it as a follow-up. Its focus makes the panel's keys inert,
+    /// which is what lets the answer be typed without R, E, or Z firing
+    /// under it.
+    private var answerField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "bubble.left")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+            TextField("Answer it\u{2026}", text: $answerDraft)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11))
+                .focused($answerFocused)
+                .onSubmit { submitAnswer() }
+            RowButton(icon: "arrow.up.circle", help: "Send the answer (\u{23CE})") {
+                submitAnswer()
+            }
+        }
+        .padding(.leading, 27)
+        .padding(.trailing, 12)
+        .padding(.bottom, 6)
+        .onChange(of: answerFocused) { _, focused in onFieldFocus(focused) }
+    }
+
+    private func submitAnswer() {
+        let text = answerDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        answerDraft = ""
+        onAnswer(text)
+    }
+
+    /// The editor a text move opens (Follow up, Try with changes): opens on
+    /// the move's prefill (the original words, for a redo), return sends
+    /// it, and the x leaves the row as it was.
+    private func editorField(_ edit: (move: String, bodyKey: String),
+                             _ text: Binding<String>) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "square.and.pencil")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+            TextField(AskRowMoves.placeholder(for: edit.move), text: text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11))
+                .focused($editorFocused)
+                .onSubmit { onEditSubmit(text.wrappedValue) }
+            RowButton(icon: "arrow.up.circle", help: "Send (\u{23CE})") {
+                onEditSubmit(text.wrappedValue)
+            }
+            RowButton(icon: "xmark", help: "Cancel (Esc)") {
+                onEditCancel()
+            }
+        }
+        .padding(.leading, 27)
+        .padding(.trailing, 12)
+        .padding(.bottom, 6)
+        .onAppear { editorFocused = true }
+        .onChange(of: editorFocused) { _, focused in onFieldFocus(focused) }
     }
 
     /// The state word, the age, or both: what the right-hand column says so
@@ -2191,13 +2443,24 @@ struct AskRowView: View {
                 // a maxHeight alone leaves a ScrollView with no floor.
                 .frame(height: Self.expandMaxHeight)
             }
-            Text("\u{23CE} opens the thread" + (row.canDone ? " \u{00B7} E files it done" : ""))
+            Text(peekHint)
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         }
         .padding(.leading, 27)
         .padding(.trailing, 12)
         .padding(.bottom, 7)
+    }
+
+    /// The peek's one-line key hint. ⏎ names what it does on *this* row
+    /// (Try with changes on a failed one, the thread otherwise), so the
+    /// hint never promises a key something the row overrides.
+    private var peekHint: String {
+        if let button = AskKeys.returnTarget(ask: row.ask, fieldHasFocus: false),
+           case .text = button.act {
+            return "\u{23CE} tries it with your changes"
+        }
+        return "\u{23CE} opens the thread" + (row.canDone ? " \u{00B7} E files it done" : "")
     }
 
     private var answerText: String {
