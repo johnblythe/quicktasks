@@ -36,6 +36,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
@@ -1015,6 +1016,17 @@ def new_id(prompt):
 
 # --- queue / run --------------------------------------------------------
 
+def _spawn_run(tid):
+    """Start `qt _run <tid>` detached in its own session (so its pid is also
+    its process-group id, which is what `qt stop` signals). Shared by queue()
+    and `qt retry`."""
+    log = open(os.path.join(LOGS_DIR, tid + ".log"), "a")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_run", tid],
+        stdout=log, stderr=log, start_new_session=True, cwd=QT_DATA,
+    )
+
+
 def queue(prompt, wait=False, in_dir=None, model=None):
     bootstrap()
     invoked = os.getcwd()
@@ -1054,11 +1066,7 @@ def queue(prompt, wait=False, in_dir=None, model=None):
             print(f"\ndenied: {', '.join(d.get('tool_name', '?') for d in t.get('denials', []))}")
             print(f"qt resume {tid}  # approve and continue")
         sys.exit(0 if t["status"] == "done" else 1)
-    log = open(os.path.join(LOGS_DIR, tid + ".log"), "a")
-    subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "_run", tid],
-        stdout=log, stderr=log, start_new_session=True, cwd=QT_DATA,
-    )
+    _spawn_run(tid)
     trust_note = f" (trusted dir, {perm_mode})" if trusted else ""
     print(f"queued {tid}{trust_note}")
 
@@ -1373,8 +1381,8 @@ def _seed_hub_item(hub_dir, item):
 def _hub_job_record(task, item_id, rc, thread=None):
     """Map a finished qt task onto a hub jobs/<slug>/job.json record, plus
     the RESULT.md body that goes with it. The hub understands done/failed/
-    blocked directly; only qt's timeout status has no hub equivalent, so it
-    becomes failed with an explanatory error and a resume hint.
+    blocked/stopped directly; only qt's timeout status has no hub equivalent,
+    so it becomes failed with an explanatory error and a resume hint.
 
     `thread` is the Slack ts a headless resume's finish notice should post
     under (see qt resume <id> --prompt); None for a plain fired task, which
@@ -1404,6 +1412,9 @@ def _hub_job_record(task, item_id, rc, thread=None):
         job["status"] = "failed"
         job["error"] = "timeout"
         body = f"Timed out.\n\n↩ resume: `{resume_hint}`"
+    elif status == "stopped":
+        job["status"] = "stopped"
+        body = task.get("result") or "Stopped by you."
     elif status == "blocked":
         denials = task.get("denials") or []
         names = ", ".join(sorted({d.get("tool_name") or "?" for d in denials})) or "a tool call"
@@ -1577,8 +1588,15 @@ def _parse_claude_run(stdout, stderr, rc):
 
 def run_task(tid, interactive=False):
     task = load(tid)
+    if task.get("status") == "stopped":
+        # `qt stop` landed between queueing and this process starting.
+        return
     task["status"] = "running"
     task["started"] = now()
+    # This process is what `qt stop` signals: queue()/`qt retry` start it in
+    # its own session, so the pid is also the process-group id and the group
+    # takes claude and everything claude spawned down with it.
+    task["pid"] = os.getpid()
     save(task)
 
     try:
@@ -1711,7 +1729,7 @@ def cmd_list(n=15):
         print('no quicktasks yet · qt "do a thing"')
         return
     glyph = {"done": "✓", "failed": "✗", "timeout": "⏱", "running": "…",
-             "queued": "·", "blocked": "⊘", "dropped": "—"}
+             "queued": "·", "blocked": "⊘", "dropped": "—", "stopped": "■"}
     for f in files:
         with open(os.path.join(TASKS_DIR, f)) as fh:
             t = json.load(fh)
@@ -1720,14 +1738,40 @@ def cmd_list(n=15):
         print(f"{glyph.get(t['status'], '?')} {age(t['created']):>4} {t['id']:<32} {p:<58} {r}")
 
 
+def _ask_url(tid):
+    """The ask address `http://127.0.0.1:<port>/ask/qt-<tid>` when a hub is
+    configured (QT_HUB / config hub_dir pointing at a real directory), else
+    None. Base URL: $QT_PASS_URL, then the hub's pass-config.json
+    "pass_url", then the default port 8811."""
+    hub_dir = resolve_hub_dir()
+    if not hub_dir or not os.path.isdir(hub_dir):
+        return None
+    base = os.environ.get("QT_PASS_URL")
+    if not base:
+        try:
+            with open(os.path.join(hub_dir, "pass-config.json")) as f:
+                base = json.load(f).get("pass_url")
+        except (OSError, ValueError, AttributeError):
+            base = None
+    base = (base or "http://127.0.0.1:8811/").rstrip("/")
+    return f"{base}/ask/qt-{tid}"
+
+
 def cmd_open(fragment):
-    """`qt open <id>`: open the task's result artifact in the default
-    viewer. The hub mirror's RESULT.md is the durable copy (a task's own
+    """`qt open <id>`: with a hub configured, open the ask's address (its one
+    URL) in the default browser. Otherwise open the task's result artifact
+    in the default viewer. The hub mirror's RESULT.md is the durable copy (a task's own
     run dir may be the shared workspace); falls back to printing the
     recorded result text when nothing was written to disk."""
     bootstrap()
     tid = match_id(fragment)
     task = load(tid)
+    url = _ask_url(tid)
+    if url:
+        r = subprocess.run(["open", url], capture_output=True)
+        if r.returncode == 0:
+            print(f"opened {url}")
+            return
     candidates = []
     hub_dir = resolve_hub_dir()
     if hub_dir:
@@ -1750,6 +1794,93 @@ def cmd_open(fragment):
     else:
         sys.exit(f"qt open: {tid} has no result on disk or recorded "
                  f"(status: {task.get('status')})")
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:  # a zombie answers kill(0) but is already dead
+        st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                            capture_output=True, text=True, timeout=5).stdout.strip()
+        return bool(st) and not st.startswith("Z")
+    except Exception:
+        return True
+
+
+def _signal_run(pid, sig):
+    """Signal a run's process group when the pid leads one (the normal
+    detached `_run`); otherwise just the pid (a foreground `qt -w` shares its
+    terminal's group, which must never be signalled)."""
+    try:
+        pgid = os.getpgid(pid)
+        if pgid == pid and pgid != os.getpgrp():
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def cmd_stop(fragment):
+    """`qt stop <id>`: kill the run's process group, mark the task stopped
+    ("Stopped by you"), and feed the hub. Exit 0 also when the task is not
+    running (prints "not running")."""
+    bootstrap()
+    tid = match_id(fragment)
+    task = load(tid)
+    if task.get("status") not in ("running", "queued"):
+        print(f"{tid}: not running ({task.get('status')})")
+        return
+    pid = task.get("pid")
+    if isinstance(pid, int) and pid > 1 and _pid_alive(pid):
+        _signal_run(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and _pid_alive(pid):
+            time.sleep(0.05)
+        if _pid_alive(pid):
+            _signal_run(pid, signal.SIGKILL)
+            time.sleep(0.1)
+    task = load(tid)  # the run may have finished on its own while we killed it
+    if task.get("status") not in ("running", "queued"):
+        print(f"{tid}: not running ({task.get('status')})")
+        return
+    task.update(status="stopped", result="Stopped by you", finished=now())
+    save(task)
+    _feed_hub(task)
+    print(f"stopped {tid}")
+
+
+def cmd_retry(fragment, prompt_text=None):
+    """`qt retry <id> [--prompt <text>]`: run the same task again under the
+    same id. Appends attempts[] {n, at, kind:"retry", prompt} (n counts the
+    original run as 1), clears the previous outcome, queues it, and spawns
+    `_run` detached like queue(). Exit 0 queued, 2 running/queued, 1 unknown."""
+    bootstrap()
+    tid = match_id(fragment)
+    task = load(tid)
+    if task.get("status") in ("running", "queued"):
+        print(f"qt retry: {tid} is {task['status']}; stop it first (qt stop {tid})",
+              file=sys.stderr)
+        sys.exit(2)
+    if prompt_text is not None and prompt_text.strip():
+        task["prompt"] = prompt_text.strip()
+        task["label"] = short_label(task["prompt"])
+        task.pop("label_refined", None)
+    attempts = task.get("attempts") or []
+    attempts.append({"n": len(attempts) + 2, "at": now(), "kind": "retry",
+                     "prompt": task["prompt"]})
+    task.update(
+        attempts=attempts, status="queued", session_id=None, result=None,
+        denials=[], question=None, cost_usd=None, pid=None, finished=None,
+    )
+    task.pop("started", None)
+    save(task)
+    _spawn_run(tid)
+    print(f"queued {tid} (retry {len(attempts)})")
 
 
 def cmd_log(tid):
@@ -1831,6 +1962,7 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None):
     })
 
     task["status"] = "running"
+    task["pid"] = os.getpid()
     save(task)
 
     def _elapsed():
@@ -2917,7 +3049,10 @@ qt · fire-and-forget quicktasks for Claude Code
   qt -m <model> "..."    override the model for this task
   qt list [n]            recent tasks (default 15)
   qt log <id>            full record + raw log path (id fragments ok)
-  qt open <id>           open the task's RESULT.md (or print its result)
+  qt open <id>           open the ask page (hub on), else RESULT.md / its result
+  qt stop <id>           kill a running task (marks it stopped)
+  qt retry <id> [--prompt "<text>"|-]
+                          run the same task again under the same id
   qt resume-log [n]      last n resume-launch records (default 10)
   qt resume <id>         reopen a task as an interactive session
   qt resume <id> --prompt "<text>" [--thread <ts>]
@@ -2995,6 +3130,18 @@ def main():
             cmd_resume_prompt(fragment, prompt_text, thread=thread)
         else:
             cmd_resume(match_id(fragment))
+    elif cmd == "stop" and len(args) > 1:
+        cmd_stop(args[1])
+    elif cmd == "retry" and len(args) > 1:
+        rest = args[2:]
+        prompt_text = None
+        if rest:
+            if rest[0] != "--prompt" or len(rest) != 2:
+                sys.exit("usage: qt retry <id> [--prompt <text>|-]")
+            prompt_text = rest[1]
+            if prompt_text == "-":
+                prompt_text = sys.stdin.read()
+        cmd_retry(args[1], prompt_text)
     elif cmd == "setup":
         cmd_setup(args[1:])
     elif cmd == "doctor":
@@ -3041,7 +3188,7 @@ def main():
             launch_resume_terminal(latest_blocked())
     elif cmd == "_test-echo":
         cmd_test_echo()
-    elif cmd in ("log", "resume", "untrust", "allow"):
+    elif cmd in ("log", "resume", "untrust", "allow", "stop", "retry"):
         # without this arm a bare `qt resume` would fall through to the
         # catch-all and queue a paid task with "resume" as the prompt
         sys.exit(f"usage: qt {cmd} <{'tool' if cmd == 'allow' else 'id'}>")
