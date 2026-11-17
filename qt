@@ -1538,6 +1538,23 @@ def _notify_hub_job(hub_dir, jobdir, thread=None):
     subprocess.run(argv, capture_output=True, text=True, timeout=10, check=True)
 
 
+def _hub_bell_wired():
+    """True when the configured hub owns the bell: hub_dir set AND
+    <hub_dir>/bell.py present (the slice-2 seam, plan 1.8). Then the hub
+    rings for a qt ask itself -- its notice.py, fed the job record qt
+    already wrote, drives bell.ring -- so qt's finish/blocked/failed/
+    timeout/continuation notify() calls are skipped: one bell per ask, not
+    two. False means today's behavior, nothing changes: standalone qt (no
+    hub configured) keeps every banner, and an older hub that predates
+    bell.py still gets qt's own. Checked per call, never cached -- one
+    config read, a finish path consults it at most once -- so a hub picked
+    up mid-process is honored. The DM-fallback "DM not sent" notice is
+    deliberately NOT gated on this: it reports qt's own Slack send
+    failing, an event the hub has no record of, so it always rings."""
+    hub_dir = resolve_hub_dir()
+    return bool(hub_dir) and os.path.isfile(os.path.join(hub_dir, "bell.py"))
+
+
 def _deliver_hub_job(hub_dir, jobdir):
     """Hand a finished job to the hub's own deliver.py, which decides
     whether it auto-closes or waits in Verify -- qt never makes that call,
@@ -1680,8 +1697,12 @@ def run_task(tid, interactive=False):
             task.update(status="failed", result="claude CLI not found on PATH", finished=now())
             save(task)
             _feed_hub(task)
-            notify("Quicktask failed", task["prompt"], "claude CLI not found",
-                   kind="failed", task_id=task["id"])
+            # Hub bell check runs after _feed_hub: the job record is on disk
+            # first, so the hub's notice.py has something to ring off before
+            # qt decides to stay quiet.
+            if not _hub_bell_wired():
+                notify("Quicktask failed", task["prompt"], "claude CLI not found",
+                       kind="failed", task_id=task["id"])
             return
 
         prompt = task_prompt(task)
@@ -1715,8 +1736,9 @@ def run_task(tid, interactive=False):
                 task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
                 save(task)
                 _feed_hub(task)
-                notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}",
-                       kind="timeout", task_id=tid)
+                if not _hub_bell_wired():
+                    notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}",
+                           kind="timeout", task_id=tid)
                 return
         finally:
             if settings_path:
@@ -1752,22 +1774,27 @@ def run_task(tid, interactive=False):
         save(task)
         _feed_hub(task, rc=rc)
 
-        if status == "blocked":
-            if not interactive:
-                notify_blocked(task, denials_out)
-            return
-        if status == "question":
-            notify("Quicktask has a question ?", task["prompt"], task.get("question") or status,
-                   kind="question", task_id=tid)
-            return
-        icon = "✓" if status == "done" else "✗"
-        cost = f" · ${task['cost_usd']:.2f}" if task.get("cost_usd") else ""
-        notify(
-            f"Quicktask {icon}{cost}",
-            task["prompt"],
-            result_raw.splitlines()[0] if result_raw else status,
-            kind="done" if status == "done" else "failed", task_id=tid,
-        )
+        # One bell per ask (plan 1.8): with a hub bell wired, the hub rings
+        # for this finish itself -- notice.py, off the job record
+        # _feed_hub just wrote, feeds it to bell.ring -- so qt's own banner
+        # below would only be the second one for the same event.
+        if not _hub_bell_wired():
+            if status == "blocked":
+                if not interactive:
+                    notify_blocked(task, denials_out)
+                return
+            if status == "question":
+                notify("Quicktask has a question ?", task["prompt"], task.get("question") or status,
+                       kind="question", task_id=tid)
+                return
+            icon = "✓" if status == "done" else "✗"
+            cost = f" · ${task['cost_usd']:.2f}" if task.get("cost_usd") else ""
+            notify(
+                f"Quicktask {icon}{cost}",
+                task["prompt"],
+                result_raw.splitlines()[0] if result_raw else status,
+                kind="done" if status == "done" else "failed", task_id=tid,
+            )
     except Exception as e:
         # General safety net: whatever broke, a task must never be left at
         # "running" forever. Only stamp failed if nothing already gave it a
@@ -2072,8 +2099,11 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
         hub_task = dict(task, result="claude CLI not found", _run_kind=kind,
                         _allow_once=allow_once, _resume_session=sid)
         _feed_hub(hub_task, rc=None, thread=thread)
-        notify("Quicktask continuation failed ✗", task["prompt"], "claude CLI not found",
-               kind="failed", task_id=tid)
+        # Same ordering rule as run_task's claude-missing branch: the hub
+        # record lands before qt checks whether the hub will ring for it.
+        if not _hub_bell_wired():
+            notify("Quicktask continuation failed ✗", task["prompt"], "claude CLI not found",
+                   kind="failed", task_id=tid)
         _log_launch({
             "ts": now(), "outcome": "headless-failed", "requested_terminal": "headless",
             "branch": "headless", "id": tid, "rc": None, "elapsed": _elapsed(),
@@ -2116,8 +2146,9 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
             hub_task = dict(task, result=f"timed out after {TIMEOUT}s", _run_kind=kind,
                             _allow_once=allow_once, _resume_session=sid)
             _feed_hub(hub_task, rc=None, thread=thread)
-            notify("Quicktask continuation timed out", task["prompt"],
-                   f"after {TIMEOUT}s · qt log {tid}", kind="timeout", task_id=tid)
+            if not _hub_bell_wired():
+                notify("Quicktask continuation timed out", task["prompt"],
+                       f"after {TIMEOUT}s · qt log {tid}", kind="timeout", task_id=tid)
             _log_launch({
                 "ts": now(), "outcome": "headless-timeout", "requested_terminal": "headless",
                 "branch": "headless", "id": tid, "rc": None, "elapsed": _elapsed(),
@@ -2169,20 +2200,25 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
                     _allow_once=allow_once, _resume_session=sid)
     _feed_hub(hub_task, rc=rc, thread=thread)
 
-    if status == "blocked":
-        notify_blocked(task, denials_out)
-    elif status == "question":
-        notify("Quicktask has a question ?", task["prompt"], task.get("question") or status,
-               kind="question", task_id=tid)
-    else:
-        icon = "✓" if status == "done" else "✗"
-        cost = f" · ${cost_usd:.2f}" if cost_usd else ""
-        notify(
-            f"Quicktask continued {icon}{cost}",
-            task["prompt"],
-            result_raw.splitlines()[0] if result_raw else status,
-            kind="done" if status == "done" else "failed", task_id=tid,
-        )
+    # One bell per ask (plan 1.8), same rule as run_task's finish tail: with
+    # a hub bell wired the hub rings for this continuation too (the job
+    # record above carries kind/resume_session), so qt's own banner below
+    # would only be the second one.
+    if not _hub_bell_wired():
+        if status == "blocked":
+            notify_blocked(task, denials_out)
+        elif status == "question":
+            notify("Quicktask has a question ?", task["prompt"], task.get("question") or status,
+                   kind="question", task_id=tid)
+        else:
+            icon = "✓" if status == "done" else "✗"
+            cost = f" · ${cost_usd:.2f}" if cost_usd else ""
+            notify(
+                f"Quicktask continued {icon}{cost}",
+                task["prompt"],
+                result_raw.splitlines()[0] if result_raw else status,
+                kind="done" if status == "done" else "failed", task_id=tid,
+            )
 
     _log_launch({
         "ts": now(), "outcome": f"headless-{status}", "requested_terminal": "headless",
