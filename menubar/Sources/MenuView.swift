@@ -81,9 +81,40 @@ struct MenuView: View {
     @State private var highlighted: String?
     /// The row with its peek panel open (2026-11-03). One at a time; set by
     /// the row's eye button or by a notification banner's deep link (the
-    /// controller's revealTick onChange below).
+    /// controller's revealTick onChange below). Q3 reuses it for ask rows:
+    /// expanding an ask in place is the same one-peek-at-a-time gesture.
     @State private var expandedID: String?
     @FocusState private var fieldFocused: Bool
+
+    // MARK: Q3 -- the ask board and its in-place reading
+
+    /// The ask feed's own model, nil until the first ask poll lands. When it
+    /// speaks asks (`speaksAsks`), the list below draws ask sections instead
+    /// of the legacy task rows; when the hub predates the ask API it carries
+    /// the legacy model and the menu is exactly what it has always been.
+    ///
+    /// Held by the view rather than StatusController on purpose for slice 1:
+    /// the controller is App.swift's (Q6 moves this poll there when it owns
+    /// the notification side of asks). Loaded on appear and re-loaded on the
+    /// controller's own refreshedAt tick, so the ask list refreshes at the
+    /// same cadence as everything else while the menu is open.
+    @State private var askFeed: AskFeed?
+    @State private var askBoard: AskBoard?
+    /// Threads fetched for rows whose peek is open, keyed by ask id.
+    @State private var askThreads: [String: AskThread] = [:]
+    /// Rows whose thread fetch is in flight.
+    @State private var askLoadingThreads: Set<String> = []
+    /// The verdict line E (or a refused E) left under a row: which row, the
+    /// line to draw, and the undo token Z spends. Token nil when the hub
+    /// refused -- the line still shows its words, but Z has nothing to do.
+    @State private var askMoveLine: (id: String, line: String, token: String?)?
+    /// One ask poll at a time, the same rule as StatusController's own
+    /// pollInFlight.
+    @State private var askPollInFlight = false
+    /// The id-substring the snapshot seam asked to pre-expand (`--snapshot
+    /// <png> --expand <id>`), consumed by the first board that can satisfy
+    /// it. Held as @State because consuming it mutates view state.
+    @State private var preexpand: String?
 
     /// The quick-search query. Narrows the rows across every section; the
     /// header keeps counting the whole feed, because a search box that also
@@ -145,10 +176,13 @@ struct MenuView: View {
     @State private var filteredModel: MenuModel
     private var model: MenuModel { filteredModel }
 
-    init(controller: StatusController, onEscapeExhausted: (() -> Void)? = nil) {
+    init(controller: StatusController,
+         preexpandAsk: String? = nil,
+         onEscapeExhausted: (() -> Void)? = nil) {
         self.controller = controller
         self.onEscapeExhausted = onEscapeExhausted
         self._filteredModel = State(initialValue: controller.model.filtered(query: ""))
+        self._preexpand = State(initialValue: preexpandAsk)
     }
 
     var body: some View {
@@ -167,96 +201,7 @@ struct MenuView: View {
                              onDismiss: { controller.dismissOutcome(latest.id) })
                 Divider()
             }
-            if controller.model.records.isEmpty {
-                Text(emptyText)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-            } else if model.records.isEmpty && !model.showsSuggestions {
-                // Filtered down to nothing. Says what was searched for, since
-                // the query is one line up and easy to forget mid-type.
-                Text("Nothing matches \u{201C}\(search)\u{201D}")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        // Suggestions lead the list: they are the only rows
-                        // that are here to be decided rather than watched.
-                        if model.showsSuggestions {
-                            SuggestionSectionHeader(count: model.suggestions.count,
-                                                    collapsed: controller.suggestionsCollapsed) {
-                                controller.toggleSuggestions()
-                            }
-                            if !controller.suggestionsCollapsed {
-                                ForEach(model.suggestions, id: \.itemID) { suggestion in
-                                    SuggestionRow(
-                                        suggestion: suggestion,
-                                        busy: controller.busy.contains(suggestion.itemID),
-                                        confirming: confirmingSuggestion?.id == suggestion.itemID
-                                            ? confirmingSuggestion?.action : nil,
-                                        onTitle: { openSuggestion(suggestion) },
-                                        onAsk: { action in
-                                            confirmingSuggestion = (suggestion.itemID, action)
-                                        },
-                                        onCancelAsk: { confirmingSuggestion = nil },
-                                        onDecide: { action in
-                                            confirmingSuggestion = nil
-                                            decideSuggestion(suggestion, action: action)
-                                        })
-                                }
-                            }
-                        }
-                        ForEach(model.sections(now: controller.now), id: \.section) { entry in
-                            SectionHeader(section: entry.section,
-                                          count: entry.records.count,
-                                          collapsed: controller.isCollapsed(entry.section),
-                                          clearable: entry.records.contains { !$0.status.isActive },
-                                          onToggle: { controller.toggle(entry.section) },
-                                          onClear: { controller.clearSection(entry.section) })
-                            if !controller.isCollapsed(entry.section) {
-                                ForEach(entry.records, id: \.id) { record in
-                                    TaskRow(record: record,
-                                            now: controller.now,
-                                            fetchedAt: controller.model.refreshedAt,
-                                            busy: controller.busy.contains(record.id),
-                                            highlighted: highlighted == record.id,
-                                            expanded: expandedID == record.id,
-                                            onResume: { resume(record) },
-                                            onReport: { openReport(record) },
-                                            onTitle: { openItem(record) },
-                                            onRun: { run(record) },
-                                            onRevive: { revive(record) },
-                                            onDecide: { action, comment in
-                                                decide(record, action: action, comment: comment)
-                                            },
-                                            onToggleExpand: {
-                                                expandedID = expandedID == record.id ? nil : record.id
-                                            },
-                                            onOpenResult: { openResult(record) },
-                                            onCopyResult: { copyResult(record) })
-                                }
-                            }
-                        }
-                    }
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(key: ListHeightKey.self,
-                                                   value: geo.size.height)
-                        }
-                    )
-                }
-                // An explicit height, not a cap: see `listHeight`. Scrolls
-                // once the content passes listMaxHeight, so a long history
-                // cannot grow the menu off the bottom of the screen.
-                .frame(height: renderedListHeight)
-                .onPreferenceChange(ListHeightKey.self) { measured in
-                    if abs(measured - listHeight) > 0.5 { listHeight = measured }
-                }
-            }
+            rowList
             if let warning = controller.model.warning {
                 Divider()
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
@@ -273,29 +218,12 @@ struct MenuView: View {
         // window has no menu bar of its own to hang them off, and onKeyPress
         // does not see a command-modified key that the menu system claims
         // first, so the shortcut has to belong to a real (if invisible) button.
-        .background {
-            VStack(spacing: 0) {
-                Button("", action: toggleSearch)
-                    .keyboardShortcut("f", modifiers: .command)
-                Button("", action: { controller.showSettings() })
-                    .keyboardShortcut(",", modifiers: .command)
-                // Mode-select and one-shot-fire, all command-modified: same
-                // reason as \u{2318}F/\u{2318}, above, a hidden button rather than
-                // onKeyPress. Each checks fieldFocused itself so the shortcut
-                // only fires while quick-fire's own field owns the keystroke.
-                Button("", action: { selectMode(toPass: false) })
-                    .keyboardShortcut("1", modifiers: .command)
-                Button("", action: { selectMode(toPass: true) })
-                    .keyboardShortcut("2", modifiers: .command)
-                Button("", action: fireOtherMode)
-                    .keyboardShortcut(.return, modifiers: .command)
-            }
-            .opacity(0)
-            .frame(width: 0, height: 0)
-            .accessibilityHidden(true)
-        }
+        .background { shortcutButtons }
         .onAppear {
             controller.refresh()
+            // The ask feed loads alongside the controller's own poll: the
+            // menu opens showing whichever answer the bell was about.
+            refreshAsks()
             // The panel needs to be key before the TextField will take
             // keystrokes, and opening a MenuBarExtra window does not
             // activate the app on its own -- see `focusQuickFireField`.
@@ -356,11 +284,24 @@ struct MenuView: View {
         // Only once the arrows have taken focus off the quick-fire field: while
         // that field has focus it owns every character, which is what keeps
         // "type, press return, task fired" working.
+        //
+        // E and Z are verbs before they are search starters (Q3): E files the
+        // highlighted ask done, Z spends the undo token a move left behind.
+        // Handled here rather than in their own onKeyPress modifiers so there
+        // is exactly one place a bare letter is interpreted -- the place that
+        // already knows whether a field owns the keystroke and whether the
+        // modifiers are bare.
         .onKeyPress(phases: .down) { press in
             guard !fieldFocused, !searchFocused, !searching else { return .ignored }
             guard press.modifiers.isEmpty || press.modifiers == .shift else { return .ignored }
             guard let c = press.characters.first, c.isLetter || c.isNumber else {
                 return .ignored
+            }
+            if press.characters.lowercased() == "e", eActsOnAsk {
+                return pressE()
+            }
+            if press.characters.lowercased() == "z", zActsOnAsk {
+                return pressZ()
             }
             search = String(press.characters)
             searching = true
@@ -371,6 +312,9 @@ struct MenuView: View {
             // The controller polled a fresh model: re-narrow it to whatever
             // is currently typed, once, here -- not on every read below.
             filteredModel = controller.model.filtered(query: search)
+            // The ask feed rides the controller's own poll cadence: a fresh
+            // legacy model means a tick went by, so the asks refresh too.
+            refreshAsks()
             // A highlight whose row has left the feed is dropped rather than
             // moved: the row under the cursor changing identity between polls
             // is how you act on the wrong thing.
@@ -390,9 +334,16 @@ struct MenuView: View {
     /// out, so it is the same list the eye is walking. Reads the same
     /// (possibly search-narrowed) `model` the rows are drawn from -- with a
     /// query typed, the drawn rows and the walked rows have to be the same
-    /// list, or the arrows land on a row nobody can see.
+    /// list, or the arrows land on a row nobody can see. Ask rows walk the
+    /// same way when the feed speaks asks (Q3): the same narrowed list the
+    /// ask sections are drawing.
     private var visibleIDs: [String] {
-        model
+        if asksLive, let board = askBoard {
+            return board.sections
+                .map { AskFilter.apply($0.rows, query: search) }
+                .flatMap { $0.map(\.id) }
+        }
+        return model
             .visibleRecords(collapsed: controller.collapsed, now: controller.now)
             .map { $0.id }
     }
@@ -412,6 +363,14 @@ struct MenuView: View {
     }
 
     private func triggerHighlighted() -> KeyPress.Result {
+        // An ask row's one action is opening the ask's own address (Q3):
+        // always enabled, never dimmed. Return falls through to the legacy
+        // record path only when the feed is not speaking asks.
+        if asksLive, let board = askBoard,
+           let id = highlighted, let row = board.row(id: id) {
+            openAsk(row)
+            return .handled
+        }
         guard let id = highlighted,
               let record = model.records.first(where: { $0.id == id }) else {
             return .ignored
@@ -450,11 +409,18 @@ struct MenuView: View {
     private func submitSearch() {
         guard highlighted == nil else { return }
         let ids = visibleIDs
-        if ids.count == 1, let id = ids.first,
-           let record = model.records.first(where: { $0.id == id }) {
-            switch record.primaryAction {
-            case .resume: resume(record)
-            case .item: openItem(record)
+        if ids.count == 1, let id = ids.first {
+            // One match, whichever feed is live: act on it, since one match
+            // is unambiguous enough not to need the extra keystroke.
+            if asksLive, let board = askBoard, let row = board.row(id: id) {
+                openAsk(row)
+                return
+            }
+            if let record = model.records.first(where: { $0.id == id }) {
+                switch record.primaryAction {
+                case .resume: resume(record)
+                case .item: openItem(record)
+                }
             }
         } else if let first = ids.first {
             highlighted = first
@@ -526,6 +492,116 @@ struct MenuView: View {
     private var emptyText: String {
         controller.model.source == .pass ? "Nothing on the Pass and no task runs yet"
                                          : "No task runs yet"
+    }
+
+    /// The row list, whichever feed is live. Extracted from `body` because
+    /// the three-way branch (asks / empty / legacy) plus everything each arm
+    /// carries sat, as one expression, past the compiler's type-check
+    /// budget -- the same treatment `feedFacts` got in DumpModel (2026-10-29).
+    @ViewBuilder private var rowList: some View {
+        if let board = askBoard, board.speaksAsks {
+            // Q3: the feed speaks asks -- the list is ask sections. The
+            // legacy branches below stay exactly as they were for the hubs
+            // and fallbacks that do not.
+            askList(board)
+        } else if controller.model.records.isEmpty {
+            Text(emptyText)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+        } else if model.records.isEmpty && !model.showsSuggestions {
+            // Filtered down to nothing. Says what was searched for, since
+            // the query is one line up and easy to forget mid-type.
+            Text("Nothing matches \u{201C}\(search)\u{201D}")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+        } else {
+            legacyList
+        }
+    }
+
+    /// The legacy task-row list, verbatim what the menu has always drawn:
+    /// suggestions, then sections with collapsible headers and TaskRows.
+    /// Kept whole and separate so the ask branch above cannot cost it its
+    /// type-check budget, and vice versa.
+    private var legacyList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                // Suggestions lead the list: they are the only rows
+                // that are here to be decided rather than watched.
+                if model.showsSuggestions {
+                    SuggestionSectionHeader(count: model.suggestions.count,
+                                            collapsed: controller.suggestionsCollapsed) {
+                        controller.toggleSuggestions()
+                    }
+                    if !controller.suggestionsCollapsed {
+                        ForEach(model.suggestions, id: \.itemID) { suggestion in
+                            SuggestionRow(
+                                suggestion: suggestion,
+                                busy: controller.busy.contains(suggestion.itemID),
+                                confirming: confirmingSuggestion?.id == suggestion.itemID
+                                    ? confirmingSuggestion?.action : nil,
+                                onTitle: { openSuggestion(suggestion) },
+                                onAsk: { action in
+                                    confirmingSuggestion = (suggestion.itemID, action)
+                                },
+                                onCancelAsk: { confirmingSuggestion = nil },
+                                onDecide: { action in
+                                    confirmingSuggestion = nil
+                                    decideSuggestion(suggestion, action: action)
+                                })
+                        }
+                    }
+                }
+                ForEach(model.sections(now: controller.now), id: \.section) { entry in
+                    SectionHeader(section: entry.section,
+                                  count: entry.records.count,
+                                  collapsed: controller.isCollapsed(entry.section),
+                                  clearable: entry.records.contains { !$0.status.isActive },
+                                  onToggle: { controller.toggle(entry.section) },
+                                  onClear: { controller.clearSection(entry.section) })
+                    if !controller.isCollapsed(entry.section) {
+                        ForEach(entry.records, id: \.id) { record in
+                            TaskRow(record: record,
+                                    now: controller.now,
+                                    fetchedAt: controller.model.refreshedAt,
+                                    busy: controller.busy.contains(record.id),
+                                    highlighted: highlighted == record.id,
+                                    expanded: expandedID == record.id,
+                                    onResume: { resume(record) },
+                                    onReport: { openReport(record) },
+                                    onTitle: { openItem(record) },
+                                    onRun: { run(record) },
+                                    onRevive: { revive(record) },
+                                    onDecide: { action, comment in
+                                        decide(record, action: action, comment: comment)
+                                    },
+                                    onToggleExpand: {
+                                        expandedID = expandedID == record.id ? nil : record.id
+                                    },
+                                    onOpenResult: { openResult(record) },
+                                    onCopyResult: { copyResult(record) })
+                        }
+                    }
+                }
+            }
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(key: ListHeightKey.self,
+                                           value: geo.size.height)
+                }
+            )
+        }
+        // An explicit height, not a cap: see `listHeight`. Scrolls
+        // once the content passes listMaxHeight, so a long history
+        // cannot grow the menu off the bottom of the screen.
+        .frame(height: renderedListHeight)
+        .onPreferenceChange(ListHeightKey.self) { measured in
+            if abs(measured - listHeight) > 0.5 { listHeight = measured }
+        }
     }
 
     // MARK: - sections
@@ -609,8 +685,10 @@ struct MenuView: View {
                 .onSubmit(submitSearch)
             if !search.isEmpty {
                 // The count is the useful thing here rather than in the header:
-                // it says how much of the list the query is hiding.
-                Text("\(model.records.count + model.suggestions.count)")
+                // it says how much of the list the query is hiding. Ask rows
+                // count the same way: every row the query kept, sections and
+                // all.
+                Text("\(matchedRowCount)")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -630,9 +708,9 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
                 Circle()
-                    .fill(Color(StatusPalette.color(for: controller.model.aggregate)))
+                    .fill(headerDot)
                     .frame(width: 8, height: 8)
-                Text(controller.model.headlineText)
+                Text(headerHeadline)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
                 Spacer(minLength: 6)
@@ -644,7 +722,7 @@ struct MenuView: View {
             // and they are the reason the widget is a list rather than a badge
             // -- so the count carries two or three of them even when the rows
             // themselves are collapsed or scrolled out of sight.
-            if let preview = headlinePreview {
+            if let preview = headerPreviewText {
                 Text(preview)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -655,6 +733,78 @@ struct MenuView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .help(groupsTooltip)
+    }
+
+    /// The zero-sized buttons that carry the command shortcuts: a
+    /// MenuBarExtra window has no menu bar of its own to hang them off, and
+    /// onKeyPress does not see a command-modified key the menu system claims
+    /// first, so the shortcut has to belong to a real (if invisible) button.
+    /// Its own property so `body`'s modifier chain stays inside the
+    /// type-checker's budget.
+    private var shortcutButtons: some View {
+        VStack(spacing: 0) {
+            Button("", action: toggleSearch)
+                .keyboardShortcut("f", modifiers: .command)
+            Button("", action: { controller.showSettings() })
+                .keyboardShortcut(",", modifiers: .command)
+            // Mode-select and one-shot-fire, all command-modified: same
+            // reason as ⌘F/⌘, above, a hidden button rather than onKeyPress.
+            // Each checks fieldFocused itself so the shortcut only fires
+            // while quick-fire's own field owns the keystroke.
+            Button("", action: { selectMode(toPass: false) })
+                .keyboardShortcut("1", modifiers: .command)
+            Button("", action: { selectMode(toPass: true) })
+                .keyboardShortcut("2", modifiers: .command)
+            Button("", action: fireOtherMode)
+                .keyboardShortcut(.return, modifiers: .command)
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .accessibilityHidden(true)
+    }
+
+    /// The ask board's own header facts, nil whenever the feed is not
+    /// speaking asks -- one read so the header, the footer, and the list all
+    /// agree on which menu is up.
+    private var liveAskBoard: AskBoard? {
+        guard let board = askBoard, board.speaksAsks else { return nil }
+        return board
+    }
+
+    /// Whether the menu is currently drawing ask rows (Q3) rather than the
+    /// legacy task sections.
+    private var asksLive: Bool { liveAskBoard != nil }
+
+    /// The search field's count: how many rows the query kept, whichever feed
+    /// is live. Sections and suggestions included, since the question is "how
+    /// much is hidden", not "how much is visible".
+    private var matchedRowCount: Int {
+        if let board = liveAskBoard {
+            return AskFilter.apply(board.rows, query: search).count
+        }
+        return model.records.count + model.suggestions.count
+    }
+
+    private var headerDot: Color {
+        if let board = liveAskBoard {
+            if board.badge > 0 { return .orange }
+            if board.counts.working > 0 { return .green }
+            return .secondary.opacity(0.5)
+        }
+        return Color(StatusPalette.color(for: controller.model.aggregate))
+    }
+
+    private var headerHeadline: String {
+        if let board = liveAskBoard { return board.headline }
+        return controller.model.headlineText
+    }
+
+    private var headerPreviewText: String? {
+        if let board = liveAskBoard {
+            let titles = board.headlinePreview()
+            return titles.isEmpty ? nil : titles.joined(separator: " \u{00B7} ")
+        }
+        return headlinePreview
     }
 
     /// The titles under the count, or nil when they would say nothing new.
@@ -697,6 +847,16 @@ struct MenuView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // Q3's footer stub, on the ask menu only: the plan's fixed words
+            // for the two things slice 5 wires (⌘F find across every ask,
+            // ⌘D the desk). Saying them now, unbound, keeps the shape of the
+            // footer honest while the verbs are still Q11's to land.
+            if liveAskBoard != nil {
+                Text(AskFooter.stub)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .help("Find across every ask and the desk land with slice 5.")
+            }
             // The Pass caps jobs[] at 200. Said out loud, because a widget
             // quietly showing a slice of the history is the kind of thing you
             // only notice when it matters.
@@ -824,6 +984,11 @@ struct MenuView: View {
     private func resetKeyboardState() {
         highlighted = KeyboardNav.summonReset()
         confirmingSuggestion = nil
+        // A move line from an earlier visit is not carried into the next
+        // one: the dropdown tears down on close anyway (state lost with it),
+        // so the cached summon panel starting equally clean is the same
+        // rule, not a second one.
+        askMoveLine = nil
     }
 
     private func send() {
@@ -1097,6 +1262,228 @@ struct MenuView: View {
                 controller.post(kind: .ok, title: message)
             case .failure(let problem):
                 controller.post(kind: .error, title: "Couldn't save the decision", detail: problem.message)
+            }
+        }
+    }
+
+    // MARK: - asks (Q3)
+
+    /// The ask poll. Rides the controller's own tick (see onChange of
+    /// refreshedAt) plus .onAppear, runs off the main thread, one at a time.
+    /// `previous` carries the last rev so an unchanged hub answers with a
+    /// two-field body instead of the whole list.
+    private func refreshAsks() {
+        guard !askPollInFlight else { return }
+        askPollInFlight = true
+        let previous = askFeed
+        DispatchQueue.global(qos: .utility).async {
+            let config = StoreConfig.resolve()
+            let feed = Feed.loadAsks(config: config, previous: previous)
+            DispatchQueue.main.async {
+                askPollInFlight = false
+                askFeed = feed
+                askBoard = AskBoard.build(feed: feed)
+                consumePreexpand()
+            }
+        }
+    }
+
+    /// Spends the snapshot seam's `--expand <id-substring>` on the first
+    /// board that can satisfy it: highlight the row and open its peek, so a
+    /// snapshot can show the answer in place without a click.
+    private func consumePreexpand() {
+        guard let needle = preexpand,
+              let board = askBoard,
+              let row = board.row(matching: needle) else { return }
+        preexpand = nil
+        highlighted = row.id
+        expandedID = row.id
+        expand(row)
+    }
+
+    /// The eye button on an ask row: one peek at a time, same gesture (and
+    /// the same `expandedID`) the legacy rows' peek panel uses.
+    private func toggleExpand(_ row: AskRowModel) {
+        if expandedID == row.id {
+            expandedID = nil
+        } else {
+            expandedID = row.id
+            expand(row)
+        }
+    }
+
+    /// Expanding a row reads the answer where it is: the thread off the hub
+    /// (cached per id + updated_at by AskClient), shown in place. A row
+    /// still unseen posts `seen` once its answer is actually on screen --
+    /// that is the move that stops it counting toward the badge, and doing
+    /// it before the text landed would clear the dot on a row that was never
+    /// read.
+    private func expand(_ row: AskRowModel) {
+        let plan = AskExpand.plan(ask: row.ask, source: askFeed?.source ?? .files)
+        guard plan.fetchThread, let base = askClientBase(),
+              askThreads[row.id] == nil,
+              !askLoadingThreads.contains(row.id) else { return }
+        askLoadingThreads.insert(row.id)
+        AskClient(base: base).threadAsync(id: row.id, updatedAt: row.ask.updatedAt) { result in
+            askLoadingThreads.remove(row.id)
+            switch result {
+            case .success(let thread):
+                askThreads[row.id] = thread
+                if plan.postSeen { postSeen(row) }
+            case .failure:
+                // The peek falls back to the row's excerpt; `seen` is not
+                // posted, so the unseen dot and the badge both stay honest.
+                break
+            }
+        }
+    }
+
+    private func postSeen(_ row: AskRowModel) {
+        guard let base = askClientBase() else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = AskClient(base: base).post(id: row.id, move: "seen")
+        }
+    }
+
+    /// ⏎ and the title click: the ask's one address, always. Never gated,
+    /// never dimmed -- reading a thread is the one thing every ask allows.
+    private func openAsk(_ row: AskRowModel) {
+        guard let url = row.openURL else {
+            controller.post(kind: .error, title: "This ask has no address",
+                            detail: "The hub is down; the row shows what the ledger knows.")
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// E on a row: files it done through the real move route. The verdict
+    /// lands under the row as a line -- with "Z to undo" while the hub's
+    /// token holds -- rather than as a banner, because undo is about the
+    /// row, and the row is what the eye is on.
+    private func doneAsk(_ row: AskRowModel) {
+        guard let base = askClientBase() else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = AskClient(base: base).post(id: row.id, move: "done")
+            DispatchQueue.main.async {
+                landMoveLine(row: row, result: result)
+            }
+        }
+    }
+
+    /// Z: spends the undo token the last move left. Any row's token, not
+    /// only the highlighted one's -- undoing is about the write, and the
+    /// write named its row in the line.
+    private func undoAsk() {
+        guard let pending = askMoveLine, let token = pending.token, !token.isEmpty,
+              let base = askClientBase() else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = AskClient(base: base).post(id: pending.id, move: "undo",
+                                                    body: ["token": token])
+            DispatchQueue.main.async {
+                if result.ok {
+                    askMoveLine = nil
+                    refreshAsks()
+                } else {
+                    askMoveLine = (pending.id, AskMoveLine.failure(result), nil)
+                }
+            }
+        }
+    }
+
+    /// Whether the E key currently has ask work to do: asks are live, a row
+    /// is highlighted, and the hub's own moves list offers `done` for it.
+    private var eActsOnAsk: Bool {
+        guard let board = liveAskBoard, let id = highlighted,
+              let row = board.row(id: id) else { return false }
+        return row.canDone
+    }
+
+    /// Whether the Z key currently has a token to spend.
+    private var zActsOnAsk: Bool {
+        guard let token = askMoveLine?.token else { return false }
+        return !token.isEmpty
+    }
+
+    private func pressE() -> KeyPress.Result {
+        guard !fieldFocused, !searchFocused, eActsOnAsk else { return .ignored }
+        if let board = liveAskBoard, let id = highlighted, let row = board.row(id: id) {
+            doneAsk(row)
+            return .handled
+        }
+        return .ignored
+    }
+
+    private func pressZ() -> KeyPress.Result {
+        guard !fieldFocused, !searchFocused, zActsOnAsk else { return .ignored }
+        undoAsk()
+        return .handled
+    }
+
+    /// Lands a move's verdict under the row: the undo line when the hub
+    /// handed back a token, its own words when it refused. A refusal also
+    /// posts to the outcome queue -- the panel can close mid-read, and a
+    /// refused write is the one thing worth following the user out of the
+    /// menu.
+    private func landMoveLine(row: AskRowModel, result: MoveResult) {
+        let line = AskMoveLine.done(result)
+        askMoveLine = (row.id, line, result.undo?.token)
+        if result.ok {
+            refreshAsks()
+        } else {
+            controller.post(kind: .error, title: line)
+        }
+    }
+
+    /// Where ask reads and writes go: the URL the ask feed itself was read
+    /// from, so the two can never point at different hubs.
+    private func askClientBase() -> URL? {
+        let raw = askFeed?.passURL ?? controller.config.passURL?.absoluteString
+        return raw.flatMap(URL.init(string:))
+    }
+
+    // MARK: - ask list (Q3)
+
+    /// The ask menu's row list: the plan's sections in order -- New for you
+    /// (unseen answers), Needs you, Working -- inside the same measured,
+    /// capped scroll the legacy list uses.
+    private func askList(_ board: AskBoard) -> some View {
+        Group {
+            if board.sections.isEmpty || visibleIDs.isEmpty {
+                Text(search.isEmpty ? "No asks yet"
+                                    : "Nothing matches \u{201C}\(search)\u{201D}")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(board.sections, id: \.section) { entry in
+                            AskSectionHeader(section: entry.section, count: entry.rows.count)
+                            ForEach(AskFilter.apply(entry.rows, query: search)) { row in
+                                AskRowView(
+                                    row: row,
+                                    highlighted: highlighted == row.id,
+                                    expanded: expandedID == row.id,
+                                    loading: askLoadingThreads.contains(row.id),
+                                    thread: askThreads[row.id],
+                                    moveLine: askMoveLine?.id == row.id ? askMoveLine?.line : nil,
+                                    onTitle: { openAsk(row) },
+                                    onToggleExpand: { toggleExpand(row) })
+                            }
+                        }
+                    }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(key: ListHeightKey.self,
+                                                   value: geo.size.height)
+                        }
+                    )
+                }
+                .frame(height: renderedListHeight)
+                .onPreferenceChange(ListHeightKey.self) { measured in
+                    if abs(measured - listHeight) > 0.5 { listHeight = measured }
+                }
             }
         }
     }
@@ -1666,6 +2053,190 @@ struct TaskRow: View {
                                       : "no session to resume")
         if record.canRun { parts.append("click play to fire its prompt as a job") }
         parts.append("click the title to open it in the Pass")
+        return parts.joined(separator: "\n")
+    }
+}
+
+// MARK: - one ask row (Q3)
+
+/// An ask section's header. Not a toggle: slice 1 has no collapsed ask
+/// sections, because the three sections are short by construction (the hub's
+/// default list excludes done, and unseen answers leave "New for you" the
+/// moment they are expanded). A quiet label and a count, like the reference's.
+struct AskSectionHeader: View {
+    let section: AskSection
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if section == .newForYou {
+                Image(systemName: "sparkle")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            Text(section.label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text("\(count)")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(section == .newForYou
+              ? "Answers you have not read yet. Expanding one clears it from the count."
+              : "Open the Pass for the full history.")
+    }
+}
+
+/// One ask row: the title opens the ask's own address (always -- that is the
+/// row's one guaranteed action), the eye expands the answer in place, and
+/// working rows carry their age and live line. The keyboard highlight and
+/// the peek panel are the same affordances the legacy TaskRow has, so the
+/// two menus still feel like one widget.
+struct AskRowView: View {
+    let row: AskRowModel
+    var highlighted: Bool = false
+    var expanded: Bool = false
+    var loading: Bool = false
+    var thread: AskThread?
+    /// The verdict line a move left under this row (E's undo line, or the
+    /// hub's refusal), nil when there is none to draw.
+    var moveLine: String?
+    let onTitle: () -> Void
+    let onToggleExpand: () -> Void
+
+    /// The peek's answer area: tall enough to read a real answer, short
+    /// enough that a long one scrolls inside the row instead of growing the
+    /// menu off the screen -- "clipped scroll, max height".
+    static let expandMaxHeight: CGFloat = 170
+
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 7, height: 7)
+                Button(action: onTitle) {
+                    Text(row.title)
+                        .font(.system(size: 12, weight: row.ask.unseen ? .semibold : .regular))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 8)
+                Text(rightDetail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
+                RowButton(icon: expanded ? "chevron.up" : "eye",
+                          help: expanded ? "Hide the answer" : "Read the answer here",
+                          action: onToggleExpand)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(highlighted ? Color.accentColor.opacity(0.18)
+                                    : (hovering ? Color.primary.opacity(0.06) : .clear))
+            .onHover { hovering = $0 }
+            .help(helpText)
+
+            if let now = row.nowLine {
+                Text(now)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 27)
+                    .padding(.bottom, 3)
+            }
+            if let line = moveLine {
+                Text(line)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 27)
+                    .padding(.bottom, 3)
+            }
+            if expanded {
+                peek
+            }
+        }
+    }
+
+    /// The state word, the age, or both: what the right-hand column says so
+    /// the title can stay a title.
+    private var rightDetail: String {
+        if let a = row.ageText { return "\(row.detail) \u{00B7} \(a)" }
+        return row.detail
+    }
+
+    /// No colour claim about a state this build cannot read (unknown draws
+    /// gray, like the dot); the named states keep the palette the legacy
+    /// rows trained.
+    private var dotColor: Color {
+        switch row.ask.state {
+        case .question, .blocked, .failed: return .orange
+        case .answer: return row.ask.unseen ? .accentColor : .secondary.opacity(0.6)
+        case .working: return .green
+        case .wantsOk: return .blue
+        default: return .secondary.opacity(0.6)
+        }
+    }
+
+    /// The peek panel: the thread's answer once the fetch lands, the row's
+    /// excerpt when the hub cannot be reached, or an honest nothing with the
+    /// way out named.
+    private var peek: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if loading {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.6)
+                    Text("Reading the answer\u{2026}")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                ScrollView {
+                    Text(answerText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 2)
+                }
+                // A fixed height, not a cap: see MenuView.listHeight for why
+                // a maxHeight alone leaves a ScrollView with no floor.
+                .frame(height: Self.expandMaxHeight)
+            }
+            Text("\u{23CE} opens the thread" + (row.canDone ? " \u{00B7} E files it done" : ""))
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.leading, 27)
+        .padding(.trailing, 12)
+        .padding(.bottom, 7)
+    }
+
+    private var answerText: String {
+        if let thread, !thread.answerText.isEmpty { return thread.answerText }
+        if let excerpt = row.ask.answerExcerpt, !excerpt.isEmpty { return excerpt }
+        return "No answer text on this row \u{2014} \u{23CE} opens the thread."
+    }
+
+    private var helpText: String {
+        var parts = [row.title, "id: \(row.id)"]
+        if let door = row.ask.door { parts.append("came in by: \(door)") }
+        parts.append("state: \(row.ask.state.raw)")
+        if let age = row.ageText { parts.append("\(age) old") }
+        if let reason = row.ask.reason { parts.append(String(reason.prefix(200))) }
+        if let question = row.ask.question { parts.append(question) }
+        if let url = row.ask.url { parts.append(url) }
+        parts.append("click the title (or \u{23CE}) to open the thread")
         return parts.joined(separator: "\n")
     }
 }
