@@ -981,6 +981,14 @@ def task_path(tid):
     return os.path.join(TASKS_DIR, tid + ".json")
 
 
+def events_path_for(tid):
+    """$QT_DATA/logs/<tid>.events.jsonl -- where a run's stream-json events
+    land (slice 4, plan 1.7). One path per task: each run truncates it, so
+    the file always holds the current (or most recent) run's events, which
+    is what the hub's live "now line" reads while the ask is working."""
+    return os.path.join(LOGS_DIR, tid + ".events.jsonl")
+
+
 def load(tid):
     with open(task_path(tid)) as f:
         return json.load(f)
@@ -1633,11 +1641,101 @@ def _append_log(log_path, text):
         pass
 
 
+def _read_events(events_path):
+    """Best-effort read of a run's events file -- whatever has landed there
+    so far, which for a timed-out run is exactly the partial stream claude
+    flushed before it was killed."""
+    try:
+        with open(events_path, errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _kill_run_group_mates():
+    """After a timed-out run, SIGKILL everything else in this process's
+    process group. claude itself is already dead (subprocess.run killed it
+    the moment the timeout fired), but anything claude spawned -- shells,
+    MCP servers, whatever -- is still alive in here and must not outlive
+    the run.
+
+    A literal os.killpg on the group would take this process down with it:
+    claude shares the runner's group on purpose, because `qt stop` kills a
+    run by signalling the runner's whole group (Q7), and a runner that put
+    claude in a group of its own would let claude survive `qt stop`. So the
+    group mates are enumerated with ps and killed individually -- the
+    killpg semantics (the whole claude tree goes down) without signaling
+    ourselves.
+
+    Only fires when this process leads its own group: the detached `_run`
+    (spawned with start_new_session, so its pid is its pgid) or a
+    setsid'd headless resume. A foreground `qt -w` / plain
+    `qt resume <id> --prompt` shares the terminal's group with the user's
+    shell, which must never be signaled; there the already-killed claude
+    is the best that can be done safely (and matches the pre-slice-4
+    behavior). Best-effort throughout: an unavailable or unreadable ps
+    means the orphans stay for the user to see, never a broken task."""
+    try:
+        if os.getpgid(0) != os.getpid():
+            return
+        listing = subprocess.run(
+            ["ps", "-ax", "-o", "pid=", "-o", "pgid="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    pgid = os.getpid()
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, group = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if group == pgid and pid != pgid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def _stream_result_event(stdout):
+    """The last {"type":"result",...} event in a stream-json run's output,
+    or None when there is none (a plain --output-format json object, the
+    partial stream of a killed run, or anything else). The stream-json
+    result event carries the same field names as the plain json object
+    (result, session_id, is_error, total_cost_usd, permission_denials), so
+    _parse_claude_run's one mapping serves both formats; a field some
+    future Claude Code version renames simply reads as absent through the
+    defensive .get() chain rather than breaking the parse (the plan's
+    stream-shape-drift risk)."""
+    event = None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            event = obj  # keep the last one: the final result ends the run
+    return event
+
+
 def _parse_claude_run(stdout, stderr, rc, questions=None):
-    """Parse a claude --output-format json run's stdout into the
-    status/result mapping shared by run_task() and headless resume's
-    post-run bookkeeping (qt resume <id> --prompt): (status, result_raw,
-    result_text, session_id, cost_usd, denials_out).
+    """Parse a claude run's stdout into the status/result mapping shared by
+    run_task() and headless resume's post-run bookkeeping (qt resume <id>
+    --prompt): (status, result_raw, result_text, session_id, cost_usd,
+    denials_out).
+
+    Two formats, both accepted (slice 4, plan 1.7): a stream-json run
+    (stdout is a series of JSON event lines ending in a
+    {"type":"result",...} event -- see _stream_result_event), and the
+    plain --output-format json object (one JSON object on stdout, kept as
+    the fallback for claude versions and stubs that emit it instead; the
+    scan takes the last JSON-looking line, exactly as before slice 4).
 
     result_raw is the claude result text alone (stripped, possibly empty).
     result_text is what gets persisted as the task's result: result_raw,
@@ -1648,15 +1746,19 @@ def _parse_claude_run(stdout, stderr, rc, questions=None):
     An otherwise-ok run whose result ends in an `ASK: <question>` line maps
     to status "question" (callers read the text with _question_from_result);
     `questions` None defers to questions_enabled()."""
-    data = {}
-    for line in reversed(stdout.strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                data = json.loads(line)
-                break
-            except json.JSONDecodeError:
-                continue
+    event = _stream_result_event(stdout)
+    if event is not None:
+        data = event
+    else:
+        data = {}
+        for line in reversed(stdout.strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    data = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
 
     result_raw = (data.get("result") or "").strip()
     denials = data.get("permission_denials") or []
@@ -1689,6 +1791,9 @@ def run_task(tid, interactive=False):
     # its own session, so the pid is also the process-group id and the group
     # takes claude and everything claude spawned down with it.
     task["pid"] = os.getpid()
+    # Slice 4 (plan 1.7): the run's stream-json events file, recorded on
+    # the task so the hub can read the live line while the ask is working.
+    task["events_path"] = events_path_for(tid)
     save(task)
 
     try:
@@ -1708,7 +1813,7 @@ def run_task(tid, interactive=False):
         prompt = task_prompt(task)
         cmd = [
             claude, "-p", prompt,
-            "--output-format", "json",
+            "--output-format", "stream-json", "--verbose",
             "--permission-mode", task.get("perm_mode") or resolve_permissions(),
         ]
         if task.get("model"):
@@ -1724,23 +1829,46 @@ def run_task(tid, interactive=False):
 
         log_path = os.path.join(LOGS_DIR, tid + ".log")
         run_cwd = task.get("run_cwd", WORKSPACE)
+        # Slice 4: claude's stdout IS the events file. Redirecting the
+        # stream there (rather than capturing a pipe and copying lines)
+        # means each event line is on disk the moment claude writes it, so
+        # the hub's live "now line" can read the file mid-run; the final
+        # {"type":"result",...} event is parsed back out of it below. The
+        # invocation still goes through subprocess.run so the timeout and
+        # the claude-not-found / exception resilience of the pre-stream
+        # code paths are untouched. A stubbed subprocess.run (the
+        # resilience tests) returns a captured stdout string; that is
+        # honored as-is so the same code serves both.
+        events_path = task["events_path"]
+        # (LOGS_DIR is not guaranteed here -- `qt _run` never bootstraps --
+        # and _append_log's lazy recreate comes too late for this open.)
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        events_fh = open(events_path, "w")
         try:
             try:
                 proc = subprocess.run(
-                    cmd, cwd=run_cwd, capture_output=True, text=True, timeout=TIMEOUT
+                    cmd, cwd=run_cwd, stdout=events_fh,
+                    stderr=subprocess.PIPE, text=True, timeout=TIMEOUT,
                 )
-                stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
-            except subprocess.TimeoutExpired as e:
-                stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-                _append_log(log_path, stdout + f"\n--- timed out after {TIMEOUT}s ---\n")
+                stdout = (proc.stdout if isinstance(proc.stdout, str)
+                          else _read_events(events_path))
+                stderr, rc = proc.stderr, proc.returncode
+            except subprocess.TimeoutExpired:
+                partial = _read_events(events_path)
+                _append_log(log_path, partial + f"\n--- timed out after {TIMEOUT}s ---\n")
                 task.update(status="timeout", result=f"timed out after {TIMEOUT}s", finished=now())
                 save(task)
                 _feed_hub(task)
                 if not _hub_bell_wired():
                     notify("Quicktask timed out", task["prompt"], f"after {TIMEOUT}s · qt log {tid}",
                            kind="timeout", task_id=tid)
+                # claude is dead (subprocess.run killed it on timeout);
+                # anything it spawned is still in this process's group.
+                # Take the tree down -- see _kill_run_group_mates().
+                _kill_run_group_mates()
                 return
         finally:
+            events_fh.close()
             if settings_path:
                 try:
                     os.remove(settings_path)
@@ -2077,6 +2205,8 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
     task["status"] = "running"
     task["pid"] = os.getpid()
     task["question"] = None
+    # Slice 4 (plan 1.7): this run's events file, same as a first run.
+    task["events_path"] = events_path_for(tid)
     save(task)
     allow_once = [t for t in (allow_once or ()) if t]
     extra = {}
@@ -2112,7 +2242,7 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
 
     cmd = [
         claude, "-p", prompt_text,
-        "--output-format", "json",
+        "--output-format", "stream-json", "--verbose",
         "--permission-mode", task.get("perm_mode") or resolve_permissions(),
         "--resume", sid,
     ]
@@ -2124,15 +2254,29 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
 
     log_path = os.path.join(LOGS_DIR, tid + ".log")
     run_cwd = task.get("run_cwd", WORKSPACE)
+    # Slice 4: same streaming shape as run_task() -- the continuation's
+    # stream-json events go straight into the task's events file (truncated
+    # per run, so it always reflects the current run), and the invocation
+    # still goes through subprocess.run so the timeout/resilience paths are
+    # untouched. A stubbed subprocess.run (tests) returning a captured
+    # stdout string is honored as-is.
+    events_path = task["events_path"]
+    # (bootstrap() ran above, but a vanished-logs-dir mid-run is a thing
+    # _append_log already tolerates; make the open equally forgiving.)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    events_fh = open(events_path, "w")
     try:
         try:
             proc = subprocess.run(
-                cmd, cwd=run_cwd, capture_output=True, text=True, timeout=TIMEOUT
+                cmd, cwd=run_cwd, stdout=events_fh,
+                stderr=subprocess.PIPE, text=True, timeout=TIMEOUT,
             )
-            stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
-        except subprocess.TimeoutExpired as e:
-            stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-            _append_log(log_path, stdout + f"\n--- continuation timed out after {TIMEOUT}s ---\n")
+            stdout = (proc.stdout if isinstance(proc.stdout, str)
+                      else _read_events(events_path))
+            stderr, rc = proc.stderr, proc.returncode
+        except subprocess.TimeoutExpired:
+            partial = _read_events(events_path)
+            _append_log(log_path, partial + f"\n--- continuation timed out after {TIMEOUT}s ---\n")
             previous = task.get("result") or ""
             heading = (f"## Continuation {started}\n\n**Prompt:** {prompt_text}\n\n"
                        f"timed out after {TIMEOUT}s")
@@ -2149,12 +2293,16 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
             if not _hub_bell_wired():
                 notify("Quicktask continuation timed out", task["prompt"],
                        f"after {TIMEOUT}s · qt log {tid}", kind="timeout", task_id=tid)
+            # claude is dead (subprocess.run killed it on timeout); take
+            # whatever it spawned down with it -- _kill_run_group_mates().
+            _kill_run_group_mates()
             _log_launch({
                 "ts": now(), "outcome": "headless-timeout", "requested_terminal": "headless",
                 "branch": "headless", "id": tid, "rc": None, "elapsed": _elapsed(),
             })
             return
     finally:
+        events_fh.close()
         if settings_path:
             try:
                 os.remove(settings_path)
