@@ -952,6 +952,8 @@ enum Entry {
               --dump-restart          print the POST /restart request (method, path, Origin)
               --post-restart          really POST /restart and print the outcome
               --snapshot <png>        render the dropdown to a PNG and exit
+              --expand <id-substring>
+                                      with --snapshot, pre-expand the matching ask row
               --snapshot-settings <png>
                                       render the settings window to a PNG and exit
               --dump-layout           print panel-layout measurements as JSON and exit
