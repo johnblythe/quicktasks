@@ -25,9 +25,12 @@ Requires: `claude` CLI, python3, macOS. The Raycast extension additionally needs
 ## Menu-bar widget
 
 A native status-menu app so `qt` is usable with no Raycast and no terminal. The
-menu-bar icon is a coloured dot for aggregate state; the dropdown has a
-quick-fire text field, one row per recent run with a status dot and one-click
-resume, and a refreshed-at footer.
+menu-bar icon is a coloured dot whose count is the hub's own "asks that need
+you" badge; the dropdown has the ask field ("Ask for something…", ⏎ Run now /
+⌘⏎ Ask me first), one row per ask in sections — New for you, Needs you,
+Working, Yours today — that expand in place to the answer and carry their moves
+as buttons and keys, and a refreshed-at footer. A hub that predates the ask
+API (or the Pass being down) draws the legacy run list exactly as before.
 
 ```bash
 cd menubar
@@ -74,7 +77,12 @@ Shortcuts runs a bare shell, hence the absolute path; `qt` locates `claude` on i
 | `qt -m <model> "..."` | override the model for this task |
 | `qt list` | recent tasks with status glyphs |
 | `qt log <id>` | full record + raw log path (unique id fragment works) |
+| `qt open <id>` | open the ask page (hub on), else the task's result |
+| `qt stop <id>` | kill a running task (marks it stopped) |
+| `qt retry <id> [--prompt "<text>"\|-]` | run the same task again under the same id (attempts accumulate) |
 | `qt resume <id>` | reopen a task as an interactive session |
+| `qt resume <id> --prompt "<text>"` | continue a run headlessly with `<text>` as the next turn (also answers an `ASK:` question) |
+| `qt continue <id> (--allow-once <tool>)... \| --skip` | continue a blocked run headless; the tools are allowed for that run only |
 | `qt resume-log [n]` | last n resume-launch records (terminal, branch, outcome) |
 | `qt setup` | pick terminal, trusted dirs, permission mode, default model |
 | `qt doctor` | read-only environment health check |
@@ -85,6 +93,27 @@ Shortcuts runs a bare shell, hence the absolute path; `qt` locates `claude` on i
 ## How it works
 
 `qt` detaches a `claude -p` run. By default it runs in a fixed workspace (`~/.quicktasks/workspace/`), so your global CLAUDE.md, tools, and memory apply no matter where you fired it from. The workspace CLAUDE.md tells the agent it's unattended: never ask questions, lead with the outcome, don't expand scope. Each task is one JSON file in `~/.quicktasks/tasks/`; raw transcripts in `~/.quicktasks/logs/`. The invocation directory is passed as context so "this repo" works from a terminal.
+
+## Asks: one id, one address, many runs
+
+With a hub configured, every quicktask is also an **ask** in the hub's derived list: id `qt-<tid>` — the same id before and after it reaches the hub, stable from queue time — one address `http://127.0.0.1:<port>/ask/qt-<tid>`, and a state machine the hub computes by reading qt's own ledger. A **run** is one claude invocation inside an ask: the first fire, a retry, a follow-up, a continue. Redoing or steering an ask never spawns a new one; runs accumulate (`attempts[]` on the task record) under the same id. The hub delegates an ask's moves back to these verbs, and everything below works from the shell too:
+
+- **`qt retry <id> [--prompt "<text>"|-]`** runs the same task again under the same id. The attempt is appended to `attempts[]` (the original run counts as 1), the previous outcome, session, denials, and question are cleared, and the run is spawned detached exactly like a fresh queue. `--prompt` replaces the words; `-` reads them from stdin. Exit 0 queued, 2 if the task is still running or queued (stop it first), 1 unknown id.
+- **`qt stop <id>`** kills the run's whole process group (SIGTERM, then SIGKILL after 3 s), marks the task `stopped` with the result "Stopped by you", and feeds the hub. Exit 0 also when the task is not running — it just prints "not running" — so a stop triggered from a notification, a menu row, or a script never needs to check first. A run that finishes on its own mid-stop wins: the status it earned is kept.
+- **`qt continue <id> (--allow-once <tool>)... | --skip [--prompt "<text>"]`** is the move after a blocked run. It resumes the run's session headlessly, exactly like `qt resume <id> --prompt`, but `--allow-once` renders the named tools into that one run's `--settings` allow list — nothing persists; `qt allow <tool>` is the permanent version — and `--skip` sends the standard "That tool is not available to you; skip that step and finish the rest." instruction instead. The two flags are exclusive; `--prompt` replaces either's default wording.
+- **`qt open <id>`** opens the ask's one address in the browser when a hub is configured. Without one it keeps today's behavior: the hub mirror's `RESULT.md` first, then the run dir's, then the recorded result text.
+
+### The question convention
+
+A headless run can't answer a question mid-flight, so the ones that matter move to the end. With config `questions` on (the default), every task prompt carries a tail telling the model: if you cannot finish without the owner's input, end your final message with one line `ASK: <question>` — and only when truly stuck, otherwise make the most reasonable assumption and finish. A result whose last non-empty line starts `ASK:` stamps the task `question` rather than `done`, so the ask waits for you instead of masquerading as finished, and the question itself rides into the hub job record, the menu bar's row, and the notification. Answer it wherever you saw it: `qt resume <id> --prompt "<answer>"`, the row's inline answer field, or the banner's Answer… button — all the same follow-up. With `questions` off, the tail is not sent and a trailing `ASK:` line is just text in a normal done result.
+
+### Streaming events
+
+Every run kind — first fire, retry, follow-up, continue — runs claude with `--output-format stream-json` and appends the events to `$QT_DATA/logs/<tid>.events.jsonl` (recorded as `events_path` on the task). Each run truncates the file, so it always holds the current (or most recent) run's events; that file is what the hub's live "now line" reads while the ask is working, which is how a working row in the menu bar can say "reading 14 files" or "searching Slack" instead of just a stopwatch. The final `result` event is parsed into the same fields as the old plain-json output, so `qt list`, `qt log`, and the hub feed are unchanged, and a run whose stream can't be parsed falls back to the json path.
+
+### One bell per ask
+
+When the configured hub's checkout has a `bell.py`, the hub owns the bell: it rings for a qt ask itself when its `notice.py` sees the job record qt already wrote, so qt skips its own finish/blocked/failed/timeout/continuation banners — one bell per ask, not two. The check is per finish and never cached, so a hub upgraded mid-flight is honored immediately. Standalone qt (no hub) and an older hub without `bell.py` keep every banner exactly as before. The DM-fallback "DM not sent" notice is deliberately not gated on this: it reports qt's own Slack send failing, an event the hub has no record of, so it always rings.
 
 ## Permissions: trusted dirs and the blocked flow
 
@@ -111,7 +140,7 @@ Note: your global allowlist is inherited by headless runs, and sandbox-safe read
 
 ## Config
 
-`qt setup` writes `~/.quicktasks/config.json`: `terminal` (cmux | Ghostty | iTerm | Terminal | custom template with `{script}`), `trusted_dirs`, `permissions` (see above, also set by `qt setup`), `trusted_permissions` (mode inside trusted dirs, default `auto`), `model` (default for all tasks; `qt setup` recommends `sonnet[1m]`, Claude Code 2.1.266+'s 1M-context alias, but leaves it unset unless you pick it), optional `notifier: "osascript"` to force the fallback, and `slack_owner_id` / `slack_allowed_channels` / `slack_allow_public_channels` (see Slack safety, below).
+`qt setup` writes `~/.quicktasks/config.json`: `terminal` (cmux | Ghostty | iTerm | Terminal | custom template with `{script}`), `trusted_dirs`, `permissions` (see above, also set by `qt setup`), `trusted_permissions` (mode inside trusted dirs, default `auto`), `model` (default for all tasks; `qt setup` recommends `sonnet[1m]`, Claude Code 2.1.266+'s 1M-context alias, but leaves it unset unless you pick it), `questions` (the `ASK:` convention, default on — see [Asks](#asks-one-id-one-address-many-runs)), optional `notifier: "osascript"` to force the fallback, and `slack_owner_id` / `slack_allowed_channels` / `slack_allow_public_channels` (see Slack safety, below).
 
 Model resolution per task: `-m` flag > `QT_MODEL` env > config `"model"` > your CLI default. Leaving `model` unset (the default if you skip that step in `qt setup`) always falls through to whatever the `claude` CLI itself defaults to; setup never writes a model choice you didn't make.
 
@@ -122,6 +151,8 @@ Env vars, all optional: `QT_DATA` (default `~/.quicktasks`), `QT_TIMEOUT` (secon
 ### Hub mode
 
 `qt hub <dir>` points qt at a checkout of The Pass (a separate ledger app; `dir` must contain its `seed.py`); `qt hub off` clears it; `qt hub status` shows the current setting. Unset (the default) is a strict no-op: nothing changes. Set it and every finished task also seeds an item into that ledger (`seed.py`, so a re-run never duplicates) and writes a `jobs/qt-<id>-<timestamp>/job.json` + `output/RESULT.md`, so it shows up in the ledger's Verify queue: done tasks land as `done`, blocked tasks land as `blocked`, and failed/timeout tasks land as `failed`, each with an error explaining why and a `qt resume <id>` hint. `QT_HUB` overrides the config value. This never blocks or fails the task itself; a hub-feed problem is logged to the task's log file at most.
+
+With a hub configured, each task is also an **ask** — see [Asks](#asks-one-id-one-address-many-runs) — with the id, address, verbs, question convention, streaming events, and bell delegation described there: `qt open` opens the ask page, the state machine (`stopped`, `question`, and the rest) maps straight into the hub's ask list, and the hub's bell rings so qt's own banners don't.
 
 ### Slack safety
 
