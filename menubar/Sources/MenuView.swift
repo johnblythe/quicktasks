@@ -86,20 +86,16 @@ struct MenuView: View {
     @State private var expandedID: String?
     @FocusState private var fieldFocused: Bool
 
-    // MARK: Q3 -- the ask board and its in-place reading
+    // MARK: Q3/Q6 -- the ask board and its in-place reading
 
-    /// The ask feed's own model, nil until the first ask poll lands. When it
-    /// speaks asks (`speaksAsks`), the list below draws ask sections instead
-    /// of the legacy task rows; when the hub predates the ask API it carries
-    /// the legacy model and the menu is exactly what it has always been.
-    ///
-    /// Held by the view rather than StatusController on purpose for slice 1:
-    /// the controller is App.swift's (Q6 moves this poll there when it owns
-    /// the notification side of asks). Loaded on appear and re-loaded on the
-    /// controller's own refreshedAt tick, so the ask list refreshes at the
-    /// same cadence as everything else while the menu is open.
-    @State private var askFeed: AskFeed?
-    @State private var askBoard: AskBoard?
+    /// The ask feed and its board live on StatusController since Q6 -- this
+    /// used to be view @State with a poll of its own, which could only run
+    /// while a window was open. The view reads `controller.askFeed` /
+    /// `controller.askBoard` and lets the controller's poll keep them fresh.
+    /// When the board speaks asks (`speaksAsks`), the list below draws ask
+    /// sections instead of the legacy task rows; when the hub predates the
+    /// ask API the board carries the legacy model and the menu is exactly
+    /// what it has always been.
     /// Threads fetched for rows whose peek is open, keyed by ask id.
     @State private var askThreads: [String: AskThread] = [:]
     /// Rows whose thread fetch is in flight.
@@ -108,9 +104,6 @@ struct MenuView: View {
     /// line to draw, and the undo token Z spends. Token nil when the hub
     /// refused -- the line still shows its words, but Z has nothing to do.
     @State private var askMoveLine: (id: String, line: String, token: String?)?
-    /// One ask poll at a time, the same rule as StatusController's own
-    /// pollInFlight.
-    @State private var askPollInFlight = false
     /// The id-substring the snapshot seam asked to pre-expand (`--snapshot
     /// <png> --expand <id>`), consumed by the first board that can satisfy
     /// it. Held as @State because consuming it mutates view state.
@@ -221,9 +214,6 @@ struct MenuView: View {
         .background { shortcutButtons }
         .onAppear {
             controller.refresh()
-            // The ask feed loads alongside the controller's own poll: the
-            // menu opens showing whichever answer the bell was about.
-            refreshAsks()
             // The panel needs to be key before the TextField will take
             // keystrokes, and opening a MenuBarExtra window does not
             // activate the app on its own -- see `focusQuickFireField`.
@@ -237,6 +227,11 @@ struct MenuView: View {
             // fresh banner in it still deserves its ~2s look before it
             // collapses into "N earlier".
             controller.scheduleMarkOutcomesSeen()
+            // The ask feed is the controller's own poll now (Q6); this
+            // covers the one race it cannot: a board that landed before
+            // this view was installed, with a snapshot pre-expand waiting
+            // on it. The onChange below covers every landing after.
+            consumePreexpand()
         }
         .onDisappear {
             // Whichever host just closed, it starts the next visit clean --
@@ -312,13 +307,16 @@ struct MenuView: View {
             // The controller polled a fresh model: re-narrow it to whatever
             // is currently typed, once, here -- not on every read below.
             filteredModel = controller.model.filtered(query: search)
-            // The ask feed rides the controller's own poll cadence: a fresh
-            // legacy model means a tick went by, so the asks refresh too.
-            refreshAsks()
             // A highlight whose row has left the feed is dropped rather than
             // moved: the row under the cursor changing identity between polls
             // is how you act on the wrong thing.
             highlighted = KeyboardNav.survivor(ids: visibleIDs, current: highlighted)
+        }
+        .onChange(of: controller.askBoard) { _, _ in
+            // The controller's ask poll landed a board (Q6: the poll that
+            // used to live here). Consume any pending snapshot pre-expand
+            // against the fresh board; a no-op once nothing is waiting.
+            consumePreexpand()
         }
         .onChange(of: search) { _, newValue in
             // The query changed: re-narrow the controller's current model
@@ -338,7 +336,7 @@ struct MenuView: View {
     /// same way when the feed speaks asks (Q3): the same narrowed list the
     /// ask sections are drawing.
     private var visibleIDs: [String] {
-        if asksLive, let board = askBoard {
+        if asksLive, let board = controller.askBoard {
             return board.sections
                 .map { AskFilter.apply($0.rows, query: search) }
                 .flatMap { $0.map(\.id) }
@@ -366,7 +364,7 @@ struct MenuView: View {
         // An ask row's one action is opening the ask's own address (Q3):
         // always enabled, never dimmed. Return falls through to the legacy
         // record path only when the feed is not speaking asks.
-        if asksLive, let board = askBoard,
+        if asksLive, let board = controller.askBoard,
            let id = highlighted, let row = board.row(id: id) {
             openAsk(row)
             return .handled
@@ -412,7 +410,7 @@ struct MenuView: View {
         if ids.count == 1, let id = ids.first {
             // One match, whichever feed is live: act on it, since one match
             // is unambiguous enough not to need the extra keystroke.
-            if asksLive, let board = askBoard, let row = board.row(id: id) {
+            if asksLive, let board = controller.askBoard, let row = board.row(id: id) {
                 openAsk(row)
                 return
             }
@@ -499,7 +497,7 @@ struct MenuView: View {
     /// carries sat, as one expression, past the compiler's type-check
     /// budget -- the same treatment `feedFacts` got in DumpModel (2026-10-29).
     @ViewBuilder private var rowList: some View {
-        if let board = askBoard, board.speaksAsks {
+        if let board = controller.askBoard, board.speaksAsks {
             // Q3: the feed speaks asks -- the list is ask sections. The
             // legacy branches below stay exactly as they were for the hubs
             // and fallbacks that do not.
@@ -767,7 +765,7 @@ struct MenuView: View {
     /// speaking asks -- one read so the header, the footer, and the list all
     /// agree on which menu is up.
     private var liveAskBoard: AskBoard? {
-        guard let board = askBoard, board.speaksAsks else { return nil }
+        guard let board = controller.askBoard, board.speaksAsks else { return nil }
         return board
     }
 
@@ -1268,32 +1266,14 @@ struct MenuView: View {
 
     // MARK: - asks (Q3)
 
-    /// The ask poll. Rides the controller's own tick (see onChange of
-    /// refreshedAt) plus .onAppear, runs off the main thread, one at a time.
-    /// `previous` carries the last rev so an unchanged hub answers with a
-    /// two-field body instead of the whole list.
-    private func refreshAsks() {
-        guard !askPollInFlight else { return }
-        askPollInFlight = true
-        let previous = askFeed
-        DispatchQueue.global(qos: .utility).async {
-            let config = StoreConfig.resolve()
-            let feed = Feed.loadAsks(config: config, previous: previous)
-            DispatchQueue.main.async {
-                askPollInFlight = false
-                askFeed = feed
-                askBoard = AskBoard.build(feed: feed)
-                consumePreexpand()
-            }
-        }
-    }
-
     /// Spends the snapshot seam's `--expand <id-substring>` on the first
     /// board that can satisfy it: highlight the row and open its peek, so a
-    /// snapshot can show the answer in place without a click.
+    /// snapshot can show the answer in place without a click. The board is
+    /// the controller's (Q6); this runs when a board lands and when a view
+    /// appears over one that already had.
     private func consumePreexpand() {
         guard let needle = preexpand,
-              let board = askBoard,
+              let board = controller.askBoard,
               let row = board.row(matching: needle) else { return }
         preexpand = nil
         highlighted = row.id
@@ -1319,7 +1299,7 @@ struct MenuView: View {
     /// it before the text landed would clear the dot on a row that was never
     /// read.
     private func expand(_ row: AskRowModel) {
-        let plan = AskExpand.plan(ask: row.ask, source: askFeed?.source ?? .files)
+        let plan = AskExpand.plan(ask: row.ask, source: controller.askFeed?.source ?? .files)
         guard plan.fetchThread, let base = askClientBase(),
               askThreads[row.id] == nil,
               !askLoadingThreads.contains(row.id) else { return }
@@ -1382,7 +1362,7 @@ struct MenuView: View {
             DispatchQueue.main.async {
                 if result.ok {
                     askMoveLine = nil
-                    refreshAsks()
+                    controller.refreshAsks()
                 } else {
                     askMoveLine = (pending.id, AskMoveLine.failure(result), nil)
                 }
@@ -1428,18 +1408,16 @@ struct MenuView: View {
         let line = AskMoveLine.done(result)
         askMoveLine = (row.id, line, result.undo?.token)
         if result.ok {
-            refreshAsks()
+            controller.refreshAsks()
         } else {
             controller.post(kind: .error, title: line)
         }
     }
 
-    /// Where ask reads and writes go: the URL the ask feed itself was read
+    /// Where ask reads and writes go: the controller's own base (Q6, the
+    /// rule that used to live here) -- the URL the ask feed itself was read
     /// from, so the two can never point at different hubs.
-    private func askClientBase() -> URL? {
-        let raw = askFeed?.passURL ?? controller.config.passURL?.absoluteString
-        return raw.flatMap(URL.init(string:))
-    }
+    private func askClientBase() -> URL? { controller.askBaseURL }
 
     // MARK: - ask list (Q3)
 

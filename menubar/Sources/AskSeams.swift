@@ -23,20 +23,170 @@
 //       unseen row); --ask-done posts done and prints the undo line the row
 //       shows, and --ask-undo spends the returned token right after.
 //
+//   --ask-notice <payload.json> [--ask-action <id>] [--ask-text <text>] (Q6)
+//       One bell payload (v2 or v1) as the notice it becomes: category,
+//       sound, the actions in banner order, and the POST each action routes
+//       to -- the same InboxNotice.toNotice and AskNoticeRoute the watcher
+//       and the delegate run, printed instead of posted. --ask-action (with
+//       --ask-text for a text input) really performs that action's POST
+//       through AskClient, so a test can prove the typed text reached
+//       /asks/<id>/<move>. The `dedupe` block replays the notice's
+//       suppressions through a real JobTransitionTracker to prove the poll
+//       that later sees the same landing stays silent.
+//
 // Entry (App.swift) dispatches on `--dump-model` today and does not know these
 // flags, so a test invokes them next to it (`--dump-model --ask-dump-model`);
-// DumpModel.run hands any `--ask-*` argument to `AskSeams.run`. Once App.swift
-// routes `--ask-*` itself the companion flag stops being needed.
+// DumpModel.run hands any `--ask-*` argument to `AskSeams.run`. Since Q6,
+// Entry also routes any `--ask-*` argument directly, so both spellings work.
 
 import Foundation
 
 enum AskSeams {
     static func run(args: [String]) -> Int32 {
+        if args.contains("--ask-notice") { return askNotice(args: args) }
         if args.contains("--ask-dump-model") { return dumpModel(args: args) }
         if args.contains("--ask-dump-rows") { return dumpRows(args: args) }
         if args.contains("--ask-dump-thread") { return dumpThread(args: args) }
         if args.contains("--ask-post") { return post(args: args) }
         return fail("unknown --ask-* seam: \(args.filter { $0.hasPrefix("--ask-") }.joined(separator: " "))")
+    }
+
+    // MARK: --ask-notice (Q6)
+
+    /// One bell payload as the notice it becomes, plus each action's routed
+    /// POST, the once-per-ask dedupe proof, and (with `--ask-action`) the
+    /// real POST an action tap would make.
+    private static func askNotice(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--ask-notice"), i + 1 < args.count,
+              !args[i + 1].hasPrefix("--") else {
+            return fail("--ask-notice needs a payload file")
+        }
+        let path = args[i + 1]
+        guard let data = FileManager.default.contents(atPath: path),
+              let payload = try? JSONDecoder().decode(InboxNotice.self, from: data) else {
+            return fail("could not decode \(path) as an inbox notice")
+        }
+        let notice = payload.toNotice(uuid: "SEAM")
+        let typed = value(args, "--ask-text") ?? ""
+        let askID = payload.ask_id ?? payload.task_id
+
+        var out: [String: Any] = [
+            "v": payload.v ?? NSNull(),
+            "v2": payload.isV2,
+            "kind": payload.kind ?? NSNull(),
+            "category": notice.category.rawValue,
+            "sound": notice.sound,
+            "title": notice.title,
+            "body": notice.body ?? NSNull(),
+            "ask_id": payload.ask_id ?? NSNull(),
+            "task_id": payload.task_id ?? NSNull(),
+            "open_url": notice.passURL ?? NSNull(),
+            "moves": payload.moves ?? NSNull(),
+            "notice_id": notice.id,
+        ]
+        var actionEntries: [[String: Any]] = []
+        if let banners = AskNotice.actions[notice.category] {
+            // An ask category: every banner action with the POST it routes
+            // to, so the printout and Notification Center cannot drift.
+            actionEntries = banners.map { banner in
+                var entry: [String: Any] = [
+                    "id": banner.action.rawValue,
+                    "title": banner.title,
+                    "text_input": banner.textInput,
+                ]
+                let route = AskNoticeRoute.route(actionID: banner.action.rawValue,
+                                                 askID: askID,
+                                                 typedText: typed,
+                                                 body: payload.body,
+                                                 url: notice.passURL)
+                switch route {
+                case .move(_, let move, let body):
+                    entry["post"] = ["move": move, "body": body] as [String: Any]
+                case .copy:
+                    entry["copy"] = true
+                case .open:
+                    entry["open"] = true
+                case .click, .none:
+                    break
+                }
+                return entry
+            }
+        } else {
+            // A legacy category: today's buttons, titles only -- they are
+            // the old deep links (resume / allowlist / open), not moves.
+            let legacyTitles: [String]
+            switch notice.category {
+            case .blocked: legacyTitles = ["Resume in Terminal", "Always Allow Tool", "Open in Pass"]
+            case .blockedNoAllow: legacyTitles = ["Resume in Terminal", "Open in Pass"]
+            case .outcome: legacyTitles = ["Open in Pass"]
+            default: legacyTitles = []
+            }
+            actionEntries = legacyTitles.map { ["title": $0, "text_input": false] as [String: Any] }
+        }
+        out["actions"] = actionEntries
+        out["dedupe"] = dedupeJSON(payload)
+
+        if let actionID = value(args, "--ask-action") {
+            let route = AskNoticeRoute.route(actionID: actionID, askID: askID,
+                                             typedText: typed, body: payload.body,
+                                             url: notice.passURL)
+            guard case .move(let id, let move, let body) = route else {
+                return fail("--ask-action \(actionID) is not a move on this notice")
+            }
+            guard let base = StoreConfig.resolve().passURL else {
+                return fail("the Pass feed is off (QT_PASS_URL is empty)")
+            }
+            let result = AskClient(base: base).post(id: id, move: move, body: body)
+            out["action_post"] = [
+                "action": actionID,
+                "id": id,
+                "move": move,
+                "body": body,
+                "ok": result.ok,
+                "status": result.status,
+                "kind": result.kind.rawValue,
+                "message": result.message,
+            ] as [String: Any]
+        }
+        return emit(out)
+    }
+
+    /// The no-duplicate guarantee as data (Q6): a real JobTransitionTracker
+    /// shown the ask running, then the notice's suppressions applied --
+    /// exactly what handleInbox does -- then the landing poll, versus the
+    /// same two polls with no notice in between. `fired_after_notice` 0
+    /// with `fired_without_notice` 1 is "poll-detected fallback notices
+    /// suppressed when an inbox v2 notice for the same ask_id arrived".
+    private static func dedupeJSON(_ payload: InboxNotice) -> [String: Any] {
+        let suppressions = payload.suppressions()
+        let landedID = payload.task_id
+            ?? payload.ask_id.map { $0.hasPrefix("qt-") ? String($0.dropFirst(3)) : $0 }
+            ?? "seam"
+        let landed: TaskStatus
+        switch payload.kind {
+        case "answer", "done": landed = .done
+        case "failed", "timeout": landed = .failed
+        case "blocked": landed = .blocked
+        default: landed = .unknown   // question/receipt/reminder/info: no legacy transition fires
+        }
+        func record(_ status: TaskStatus) -> TaskRecord {
+            TaskRecord(id: landedID, itemID: payload.ask_id ?? landedID,
+                       title: payload.title, status: status,
+                       state: nil, origin: .pass)
+        }
+        let tracker = JobTransitionTracker()
+        _ = tracker.detect(fresh: [record(.running)])
+        for s in suppressions { tracker.suppress(id: s.id, status: s.status) }
+        let afterNotice = tracker.detect(fresh: [record(landed)])
+        let control = JobTransitionTracker()
+        _ = control.detect(fresh: [record(.running)])
+        let withoutNotice = control.detect(fresh: [record(landed)])
+        return [
+            "suppressed_ids": suppressions.map(\.id),
+            "landed_status": landed.rawValue,
+            "fired_after_notice": afterNotice.count,
+            "fired_without_notice": withoutNotice.count,
+        ] as [String: Any]
     }
 
     // MARK: --ask-dump-model
