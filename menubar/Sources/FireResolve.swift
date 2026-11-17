@@ -86,6 +86,28 @@ enum FireResolve {
         return chipDirectory(env: env, settings: settings)
     }
 
+    /// The body the Ask-me-first mode POSTs to `/asks` (Q12, contract 1.6):
+    /// the stripped text, the mode, the door this widget always is, and the
+    /// directory a Run-now fire of the same words would have used -- the
+    /// prefix is parsed and stripped here rather than ignored, because
+    /// `dir` *is* a field this body has.
+    ///
+    /// `describe(text:toPass:)` below keeps describing the *fallback* leg
+    /// (the `/capture` body an older hub takes) because that is what
+    /// `--dump-fire`/`--dump-keys` have always printed and what the
+    /// ask-first flow falls back to; this function and the `--ask-fire` seam
+    /// describe the POST /asks leg.
+    static func askFirstBody(text: String, dir: URL?) -> [String: Any] {
+        var body: [String: Any] = [
+            "text": text,
+            "mode": "ask_first",
+            // Section 1.3's door table: menubar (widget or summon) -> typed.
+            "door": "typed",
+        ]
+        if let dir { body["dir"] = dir.path }
+        return body
+    }
+
     /// The full resolved outcome of one fire, as JSON: what `--dump-fire`
     /// prints directly, and what a \u{2318}-Return one-shot fire inside
     /// `--dump-keys` appends to `fired`. Kept as one function so both seams,
@@ -115,6 +137,75 @@ enum FireResolve {
             "dir_source": resolved.source,
             "argv": ["--in", resolved.url.path, stripped],
         ]
+    }
+}
+
+/// Q12: the receipt a successful fire from the ask field leaves behind, and
+/// the undo it carries. One struct for both modes because they are one
+/// gesture -- the plan's fixed words for Run now, an honest cousin for Ask me
+/// first -- and one undo: stop the run if one is live (`qt stop`), then file
+/// the ask away (the `drop` move).
+///
+/// Kept pure, next to FireResolve, so the live field and the `--ask-fire`
+/// seam land the exact same receipt and spend the exact same undo.
+struct AskReceipt: Equatable {
+    enum Kind: String {
+        case runNow = "run"
+        case askFirst = "ask_first"
+    }
+
+    let kind: Kind
+    /// The stripped text that was fired -- for Run now, the words the new
+    /// ask will carry, and what Undo matches the fired ask by.
+    let words: String
+    let firedAt: Date
+    /// The ask id, when the fire already knows it (Ask me first: POST /asks
+    /// answered with the ask it created). Run now fires qt locally and knows
+    /// no id, so Undo resolves it from the board at click time.
+    let askID: String?
+
+    /// `asks.undo_window_s`, the hub's default. The client does not read the
+    /// config; the receipt simply stops offering Undo after the same window
+    /// the hub's own undo tokens live for, so the two never disagree by much.
+    static let undoWindow: TimeInterval = 600
+
+    /// The plan's fixed receipt for Run now (the spec's "Asking" mockup).
+    static let runNowLine = "Got it. Running. The answer will come to you here."
+    /// Ask me first creates a gate item, not a run -- the receipt says what
+    /// actually happens instead of borrowing Run now's "Running".
+    static let askFirstLine = "Got it. It waits for your OK."
+
+    var line: String { kind == .runNow ? Self.runNowLine : Self.askFirstLine }
+
+    func undoable(now: Date) -> Bool {
+        let age = now.timeIntervalSince(firedAt)
+        return age >= 0 && age < Self.undoWindow
+    }
+
+    /// The ask this receipt's Undo acts on: the newest board row whose words
+    /// (or title) are the fired text and which is still queued or running.
+    /// A finished ask has nothing worth stopping, and a mismatched one is
+    /// somebody else's fire. The receipt's own window bounds all of this;
+    /// the match itself stays deliberately loose about time because the hub's
+    /// `created_at` and the client's clock are not one clock.
+    static func resolveAskID(in asks: [Ask], words: String) -> String? {
+        let fired = words.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !fired.isEmpty else { return nil }
+        var best: (id: String, at: Date)?
+        for ask in asks where ask.state == .working || ask.state == .heard {
+            let said = ask.words.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let titled = ask.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard said == fired || titled == fired else { continue }
+            let at = ask.createdDate ?? ask.updatedDate ?? .distantPast
+            if best == nil || at > best!.at { best = (ask.id, at) }
+        }
+        return best?.id
+    }
+
+    /// The qt task id an ask id names: the ask is `qt-<tid>`, the task
+    /// `qt stop` takes is `<tid>`.
+    static func qtTaskID(forAskID id: String) -> String {
+        id.hasPrefix("qt-") ? String(id.dropFirst(3)) : id
     }
 }
 

@@ -41,6 +41,26 @@
 //       suppressions through a real JobTransitionTracker to prove the poll
 //       that later sees the same landing stays silent.
 //
+//   --ask-fire <text> [--ask-mode run|ask_first] [--ask-panel] (Q12)
+//       [--ask-undo] [--ask-aged <seconds>]
+//       The ask field's fire, really performed: Run now spawns qt through
+//       the same Actions.fire the field uses (point QT_BIN at a stub and
+//       read what it was invoked with); Ask me first really POSTs /asks
+//       through Actions.askFirst, falling back to /capture on a 501/404
+//       exactly as the field does. Prints the receipt the field leaves
+//       (the plan's fixed line, its undo window), and --ask-undo performs
+//       the receipt's Undo: resolve the fired ask off the board, qt stop,
+//       POST drop. --ask-aged backdates the receipt so an expired undo can
+//       be proven. --dump-fire/--dump-keys still describe the *fallback*
+//       (capture) leg of the second mode -- this seam describes both legs.
+//
+//   --ask-again [<id-substring>] (Q12)
+//       The Ask-again list: GET /asks.json?place=done through the same
+//       AskClient the field's own fetch uses, newest first. With a
+//       substring, also the walkthrough of clicking that row: the words
+//       that land in the field, and the fire they would make in either
+//       mode (FireResolve.describe, the same pure call the field runs).
+//
 // Entry (App.swift) dispatches on `--dump-model` today and does not know these
 // flags, so a test invokes them next to it (`--dump-model --ask-dump-model`);
 // DumpModel.run hands any `--ask-*` argument to `AskSeams.run`. Since Q6,
@@ -51,12 +71,219 @@ import Foundation
 enum AskSeams {
     static func run(args: [String]) -> Int32 {
         if args.contains("--ask-notice") { return askNotice(args: args) }
+        if args.contains("--ask-fire") { return fireField(args: args) }
+        if args.contains("--ask-again") { return askAgain(args: args) }
         if args.contains("--ask-dump-model") { return dumpModel(args: args) }
         if args.contains("--ask-dump-rows") { return dumpRows(args: args) }
         if args.contains("--ask-dump-thread") { return dumpThread(args: args) }
         if args.contains("--ask-press") { return press(args: args) }
         if args.contains("--ask-post") { return post(args: args) }
         return fail("unknown --ask-* seam: \(args.filter { $0.hasPrefix("--ask-") }.joined(separator: " "))")
+    }
+
+    // MARK: --ask-fire (Q12)
+
+    /// The ask field's fire, really performed, with the receipt it leaves
+    /// and (asked for) the receipt's Undo. Every step is the same call the
+    /// live field makes -- Actions.fire / Actions.askFirst for the send,
+    /// AskReceipt for the landing, Actions.stopQtTask + AskClient.post for
+    /// the undo -- so a test pins the field's behaviour, not a copy of it.
+    private static func fireField(args: [String]) -> Int32 {
+        // The text is allowed to start with `--in`/`@` -- that is the
+        // fire's own directory prefix -- so the guard rejects only this
+        // seam's own flags, not every leading dash.
+        let ownFlags: Set<String> = ["--ask-mode", "--ask-panel", "--ask-undo", "--ask-aged"]
+        guard let i = args.firstIndex(of: "--ask-fire"), i + 1 < args.count,
+              !ownFlags.contains(args[i + 1]) else {
+            return fail("--ask-fire needs some text")
+        }
+        let raw = args[i + 1]
+        let mode = value(args, "--ask-mode") ?? "run"
+        let isPanel = args.contains("--ask-panel")
+        let config = StoreConfig.resolve()
+        var out: [String: Any] = [
+            "text": raw,
+            "mode": mode,
+            "panel": isPanel,
+        ]
+        let (prefixDir, stripped) = FireResolve.parsePrefix(raw)
+        let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: config.settings)
+        out["dir"] = resolved.url.path
+        out["dir_source"] = resolved.source
+
+        func receiptJSON(_ receipt: AskReceipt, undoable: Bool) -> [String: Any] {
+            [
+                "kind": receipt.kind.rawValue,
+                "line": receipt.line,
+                "words": receipt.words,
+                "ask_id": receipt.askID ?? NSNull(),
+                "undo_window_s": Int(AskReceipt.undoWindow),
+                "undoable": undoable,
+            ] as [String: Any]
+        }
+
+        switch mode {
+        case "run":
+            switch Actions.fire(prompt: stripped, in: resolved.url,
+                                origin: isPanel ? "summon" : "widget").map({ stripped }) {
+            case .failure(let problem):
+                out["ok"] = false
+                out["error"] = problem.message
+                _ = emit(out)
+                return 1
+            case .success:
+                let aged = value(args, "--ask-aged").flatMap { Double($0) } ?? 0
+                let receipt = AskReceipt(kind: .runNow, words: stripped,
+                                         firedAt: Date().addingTimeInterval(-aged), askID: nil)
+                out["ok"] = true
+                out["receipt"] = receiptJSON(receipt, undoable: receipt.undoable(now: Date()))
+                if args.contains("--ask-undo") {
+                    out["undo"] = undoJSON(receipt: receipt, config: config)
+                }
+            }
+        case "ask_first":
+            guard let base = config.passURL else {
+                return fail("the Pass feed is off (QT_PASS_URL is empty)")
+            }
+            switch Actions.askFirst(text: stripped, rawText: raw, dir: resolved.url, base: base) {
+            case .failure(let problem):
+                out["ok"] = false
+                out["error"] = problem.message
+                _ = emit(out)
+                return 1
+            case .success(let outcome):
+                out["ok"] = true
+                out["route"] = outcome.route
+                switch outcome {
+                case .posted(let id):
+                    let aged = value(args, "--ask-aged").flatMap { Double($0) } ?? 0
+                    let receipt = AskReceipt(kind: .askFirst, words: stripped,
+                                             firedAt: Date().addingTimeInterval(-aged), askID: id)
+                    out["ask_id"] = id ?? NSNull()
+                    out["receipt"] = receiptJSON(receipt, undoable: receipt.undoable(now: Date()))
+                    if args.contains("--ask-undo") {
+                        out["undo"] = undoJSON(receipt: receipt, config: config)
+                    }
+                case .fellBack(let captured):
+                    out["captured_id"] = captured ?? NSNull()
+                    // The fallback leg's landing is today's To-Pass outcome,
+                    // computed by the same describe the live field runs.
+                    let (state, _) = FireFieldOutcome.describe(
+                        result: .success(captured ?? ""), toPass: true,
+                        displayText: raw, isPanel: isPanel)
+                    if case .success(let text) = state {
+                        out["fallback_line"] = text
+                    } else {
+                        out["fallback_line"] = NSNull()
+                    }
+                }
+            }
+        default:
+            return fail("--ask-mode must be run or ask_first")
+        }
+        return emit(out)
+    }
+
+    /// The receipt's Undo, performed exactly as the field's Undo button
+    /// does: resolve the fired ask off a real board read, `qt stop` when the
+    /// ask is still running or queued, then the `drop` move. A receipt past
+    /// its window refuses, the way the button disappears.
+    private static func undoJSON(receipt: AskReceipt, config: StoreConfig) -> [String: Any] {
+        let now = Date()
+        guard receipt.undoable(now: now) else {
+            return ["ok": false, "expired": true,
+                    "window_s": Int(AskReceipt.undoWindow)] as [String: Any]
+        }
+        let board = AskBoard.build(feed: Feed.loadAsks(config: config, now: now))
+        let asks = board.rows.map(\.ask)
+        guard let id = receipt.askID ?? AskReceipt.resolveAskID(in: asks, words: receipt.words) else {
+            return ["ok": false,
+                    "error": "the fired ask is not on the board to stop"] as [String: Any]
+        }
+        var out: [String: Any] = [
+            "ok": true,
+            "id": id,
+            "qt_task_id": AskReceipt.qtTaskID(forAskID: id),
+            "stopped": false,
+        ] as [String: Any]
+        if let row = board.row(id: id),
+           row.ask.state == .working || row.ask.state == .heard {
+            switch Actions.stopQtTask(askID: id) {
+            case .success: out["stopped"] = true
+            case .failure(let problem):
+                out["ok"] = false
+                out["stop_error"] = problem.message
+            }
+        }
+        if let base = config.passURL {
+            let result = AskClient(base: base).post(id: id, move: "drop")
+            out["dropped"] = result.ok
+            out["drop_message"] = result.message
+            if !result.ok { out["ok"] = false }
+        } else {
+            out["dropped"] = NSNull()
+        }
+        return out
+    }
+
+    // MARK: --ask-again (Q12)
+
+    /// The Ask-again list: the hub's own done pages, newest first, through
+    /// the same AskClient call the field's fetch makes; with a substring,
+    /// the walkthrough of clicking that row -- the words that land in the
+    /// field, and the fire they would make in either mode.
+    private static func askAgain(args: [String]) -> Int32 {
+        let config = StoreConfig.resolve()
+        guard let base = config.passURL else {
+            return fail("the Pass feed is off (QT_PASS_URL is empty)")
+        }
+        var needle: String?
+        if let i = args.firstIndex(of: "--ask-again"), i + 1 < args.count,
+           !args[i + 1].hasPrefix("--") {
+            needle = args[i + 1]
+        }
+        var out: [String: Any] = [:]
+        switch AskClient(base: base).list(place: "done", limit: 8) {
+        case .failure(let failure):
+            out["ok"] = false
+            out["error"] = failure.problem.message
+            _ = emit(out)
+            return 1
+        case .success(.unchanged(let rev)):
+            // The list call carries no since_rev, so this is a hub speaking
+            // ahead of the contract; say so rather than pretend.
+            out["ok"] = false
+            out["error"] = "the hub answered unchanged for rev \(rev ?? "?")"
+            _ = emit(out)
+            return 1
+        case .success(.list(let list)):
+            out["ok"] = true
+            out["count"] = list.asks.count
+            out["recent"] = list.asks.map { ask in
+                ["id": ask.id, "title": ask.title, "words": ask.words] as [String: Any]
+            }
+            if let needle {
+                guard let pick = list.asks.first(where: { $0.id.contains(needle) }) else {
+                    return fail("no recent ask id contains \"\(needle)\"")
+                }
+                // The click's own two steps, as the view runs them: the
+                // words land in the field (empty words would leave the
+                // field alone), then a fire of those words resolves through
+                // the same FireResolve.describe every fire describes by.
+                let words = pick.words.trimmingCharacters(in: .whitespacesAndNewlines)
+                out["picked"] = [
+                    "id": pick.id,
+                    "draft": words.isEmpty ? NSNull() : words,
+                    "run": words.isEmpty ? NSNull()
+                        : FireResolve.describe(text: words, toPass: false,
+                                               settings: config.settings),
+                    "ask_first_fallback": words.isEmpty ? NSNull()
+                        : FireResolve.describe(text: words, toPass: true,
+                                               settings: config.settings),
+                ] as [String: Any]
+            }
+        }
+        return emit(out)
     }
 
     // MARK: --ask-notice (Q6)
@@ -404,6 +631,12 @@ enum AskSeams {
             "detail": row.detail,
             "age": row.ageText ?? NSNull(),
             "now_line": row.nowLine ?? NSNull(),
+            // Q12: the failed row's reason, plus `lines` -- the sub-lines the
+            // row draws under its title, in draw order, so "rendered" is a
+            // fact about the row the view draws rather than a field it
+            // merely carries. Keep in sync with AskRowView's body.
+            "reason": row.reasonLine ?? NSNull(),
+            "lines": rowLines(row),
             "unseen": row.ask.unseen,
             "open_url": row.ask.url ?? NSNull(),
             "open_enabled": row.openEnabled,
@@ -415,6 +648,22 @@ enum AskSeams {
             "last_attempt": row.lastAttempt ?? NSNull(),
             "answer_field": row.answersInline,
         ] as [String: Any]
+    }
+
+    /// The sub-lines one ask row draws under its title, in the order the
+    /// row draws them: the live line, the failed reason, the last-attempt
+    /// facts, the move line's slot (nothing here -- it is transient), and
+    /// a question's own words. AskRowView's body is the other copy of this
+    /// order; the view's comment says the same.
+    private static func rowLines(_ row: AskRowModel) -> [String] {
+        var lines: [String] = []
+        if let now = row.nowLine { lines.append(now) }
+        if let reason = row.reasonLine { lines.append(reason) }
+        if let attempt = row.lastAttempt { lines.append(attempt) }
+        if let question = row.ask.question, !question.isEmpty, row.ask.state == .question {
+            lines.append(question)
+        }
+        return lines
     }
 
     /// One move button as the seam reports it: what it does, its key, and

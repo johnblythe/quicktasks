@@ -39,6 +39,14 @@ enum FireFieldState: Equatable {
         if case .firing = self { return true }
         return false
     }
+
+    /// Q12: whether the state is a refused fire -- the one landing the
+    /// receipt must never overwrite, because the refusal is the thing on
+    /// screen worth reading.
+    var isFireFailure: Bool {
+        if case .failure = self { return true }
+        return false
+    }
 }
 
 /// What a fire's `Result` becomes on screen, and whether the panel it
@@ -114,6 +122,18 @@ struct MenuView: View {
     /// inert, exactly the way quick-fire's field is: the field owns Return
     /// and the letters, so R/E/Z can never fire a move under the typing.
     @State private var askFieldFocused = false
+    /// Q12: the receipt a successful fire from the ask field leaves under it
+    /// -- the plan's "Got it. Running. The answer will come to you here." --
+    /// carrying its Undo for as long as the undo window holds. nil at rest.
+    @State private var askReceipt: AskReceipt?
+    /// Whether the receipt's Undo is in flight, so the button cannot be
+    /// double-spent.
+    @State private var undoingReceipt = false
+    /// Q12: the recent done asks under the field ("Ask again"), newest first,
+    /// straight off `GET /asks.json?place=done`. Empty when the hub feed is
+    /// not the ask API (the file fallback has no done-list endpoint).
+    @State private var recentAsks: [Ask] = []
+    @State private var recentAsksLoading = false
     /// The id-substring the snapshot seam asked to pre-expand (`--snapshot
     /// <png> --expand <id>`), consumed by the first board that can satisfy
     /// it. Held as @State because consuming it mutates view state.
@@ -242,6 +262,9 @@ struct MenuView: View {
             // this view was installed, with a snapshot pre-expand waiting
             // on it. The onChange below covers every landing after.
             consumePreexpand()
+            // Q12: the Ask-again list, off the board that is already here
+            // or the one the poll is about to land.
+            fetchRecentAsks()
         }
         .onDisappear {
             // Whichever host just closed, it starts the next visit clean --
@@ -336,6 +359,9 @@ struct MenuView: View {
             // used to live here). Consume any pending snapshot pre-expand
             // against the fresh board; a no-op once nothing is waiting.
             consumePreexpand()
+            // And keep the Ask-again list moving with it (Q12): a done ask
+            // is newest exactly once, right after the poll that saw it.
+            fetchRecentAsks()
         }
         .onChange(of: search) { _, newValue in
             // The query changed: re-narrow the controller's current model
@@ -646,9 +672,11 @@ struct MenuView: View {
                 Image(systemName: controller.fireToPass ? "tray.and.arrow.down.fill" : "bolt.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                TextField(controller.fireToPass ? "Capture to the Pass\u{2026}"
-                                                : "Fire a quick task\u{2026}",
-                          text: $draft)
+                // Q12: the field is the ask field now -- the plan's own
+                // placeholder, one wording for both modes, because the mode
+                // control right below it is what says which of the two an
+                // Enter will do.
+                TextField("Ask for something\u{2026}", text: $draft)
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .focused($fieldFocused)
@@ -661,7 +689,8 @@ struct MenuView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
-                    .help(controller.fireToPass ? "Add to the Pass" : "Queue this task")
+                    .help(controller.fireToPass ? "Ask it (it waits for your OK)"
+                                                 : "Run it now")
                 }
             }
             if let line = fireStatusLine {
@@ -670,24 +699,87 @@ struct MenuView: View {
                     .foregroundStyle(line.isError ? Color.red : Color.secondary)
                     .lineLimit(2)
             }
+            // Q12: the receipt a successful fire leaves. Drawn here, not as
+            // a fireState success line, because it carries an Undo the
+            // 1.2-second success timer must not clear -- the undo window is
+            // minutes, not a blink, and the receipt is the only thing on the
+            // panel that can still act after the fire itself is done.
+            if let receipt = liveReceipt {
+                HStack(spacing: 6) {
+                    Text(receipt.line)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Spacer(minLength: 4)
+                    if undoingReceipt {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.6)
+                            .frame(width: 12)
+                    } else {
+                        Button("Undo", action: undoReceipt)
+                            .font(.system(size: 11))
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Color.accentColor)
+                            .help("Stop it and drop it (10-minute window)")
+                    }
+                }
+            }
             HStack(spacing: 7) {
                 // AppKit's own segmented control rather than
                 // `Picker(.segmented)`: see FireModeControl for the leak the
                 // picker caused.
                 FireModeControl(toPass: $controller.fireToPass)
                     .disabled(fireState.isFiring)
-                    .help("Run now fires it with qt, in the chip's folder. To Pass files it "
-                          + "as an item needing your go. Tab swaps the two; \u{2318}1/\u{2318}2 "
-                          + "pick one directly; \u{2318}\u{21A9} fires the other one once.")
+                    .help("Run now fires it with qt, in the chip's folder. Ask me first "
+                          + "posts it to the hub as an ask that waits for your OK "
+                          + "(an older hub gets it as a Pass item instead). Tab swaps "
+                          + "the two; \u{2318}1/\u{2318}2 pick one directly; \u{2318}\u{21A9} "
+                          + "fires the other one once.")
                 FireDirectoryChip(controller: controller)
             }
             Text("Tab swaps \u{00B7} \u{2318}\u{21A9} fires the other way")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
+            // Q12: recent done asks, one line each. A click loads the ask's
+            // own words back into the field -- re-firing is then one Enter,
+            // in whichever mode the fire is set to, rather than a blind
+            // re-run of something finished days ago.
+            if asksLive, !recentAsks.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Ask again")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                    ForEach(recentAsks.prefix(Self.recentAskCount), id: \.id) { ask in
+                        Button { askAgain(ask) } label: {
+                            HStack(spacing: 6) {
+                                Text(ask.title)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Spacer(minLength: 4)
+                                if let at = ask.finishedDate ?? ask.createdDate {
+                                    Text(shortAge(from: at))
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help("Ask this again: \(ask.words)\nClick loads the words into the field")
+                    }
+                }
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
     }
+
+    /// How many recent asks the field shows. Three: the panel is a menu, and
+    /// a recency list longer than the sections below it would be the tail
+    /// wagging the dog.
+    static let recentAskCount = 3
 
     /// The line drawn under quick-fire's field for `fireState`, nil at rest.
     /// A firing state is worded so nothing reads as done before it is
@@ -695,14 +787,32 @@ struct MenuView: View {
     /// names what happened, briefly, before clearing itself; a refused one
     /// keeps its message on screen -- in red -- until the next fire
     /// replaces it, because nothing here ever clears it on a timer.
+    ///
+    /// Q12: while a live receipt is drawing (its own row, with its Undo),
+    /// the success and idle states say nothing -- the receipt *is* the
+    /// landing line now, and "Fired: \u{2026}" right above "Got it.
+    /// Running\u{2026" would be the same fact twice. A firing or refused
+    /// state still wins: the receipt describes the last fire, not the one
+    /// in flight.
     private var fireStatusLine: (text: String, isError: Bool)? {
+        if liveReceipt != nil, !fireState.isFiring, !fireState.isFireFailure {
+            return nil
+        }
         switch fireState {
         case .idle: return nil
         case .firing(let toPass):
-            return (toPass ? "Sending to the Pass\u{2026}" : "Firing\u{2026}", false)
+            return (toPass ? "Asking\u{2026}" : "Firing\u{2026}", false)
         case .success(let text): return (text, false)
         case .failure(let message): return (message, true)
         }
+    }
+
+    /// The receipt currently worth drawing: one exists, and its undo window
+    /// has not lapsed. `controller.now` ticks, so a receipt past its window
+    /// leaves the screen on its own.
+    private var liveReceipt: AskReceipt? {
+        guard let askReceipt, askReceipt.undoable(now: controller.now) else { return nil }
+        return askReceipt
     }
 
     /// The quick-search field. Narrows every section at once, including the
@@ -791,6 +901,9 @@ struct MenuView: View {
                 .keyboardShortcut("2", modifiers: .command)
             Button("", action: fireOtherMode)
                 .keyboardShortcut(.return, modifiers: .command)
+            // Q11 (slice 5) lands Remind me here: an .option-modifier
+            // return button in this same zero-sized stack, posting
+            // mode "remind". Nothing to wire yet -- the seam stays open.
         }
         .opacity(0)
         .frame(width: 0, height: 0)
@@ -1047,34 +1160,173 @@ struct MenuView: View {
     /// To Pass ignores `--in`/`@` outright: the raw, unstripped text goes to
     /// `/capture`, matching `FireResolve.describe`'s own rule that the
     /// directory convention is a Run-now-only thing.
+    ///
+    /// Q12: the second mode is Ask me first. It POSTs `/asks` with
+    /// `{text, mode: "ask_first", door, dir}` -- the prefix parsed and
+    /// stripped, the resolved directory sent along -- and a hub that answers
+    /// 501/404 (creation not built yet, or a hub that predates the route)
+    /// gets today's `/capture` To-Pass path with the raw unstripped text
+    /// instead, byte for byte. Run now is exactly the fire it has always
+    /// been; what it leaves behind is new -- the receipt, with its Undo.
     private func fire(rawText: String, toPass: Bool) {
         fireState = .firing(toPass: toPass)
+        // A new fire supersedes whatever the last one left: the receipt's
+        // Undo belongs to the words on screen, not the words before them.
+        askReceipt = nil
         // The standalone summon panel is the only host that ever closes
         // itself on a successful fire; the real dropdown never does. This
         // is the same "am I the panel" signal `clearDraft()` already uses
         // for Escape.
         let isPanel = onEscapeExhausted != nil
+        let (prefixDir, stripped) = FireResolve.parsePrefix(rawText)
+        let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: controller.settings)
         if toPass {
             let base = controller.passBase
-            controller.perform(key: "capture", { Actions.capture(text: rawText, base: base) }) { outcome in
-                let (state, hidesPanel) = FireFieldOutcome.describe(
-                    result: outcome, toPass: true, displayText: rawText, isPanel: isPanel)
+            // The outcome travels as "route:id" -- perform's report closure
+            // is typed for a plain String, and the two facts the landing
+            // needs (which route, which id) are exactly these.
+            controller.perform(key: "askFirst", {
+                Actions.askFirst(text: stripped, rawText: rawText,
+                                 dir: resolved.url, base: base).map { "\($0.route):\($0.id ?? "")" }
+            }) { outcome in
+                let (state, hidesPanel): (FireFieldState, Bool)
+                switch outcome {
+                case .failure(let problem):
+                    (state, hidesPanel) = (.failure(problem.message), false)
+                case .success(let tag) where tag.hasPrefix("asks:"):
+                    let id = String(tag.dropFirst("asks:".count))
+                    landReceipt(AskReceipt(kind: .askFirst, words: stripped,
+                                           firedAt: Date(), askID: id.isEmpty ? nil : id))
+                    (state, hidesPanel) = (.success(AskReceipt.askFirstLine), isPanel)
+                case .success(let tag) where tag.hasPrefix("capture:"):
+                    // The fallback leg lands exactly as the To-Pass fire
+                    // always did -- same wording, same panel decision -- so
+                    // an older hub changes nothing about what John sees.
+                    let captured = String(tag.dropFirst("capture:".count))
+                    (state, hidesPanel) = FireFieldOutcome.describe(
+                        result: .success(captured), toPass: true,
+                        displayText: rawText, isPanel: isPanel)
+                case .success:
+                    (state, hidesPanel) = (.failure("the ask came back unlabelled"), false)
+                }
                 postFireOutcome(state)
                 settle(state, hidesPanel: hidesPanel)
             }
         } else {
-            let (prefixDir, stripped) = FireResolve.parsePrefix(rawText)
-            let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: controller.settings)
             controller.perform(key: "fire", {
                 Actions.fire(prompt: stripped, in: resolved.url,
                             origin: isPanel ? "summon" : "widget").map { "" }
             }) { outcome in
+                if case .success = outcome {
+                    landReceipt(AskReceipt(kind: .runNow, words: stripped,
+                                           firedAt: Date(), askID: nil))
+                }
                 let (state, hidesPanel) = FireFieldOutcome.describe(
                     result: outcome, toPass: false, displayText: stripped, isPanel: isPanel)
                 postFireOutcome(state)
                 settle(state, hidesPanel: hidesPanel)
             }
         }
+    }
+
+    /// Lands a fire's receipt: holds it for the undo window, and gets the
+    /// board and the Ask-again list moving so both reflect the fire that
+    /// just happened (the controller's own post-action refresh covers the
+    /// board; the recents are the field's own fetch).
+    private func landReceipt(_ receipt: AskReceipt) {
+        askReceipt = receipt
+        controller.refreshAsks()
+        fetchRecentAsks()
+    }
+
+    /// The receipt's Undo (Q12): stop the run if one is live, then drop the
+    /// ask. For a Run-now receipt the ask id is resolved off the board at
+    /// click time -- the fire knew no id, only the words -- so the board is
+    /// read first; an Ask-me-first receipt already carries the id its POST
+    /// created. The drop is skipped when no hub is configured (the file
+    /// fallback has no move route), and the outcome says what happened in
+    /// either case.
+    private func undoReceipt() {
+        guard let receipt = liveReceipt, !undoingReceipt else { return }
+        let board = controller.askBoard
+        let id = receipt.askID
+            ?? board.flatMap { AskReceipt.resolveAskID(in: $0.rows.map(\.ask), words: receipt.words) }
+        guard let id else {
+            controller.post(kind: .error,
+                            title: "Cannot undo",
+                            detail: "The fired ask is not on the board to stop.")
+            return
+        }
+        // Nothing to stop unless the board says the ask is still running or
+        // queued -- an Ask-me-first ask never ran, and a Run-now ask that
+        // already finished has nothing stoppable left.
+        let running = board?.row(id: id)
+            .map { $0.ask.state == .working || $0.ask.state == .heard } ?? false
+        undoingReceipt = true
+        let base = askClientBase()
+        DispatchQueue.global(qos: .userInitiated).async {
+            var stopMessage: String?
+            if running {
+                switch Actions.stopQtTask(askID: id) {
+                case .success: break
+                case .failure(let problem): stopMessage = problem.message
+                }
+            }
+            var dropMessage: String?
+            var dropped = false
+            if let base {
+                let result = AskClient(base: base).post(id: id, move: "drop")
+                dropped = result.ok
+                if !result.ok { dropMessage = result.message }
+            }
+            DispatchQueue.main.async {
+                undoingReceipt = false
+                if stopMessage == nil, dropMessage == nil {
+                    askReceipt = nil
+                    // "stopped and dropped" only when both halves ran; with
+                    // no hub to drop against, stopping is the whole undo.
+                    controller.post(kind: .info,
+                                    title: dropped ? "Undone: stopped and dropped" : "Undone")
+                } else {
+                    controller.post(kind: .error, title: "Undo did not finish",
+                                    detail: [stopMessage, dropMessage]
+                                        .compactMap { $0 }.joined(separator: " \u{00B7} "))
+                }
+                controller.refreshAsks()
+            }
+        }
+    }
+
+    /// Q12: the Ask-again list -- recent done asks, newest first, straight
+    /// off the hub (`place=done` pages newest first per 1.6). Fetched when a
+    /// board appears and after every successful fire, never from a `body`
+    /// read. The file fallback has no done-list endpoint, so there is
+    /// nothing to fetch when the feed is not the ask API.
+    private func fetchRecentAsks() {
+        guard controller.askFeed?.source == .asks,
+              let base = askClientBase(), !recentAsksLoading else { return }
+        recentAsksLoading = true
+        DispatchQueue.global(qos: .utility).async {
+            let result = AskClient(base: base).list(place: "done", limit: 8)
+            DispatchQueue.main.async {
+                recentAsksLoading = false
+                if case .success(.list(let list)) = result {
+                    recentAsks = list.asks
+                }
+            }
+        }
+    }
+
+    /// A click on an Ask-again row: the ask's own words land in the field
+    /// and the field takes focus, so re-firing a recent ask's words is one
+    /// more Enter -- in whichever mode the fire is set to -- rather than a
+    /// blind re-run fired from a row John only meant to read.
+    private func askAgain(_ ask: Ask) {
+        let words = ask.words.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty else { return }
+        draft = words
+        fireState = .idle
+        focusQuickFireField()
     }
 
     /// Quick-fire posts to the shared outcome queue in addition to its own
@@ -2170,6 +2422,22 @@ struct TaskRow: View {
 
 // MARK: - one ask row (Q3)
 
+/// Q12: the plain-words reason a failed row carries under its title -- the
+/// hub's `reason` field, one sentence, shown only where the plan pins it
+/// ("failed rows show reason"). A reason on any other state is the hub
+/// speaking ahead of its own table (blocked rows show their tool chips,
+/// working rows their live line), so those keep quiet rather than drawing a
+/// stale verdict. An extension rather than a field on AskRowModel so the
+/// view and the `--ask-dump-rows` seam read one definition.
+extension AskRowModel {
+    var reasonLine: String? {
+        guard ask.state == .failed,
+              let reason = ask.reason?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !reason.isEmpty else { return nil }
+        return reason
+    }
+}
+
 /// An ask section's header. Not a toggle: slice 1 has no collapsed ask
 /// sections, because the three sections are short by construction (the hub's
 /// default list excludes done, and unseen answers leave "New for you" the
@@ -2302,6 +2570,20 @@ struct AskRowView: View {
                     .padding(.leading, 27)
                     .padding(.bottom, 3)
             }
+            // Q12: the failed row's reason, one line under the title --
+            // "Ran out of time after 30 minutes.", in the hub's own words.
+            // Draw order (now_line, reason, last attempt, move line,
+            // question) is the same order the `--ask-dump-rows` seam reports
+            // as `lines`, so the two cannot disagree about what a row shows.
+            if let reason = row.reasonLine {
+                Text(reason)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .padding(.leading, 27)
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 3)
+            }
             if let attempt = row.lastAttempt {
                 Text(attempt)
                     .font(.system(size: 10))
@@ -2421,6 +2703,15 @@ struct AskRowView: View {
     /// way out named.
     private var peek: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // Q12: a failed row's peek opens on the reason -- the mockup's
+            // "why" line -- before whatever text the run did produce, so the
+            // first thing read under a Failed chip is what went wrong.
+            if let reason = row.reasonLine {
+                Text(reason)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if loading {
                 HStack(spacing: 6) {
                     ProgressView()
@@ -2520,8 +2811,8 @@ struct FooterButton: View {
     }
 }
 
-/// Run now / To Pass: an NSSegmentedControl with plain string labels, bound
-/// to `StatusController.fireToPass`.
+/// Run now / Ask me first: an NSSegmentedControl with plain string labels,
+/// bound to `StatusController.fireToPass`.
 ///
 /// This used to be SwiftUI's `Picker(.segmented)`. On macOS 26 that picker
 /// hosts each segment's label in a nested SwiftUI graph, and AppKit sizes
@@ -2539,7 +2830,11 @@ struct FireModeControl: NSViewRepresentable {
     @Binding var toPass: Bool
 
     func makeNSView(context: Context) -> NSSegmentedControl {
-        let control = NSSegmentedControl(labels: ["Run now", "To Pass"],
+        // Q12: the second mode is Ask me first -- the same one-shot slot To
+        // Pass held, now POSTing /asks (contract 1.6) with today's /capture
+        // as the fallback on hubs that have not built it. String labels for
+        // the leak reason above; nothing pins them but this line.
+        let control = NSSegmentedControl(labels: ["Run now", "Ask me first"],
                                          trackingMode: .selectOne,
                                          target: context.coordinator,
                                          action: #selector(Coordinator.changed(_:)))

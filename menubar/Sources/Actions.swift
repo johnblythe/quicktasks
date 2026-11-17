@@ -236,6 +236,103 @@ enum Actions {
         PassClient(base: base).capture(text: text)
     }
 
+    // MARK: - asks (Q12)
+
+    /// What one Ask-me-first send came back as: which of the two routes took
+    /// it, and the id that route assigned.
+    enum AskFirstOutcome: Equatable {
+        /// POST /asks answered (201): the ask the hub created, waiting for
+        /// John's go.
+        case posted(askID: String?)
+        /// This hub has not built POST /asks yet -- a 501 (the move table's
+        /// "registered but not built" answer creation gives today) or a 404
+        /// (a hub that predates the route) -- and today's /capture To-Pass
+        /// path took it instead, exactly as the plan's fallback says.
+        case fellBack(capturedID: String?)
+
+        /// One word for the seam and the outcome queue: which route took it.
+        var route: String {
+            if case .posted = self { return "asks" }
+            return "capture"
+        }
+
+        /// The id the route that took it assigned -- the ask POST /asks
+        /// created, or the item /capture filed.
+        var id: String? {
+            switch self {
+            case .posted(let askID): return askID
+            case .fellBack(let capturedID): return capturedID
+            }
+        }
+    }
+
+    /// ⌘⏎ Ask me first: `POST /asks {text, mode: "ask_first", door, dir}`
+    /// (contract 1.6). The text arrives already stripped of its `--in`/`@`
+    /// prefix and `dir` is the directory that prefix (or the chip) resolved
+    /// to -- the same directory a Run-now fire of the same words would use,
+    /// which is the whole point of sending it along.
+    ///
+    /// On 501/404 the send falls back to today's `/capture` To-Pass path
+    /// with the raw, unstripped text -- To Pass has always ignored the
+    /// prefix, and the fallback is meant to be byte-for-byte the old mode,
+    /// not a near copy of it. Any other refusal is a real failure and is
+    /// reported as one rather than retried against /capture, the same line
+    /// `decide`'s own 404-only fallback draws.
+    static func askFirst(text: String, rawText: String, dir: URL?,
+                         base: URL) -> Result<AskFirstOutcome, Problem> {
+        let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stripped.isEmpty else { return .failure("nothing to ask") }
+        guard let body = try? JSONSerialization.data(
+                withJSONObject: FireResolve.askFirstBody(text: stripped, dir: dir)) else {
+            return .failure("the ask body is not JSON")
+        }
+        var request = URLRequest(url: base.appendingPathComponent("asks"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        request.timeoutInterval = 8
+        // AskClient's transport, not PassClient's: a refusal's status code is
+        // the thing this caller branches on, and PassClient's throws it away.
+        switch AskClient.send(request, timeout: 8) {
+        case .success(let reply):
+            let obj = (try? JSONSerialization.jsonObject(with: reply.data)) as? [String: Any]
+            let id = (obj?["ask"] as? [String: Any])?["id"] as? String
+            return .success(.posted(askID: id))
+        case .failure(let failure) where failure.code == 501 || failure.code == 404:
+            switch PassClient(base: base).capture(text: rawText) {
+            case .failure(let problem): return .failure(problem)
+            case .success(let capturedID): return .success(.fellBack(capturedID: capturedID))
+            }
+        case .failure(let failure):
+            return .failure(failure.problem)
+        }
+    }
+
+    /// The receipt's Undo, first half: `qt stop <tid>` -- kill the run, mark
+    /// the task "Stopped by you". Waits for exit because stop is a quick,
+    /// bounded verb and the drop that follows wants to know it took (a drop
+    /// against a still-running ask is a 409 the hub is right to send). Only
+    /// ever called off the main thread.
+    @discardableResult
+    static func stopQtTask(askID: String) -> Result<Void, Problem> {
+        let tid = AskReceipt.qtTaskID(forAskID: askID)
+        guard !tid.isEmpty else { return .failure("no task id to stop") }
+        guard let qt = qtBinary() else {
+            return .failure("qt not found; run install.sh")
+        }
+        let p = Process()
+        p.executableURL = qt
+        p.arguments = ["stop", tid]
+        p.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        do {
+            try p.run()
+            p.waitUntilExit()
+        } catch {
+            return .failure("could not run qt stop: \(error.localizedDescription)")
+        }
+        return .success(())
+    }
+
     /// Posts one verdict for a verify row, in the same shape the review page's
     /// Save button posts. Any decision already sitting unreconciled in
     /// hub/decisions.json rides along, because serve.py overwrites that file
