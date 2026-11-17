@@ -143,6 +143,7 @@ class ResumePromptEndToEndTests(unittest.TestCase):
     def _run_qt(self, resume_args, hub_dir=None, extra_env=None):
         env = dict(os.environ)
         env["QT_DATA"] = str(self.qt_data)
+        env["QT_LABEL_REFINE"] = "0"
         env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
         env["FAKE_CLAUDE_ARGV_LOG"] = str(self.argv_log)
         env.setdefault("FAKE_CLAUDE_JSON",
@@ -345,6 +346,7 @@ class ResumePromptEndToEndTests(unittest.TestCase):
 
         env = dict(os.environ)
         env["QT_DATA"] = str(self.qt_data)
+        env["QT_LABEL_REFINE"] = "0"
         env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
         env["FAKE_CLAUDE_ARGV_LOG"] = str(self.argv_log)
         env["FAKE_CLAUDE_JSON"] = json.dumps({"result": "ok", "session_id": "sess-new"})
