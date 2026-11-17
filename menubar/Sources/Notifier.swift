@@ -6,6 +6,18 @@
 // regardless of that toggle -- they replace the Python paths' own
 // osascript/terminal-notifier banners, which never knew the toggle existed.
 //
+// Q6 (asks, slice 2) adds the banner that carries the answer: the hub's
+// bell drops a v2 payload (NotifyInbox.swift) naming the ask, and the
+// notice it becomes gets its own category per bell kind -- ask.answer,
+// ask.failed, ask.blocked, ask.question, ask.receipt, ask.reminder -- with
+// the actions that answer in place: text-input follow-ups and answers,
+// Copy, Open, Try again / Change it…, Allow once / Always allow / Skip.
+// Only the sounding kinds (failed, blocked, question, reminder) may set
+// `sound`, and sound is what buys the time-sensitive interruption level;
+// a quiet answer is a passive banner. Every ask action routes through the
+// one pure `AskNoticeRoute` so the delegate, StatusController, and the
+// `--ask-notice` seam cannot drift apart.
+//
 // Everything posts through this one protocol so a test can inject a
 // recorder and prove what *would* have gone to Notification Center without
 // ever touching the real thing -- required reading for anyone tempted to
@@ -28,6 +40,14 @@ struct Notice {
         case blocked = "QT_BLOCKED"    // Resume / Always allow / Open in Pass
         case blockedNoAllow = "QT_BLOCKED_NOALLOW" // Resume / Open in Pass
         case outcome = "QT_OUTCOME"    // Open in Pass
+        // Q6: one category per bell kind (plan 1.8), so the banner's
+        // buttons are the ones that answer carries.
+        case askAnswer = "ask.answer"
+        case askFailed = "ask.failed"
+        case askBlocked = "ask.blocked"
+        case askQuestion = "ask.question"
+        case askReceipt = "ask.receipt"
+        case askReminder = "ask.reminder"
     }
 
     /// Action identifiers, shared by category registration and the delegate.
@@ -35,6 +55,18 @@ struct Notice {
         case resume = "QT_RESUME"
         case allow = "QT_ALLOW"
         case openPass = "QT_OPEN_PASS"
+        // Q6: ask banner actions. `copy` and `open` are client-only (no
+        // route, section 1.2); every other one is a 1.6 move the
+        // controller POSTs through AskClient.
+        case askFollowUp = "QT_ASK_FOLLOW_UP"          // text input -> follow_up
+        case askAnswer = "QT_ASK_ANSWER"               // text input -> follow_up
+        case askCopy = "QT_ASK_COPY"
+        case askOpen = "QT_ASK_OPEN"
+        case askRetry = "QT_ASK_RETRY"
+        case askRetryChanges = "QT_ASK_RETRY_CHANGES"  // text input -> retry_with_changes
+        case askAllowOnce = "QT_ASK_ALLOW_ONCE"
+        case askAllowAlways = "QT_ASK_ALLOW_ALWAYS"
+        case askSkip = "QT_ASK_SKIP"
     }
 
     let id: String
@@ -55,6 +87,107 @@ struct Notice {
     /// the caller had no denial detail (poll-detected blocks), and the
     /// category should be .blockedNoAllow so no dead button shows.
     var allowTools: [String] = []
+    /// Q6: this banner may interrupt -- a sound plus the time-sensitive
+    /// interruption level. Only the sounding kinds ever set it (the bell
+    /// decides; toNotice enforces the ceiling), so an answer or a receipt
+    /// is always a passive banner that waits to be noticed.
+    var sound: Bool = false
+    /// Q6: the ask this banner is about, when it is an ask banner (a v2
+    /// bell payload). Carries the click-through: a click reveals the ask's
+    /// row and posts `seen`, and every action POSTs its move to this id.
+    var askID: String? = nil
+}
+
+/// One ask banner action as the plan words it: the identifier, the button
+/// title, and whether the button opens a text input. The table is the one
+/// source both the category registration and the `--ask-notice` seam read,
+/// so what a test prints is what Notification Center shows.
+struct AskBannerAction: Equatable {
+    let action: Notice.Action
+    let title: String
+    let textInput: Bool
+}
+
+/// The ask categories' action lists in banner order (Q6). Fixed by the
+/// plan: answer = Follow up… (text input), Copy, Open; failed = Try again,
+/// Change it… (text input), Open; blocked = Allow once, Always allow, Skip
+/// that step; question = Answer… (text input); receipt and reminder carry
+/// no actions.
+enum AskNotice {
+    static let actions: [Notice.Category: [AskBannerAction]] = [
+        .askAnswer: [
+            AskBannerAction(action: .askFollowUp, title: "Follow up\u{2026}", textInput: true),
+            AskBannerAction(action: .askCopy, title: "Copy", textInput: false),
+            AskBannerAction(action: .askOpen, title: "Open", textInput: false),
+        ],
+        .askFailed: [
+            AskBannerAction(action: .askRetry, title: "Try again", textInput: false),
+            AskBannerAction(action: .askRetryChanges, title: "Change it\u{2026}", textInput: true),
+            AskBannerAction(action: .askOpen, title: "Open", textInput: false),
+        ],
+        .askBlocked: [
+            AskBannerAction(action: .askAllowOnce, title: "Allow once", textInput: false),
+            AskBannerAction(action: .askAllowAlways, title: "Always allow", textInput: false),
+            AskBannerAction(action: .askSkip, title: "Skip that step", textInput: false),
+        ],
+        .askQuestion: [
+            AskBannerAction(action: .askAnswer, title: "Answer\u{2026}", textInput: true),
+        ],
+        .askReceipt: [],
+        .askReminder: [],
+    ]
+}
+
+/// What tapping an ask banner (or clicking it) becomes -- pure, so the
+/// delegate, StatusController, and the `--ask-notice` seam all route the
+/// same action the same way. `.move` is a 1.6 move with its JSON body (the
+/// typed text for the text-input actions); `.copy` and `.open` are
+/// client-only; `.click` is the banner's own click-through (reveal the row,
+/// post `seen`).
+enum AskNoticeRoute: Equatable {
+    case click(id: String)
+    case move(id: String, move: String, body: [String: String])
+    case copy(text: String)
+    case open(url: String)
+    case none
+
+    /// `actionID` is the UNNotificationResponse's actionIdentifier (the
+    /// default-action identifier maps to `.click`). `askID` nil or empty
+    /// means the banner was not an ask banner: `.none`.
+    static func route(actionID: String,
+                      askID: String?,
+                      typedText: String,
+                      body: String?,
+                      url: String?) -> AskNoticeRoute {
+        guard let askID, !askID.isEmpty else { return .none }
+        func move(_ name: String, _ body: [String: String] = [:]) -> AskNoticeRoute {
+            .move(id: askID, move: name, body: body)
+        }
+        switch actionID {
+        case Notice.Action.askFollowUp.rawValue:
+            return move("follow_up", ["text": typedText])
+        case Notice.Action.askAnswer.rawValue:
+            return move("follow_up", ["text": typedText])
+        case Notice.Action.askRetryChanges.rawValue:
+            return move("retry_with_changes", ["prompt": typedText])
+        case Notice.Action.askRetry.rawValue:
+            return move("retry")
+        case Notice.Action.askAllowOnce.rawValue:
+            return move("allow_once")
+        case Notice.Action.askAllowAlways.rawValue:
+            return move("allow_always")
+        case Notice.Action.askSkip.rawValue:
+            return move("skip")
+        case Notice.Action.askCopy.rawValue:
+            return .copy(text: body ?? "")
+        case Notice.Action.askOpen.rawValue:
+            return url.map { .open(url: $0) } ?? .none
+        case UNNotificationDefaultActionIdentifier:
+            return .click(id: askID)
+        default:
+            return .none
+        }
+    }
 }
 
 protocol Notifier: AnyObject {
@@ -92,6 +225,13 @@ final class SystemNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate
     /// Banner click on a notice that names a task: StatusController wires
     /// this to revealRecord (open the panel, highlight + expand the row).
     var onOpenRecord: ((String) -> Void)?
+    /// An ask banner's action or click, as the pure AskNoticeRoute that
+    /// describes it (Q6). StatusController wires this to handleAskRoute:
+    /// move POSTs through AskClient, the copy, the open, and the
+    /// reveal-and-seen click. The delegate stays transport-only -- the
+    /// same rule the Python producers follow, kept: producers describe
+    /// *what happened*, the app decides how a click is carried out.
+    var onAskRoute: ((AskNoticeRoute) -> Void)?
 
     override init() {
         super.init()
@@ -103,14 +243,35 @@ final class SystemNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate
                                          title: "Always Allow Tool", options: [])
         let openPass = UNNotificationAction(identifier: Notice.Action.openPass.rawValue,
                                             title: "Open in Pass", options: [])
-        center.setNotificationCategories([
+        var categories: [UNNotificationCategory] = [
             UNNotificationCategory(identifier: Notice.Category.blocked.rawValue,
                                    actions: [resume, allow, openPass], intentIdentifiers: []),
             UNNotificationCategory(identifier: Notice.Category.blockedNoAllow.rawValue,
                                    actions: [resume, openPass], intentIdentifiers: []),
             UNNotificationCategory(identifier: Notice.Category.outcome.rawValue,
                                    actions: [openPass], intentIdentifiers: []),
-        ])
+        ]
+        // The ask categories (Q6), built from the one table the seam also
+        // reads, so a registered banner and a printed one cannot drift.
+        // The text-input actions are UNTextInputNotificationAction: the
+        // system's own inline reply box, whose text rides the response.
+        for (category, actions) in AskNotice.actions {
+            let registered = actions.map { action -> UNNotificationAction in
+                if action.textInput {
+                    return UNTextInputNotificationAction(
+                        identifier: action.action.rawValue,
+                        title: action.title, options: [],
+                        textInputButtonTitle: action.title,
+                        textInputPlaceholder: "Type your reply")
+                }
+                return UNNotificationAction(identifier: action.action.rawValue,
+                                            title: action.title, options: [])
+            }
+            categories.append(UNNotificationCategory(identifier: category.rawValue,
+                                                     actions: registered,
+                                                     intentIdentifiers: []))
+        }
+        center.setNotificationCategories(Set(categories))
     }
 
     func requestAuthorizationIfNeeded() {
@@ -133,11 +294,19 @@ final class SystemNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate
         if notice.category != .plain {
             content.categoryIdentifier = notice.category.rawValue
         }
+        if notice.sound {
+            // Sound is what the bell buys for the sounding kinds only
+            // (1.8); with it comes the interruption level, so a failure
+            // can break through Focus while an answer waits its turn.
+            content.sound = .default
+            content.interruptionLevel = .timeSensitive
+        }
         var info: [String: Any] = ["category": notice.category.rawValue]
         if let resumeURL = notice.resumeURL { info["resumeURL"] = resumeURL }
         if let passURL = notice.passURL { info["passURL"] = passURL }
         if let taskID = notice.taskID { info["taskID"] = taskID }
         if !notice.allowTools.isEmpty { info["allowTools"] = notice.allowTools }
+        if let askID = notice.askID { info["askID"] = askID }
         content.userInfo = info
         let request = UNNotificationRequest(identifier: notice.id,
                                             content: content,
@@ -177,6 +346,23 @@ final class SystemNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate
         case Notice.Action.openPass.rawValue:
             openPass(info)
         default:
+            // Ask banners route first (Q6): every action, and the plain
+            // click itself, becomes one AskNoticeRoute off the same pure
+            // table the seam prints. A dismissal or an unknown identifier
+            // routes to .none and stops here.
+            if let askID = info["askID"] as? String {
+                let typed = (response as? UNTextInputNotificationResponse)?.userText ?? ""
+                let route = AskNoticeRoute.route(
+                    actionID: response.actionIdentifier,
+                    askID: askID,
+                    typedText: typed,
+                    body: response.notification.request.content.body,
+                    url: info["passURL"] as? String)
+                if case .none = route { break }
+                DispatchQueue.main.async { [weak self] in self?.onAskRoute?(route) }
+                completionHandler()
+                return
+            }
             // Only the actual banner click routes anywhere; a dismissal
             // (or any future system identifier) must not pop the panel
             // open (2026-11-03 review).
