@@ -173,7 +173,7 @@ class ResumePromptEndToEndTests(unittest.TestCase):
         self.assertIn("-p", argv)
         self.assertEqual(argv[argv.index("-p") + 1], "continue please")
         self.assertIn("--output-format", argv)
-        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+        self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
         self.assertIn("--resume", argv)
         self.assertEqual(argv[argv.index("--resume") + 1], "sess-orig")
         self.assertIn("--settings", argv)
