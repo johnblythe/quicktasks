@@ -251,10 +251,11 @@ class TestExpandedSnapshot(RowsCase):
         return struct.unpack(">II", data[16:24])
 
     def png_scale(self, width):
-        """Backing-store scale: the render is 352 logical points wide, drawn
-        at 1x or 2x depending on the screen cacheDisplay borrowed."""
-        self.assertIn(width, (352, 704))
-        return width // 352
+        """Backing-store scale: the render is 480 logical points wide (the
+        2026-11-19 readability pass widened the panel from 352), drawn at
+        1x or 2x depending on the screen cacheDisplay borrowed."""
+        self.assertIn(width, (480, 960))
+        return width // 480
 
     def test_expand_renders_the_answer_off_screen(self):
         row = ask_row("qt-new", state="answer", unseen=True)

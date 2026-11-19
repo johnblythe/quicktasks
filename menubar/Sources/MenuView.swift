@@ -185,14 +185,16 @@ struct MenuView: View {
     /// the one behaviour a floating window needs that a dropdown does not.
     var onEscapeExhausted: (() -> Void)? = nil
 
-    /// Wider than v1's 320: a verify row carries report, accept, redo, reject,
-    /// and resume, and the title still has to be readable next to them.
-    /// Shared with --snapshot so the render is the real panel width.
-    static let panelWidth: CGFloat = 352
+    /// Wider than v1's 320 and v2's 352: the ask rows carry move buttons in
+    /// their tail, and at 352 every title truncated two words in and the
+    /// buttons crowded the text. 480 gives a real row a full sentence and
+    /// the buttons room to breathe. Shared with --snapshot so the render is
+    /// the real panel width.
+    static let panelWidth: CGFloat = 480
 
     /// Tallest the row list may get before it scrolls, so a long history
     /// cannot grow the panel off the bottom of the screen.
-    static let listMaxHeight: CGFloat = 320
+    static let listMaxHeight: CGFloat = 460
 
     /// Measured height of the row list's content, reported up from a
     /// GeometryReader behind it.
@@ -859,7 +861,7 @@ struct MenuView: View {
                 FireDirectoryChip(controller: controller)
             }
             Text("Tab swaps \u{00B7} \u{2318}\u{21A9} fires the other way")
-                .font(.system(size: 10))
+                .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
             // Q12: recent done asks, one line each. A click loads the ask's
             // own words back into the field -- re-firing is then one Enter,
@@ -868,20 +870,22 @@ struct MenuView: View {
             if asksLive, !recentAsks.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Ask again")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.tertiary)
                     ForEach(recentAsks.prefix(Self.recentAskCount), id: \.id) { ask in
                         Button { askAgain(ask) } label: {
                             HStack(spacing: 6) {
                                 Text(ask.title)
-                                    .font(.system(size: 11))
+                                    .font(.system(size: 12))
                                     .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                                    .lineLimit(2)
                                     .truncationMode(.tail)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .multilineTextAlignment(.leading)
                                 Spacer(minLength: 4)
                                 if let at = ask.finishedDate ?? ask.createdDate {
                                     Text(shortAge(from: at))
-                                        .font(.system(size: 10))
+                                        .font(.system(size: 11))
                                         .foregroundStyle(.tertiary)
                                 }
                             }
@@ -892,8 +896,8 @@ struct MenuView: View {
                 }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
     }
 
     /// How many recent asks the field shows. Three: the panel is a menu, and
@@ -963,8 +967,8 @@ struct MenuView: View {
                 searchFocused = false
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
         .help("Matches on title, status, reason, and source. Escape clears it.")
     }
 
@@ -996,8 +1000,8 @@ struct MenuView: View {
                 closeFind()
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
         .help("Searches every ask ever -- done and archived included -- through "
               + "the hub. \u{23CE} opens the first result; the eye reads one in place.")
     }
@@ -1009,7 +1013,7 @@ struct MenuView: View {
                     .fill(headerDot)
                     .frame(width: 8, height: 8)
                 Text(headerHeadline)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
                 Spacer(minLength: 6)
                 FooterButton(icon: searching ? "magnifyingglass.circle.fill" : "magnifyingglass",
@@ -1023,14 +1027,14 @@ struct MenuView: View {
             // themselves are collapsed or scrolled out of sight.
             if let preview = headerPreviewText {
                 Text(preview)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
         .help(groupsTooltip)
     }
 
@@ -1096,8 +1100,11 @@ struct MenuView: View {
 
     private var headerDot: Color {
         if let board = liveAskBoard {
-            if board.badge > 0 { return .orange }
-            if board.counts.working > 0 { return .green }
+            // The desk palette (AskStateColor): amber when something waits
+            // on John, teal when the bot is at work -- the header previews
+            // the same colours the rows carry.
+            if board.badge > 0 { return AskStateColor.amber }
+            if board.counts.working > 0 { return AskStateColor.teal }
             return .secondary.opacity(0.5)
         }
         return Color(StatusPalette.color(for: controller.model.aggregate))
@@ -2857,7 +2864,7 @@ struct TaskRow: View {
                         note = ""
                     }
                 }
-                .padding(.leading, 27)
+                .padding(.leading, 31)
                 .padding(.trailing, 12)
                 .padding(.bottom, 6)
             }
@@ -2902,7 +2909,7 @@ struct TaskRow: View {
             .buttonStyle(.plain)
             .foregroundStyle(Color.accentColor)
         }
-        .padding(.leading, 27)
+        .padding(.leading, 31)
         .padding(.trailing, 12)
         .padding(.bottom, 7)
     }
@@ -3009,23 +3016,38 @@ struct AskSectionHeader: View {
     let section: AskSection
     let count: Int
 
+    /// The section's theme colour -- the same one its rows' state dots
+    /// carry, so the header previews what the rows below it mean.
+    private var tint: Color {
+        switch section {
+        case .newForYou: return AskStateColor.green
+        case .needsYou: return AskStateColor.amber
+        case .working: return AskStateColor.teal
+        }
+    }
+
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 7) {
             if section == .newForYou {
                 Image(systemName: "sparkle")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 10))
+                    .foregroundStyle(tint)
+            } else {
+                Circle()
+                    .fill(tint)
+                    .frame(width: 6, height: 6)
             }
             Text(section.label)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 8)
             Text("\(count)")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
+                .monospacedDigit()
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
         .help(section == .newForYou
               ? "Answers you have not read yet. Expanding one clears it from the count."
@@ -3039,6 +3061,17 @@ struct AskSectionHeader: View {
 /// list (Q9), so a row offers exactly what the server says it can do. The
 /// keyboard highlight and the peek panel are the same affordances the legacy
 /// TaskRow has, so the two menus still feel like one widget.
+/// The desk's own state colours (desk.css's token block): the menubar and
+/// the desk read the same ask states, so the same colour means the same
+/// thing on both surfaces. Amber a decision waiting, teal the bot at work,
+/// green a good outcome, red a failure.
+enum AskStateColor {
+    static let amber = Color(red: 0.722, green: 0.278, blue: 0.039)  // #b8470a
+    static let teal = Color(red: 0.078, green: 0.408, blue: 0.439)   // #146870
+    static let green = Color(red: 0.184, green: 0.376, blue: 0.157)  // #2f6028
+    static let red = Color(red: 0.659, green: 0.161, blue: 0.039)    // #a8290a
+}
+
 struct AskRowView: View {
     let row: AskRowModel
     var highlighted: Bool = false
@@ -3071,7 +3104,7 @@ struct AskRowView: View {
     /// The peek's answer area: tall enough to read a real answer, short
     /// enough that a long one scrolls inside the row instead of growing the
     /// menu off the screen -- "clipped scroll, max height".
-    static let expandMaxHeight: CGFloat = 170
+    static let expandMaxHeight: CGFloat = 220
 
     @State private var hovering = false
     @State private var answerDraft = ""
@@ -3086,21 +3119,29 @@ struct AskRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
+            HStack(spacing: 9) {
                 Circle()
                     .fill(dotColor)
-                    .frame(width: 7, height: 7)
+                    .frame(width: 8, height: 8)
                 Button(action: onTitle) {
                     Text(row.title)
-                        .font(.system(size: 12, weight: row.ask.unseen ? .semibold : .regular))
-                        .lineLimit(1)
+                        .font(.system(size: 13, weight: row.ask.unseen ? .semibold : .regular))
+                        // Three lines, not one or two: a row's tail (its
+                        // moves, or the state word and age) costs the title
+                        // a third of the panel, and a clamped title lies
+                        // with an ellipsis. A short title still takes one
+                        // line; a long one wraps -- three covers every real
+                        // ask title without the panel growing for the rest.
+                        .lineLimit(3)
                         .truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.leading)
                 }
                 .buttonStyle(.plain)
                 Spacer(minLength: 8)
                 if tailButtons.isEmpty {
                     Text(rightDetail)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .fixedSize()
@@ -3108,9 +3149,11 @@ struct AskRowView: View {
                     // A row with moves spends its tail on them; the state
                     // word and the age stay one hover away in the tooltip,
                     // where they were always second-choice reading.
-                    ForEach(tailButtons) { button in
-                        RowButton(icon: button.symbol, help: button.helpText) {
-                            onButton(button)
+                    HStack(spacing: 2) {
+                        ForEach(tailButtons) { button in
+                            RowButton(icon: button.symbol, help: button.helpText) {
+                                onButton(button)
+                            }
                         }
                     }
                 }
@@ -3118,8 +3161,8 @@ struct AskRowView: View {
                           help: expanded ? "Hide the answer" : "Read the answer here",
                           action: onToggleExpand)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(highlighted ? Color.accentColor.opacity(0.18)
                                     : (hovering ? Color.primary.opacity(0.06) : .clear))
@@ -3128,9 +3171,9 @@ struct AskRowView: View {
 
             if let now = row.nowLine {
                 Text(now)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
-                    .padding(.leading, 27)
+                    .padding(.leading, 31)
                     .padding(.bottom, 3)
             }
             // Q12: the failed row's reason, one line under the title --
@@ -3140,34 +3183,34 @@ struct AskRowView: View {
             // as `lines`, so the two cannot disagree about what a row shows.
             if let reason = row.reasonLine {
                 Text(reason)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                    .padding(.leading, 27)
-                    .padding(.trailing, 12)
+                    .padding(.leading, 31)
+                    .padding(.trailing, 14)
                     .padding(.bottom, 3)
             }
             if let attempt = row.lastAttempt {
                 Text(attempt)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
-                    .padding(.leading, 27)
+                    .padding(.leading, 31)
                     .padding(.bottom, 3)
             }
             if let line = moveLine {
                 Text(line)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                    .padding(.leading, 27)
+                    .padding(.leading, 31)
                     .padding(.bottom, 3)
             }
             if let question = row.ask.question, !question.isEmpty, row.ask.state == .question {
                 Text(question)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                    .padding(.leading, 27)
-                    .padding(.trailing, 12)
+                    .padding(.leading, 31)
+                    .padding(.trailing, 14)
                     .padding(.bottom, 3)
             }
             if row.answersInline {
@@ -3189,19 +3232,19 @@ struct AskRowView: View {
     private var answerField: some View {
         HStack(spacing: 6) {
             Image(systemName: "bubble.left")
-                .font(.system(size: 9))
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             TextField("Answer it\u{2026}", text: $answerDraft)
                 .textFieldStyle(.plain)
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .focused($answerFocused)
                 .onSubmit { submitAnswer() }
             RowButton(icon: "arrow.up.circle", help: "Send the answer (\u{23CE})") {
                 submitAnswer()
             }
         }
-        .padding(.leading, 27)
-        .padding(.trailing, 12)
+        .padding(.leading, 31)
+        .padding(.trailing, 14)
         .padding(.bottom, 6)
         .onChange(of: answerFocused) { _, focused in onFieldFocus(focused) }
     }
@@ -3220,11 +3263,11 @@ struct AskRowView: View {
                              _ text: Binding<String>) -> some View {
         HStack(spacing: 6) {
             Image(systemName: "square.and.pencil")
-                .font(.system(size: 9))
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             TextField(AskRowMoves.placeholder(for: edit.move), text: text)
                 .textFieldStyle(.plain)
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .focused($editorFocused)
                 .onSubmit { onEditSubmit(text.wrappedValue) }
             RowButton(icon: "arrow.up.circle", help: "Send (\u{23CE})") {
@@ -3234,8 +3277,8 @@ struct AskRowView: View {
                 onEditCancel()
             }
         }
-        .padding(.leading, 27)
-        .padding(.trailing, 12)
+        .padding(.leading, 31)
+        .padding(.trailing, 14)
         .padding(.bottom, 6)
         .onAppear { editorFocused = true }
         .onChange(of: editorFocused) { _, focused in onFieldFocus(focused) }
@@ -3252,11 +3295,14 @@ struct AskRowView: View {
     /// gray, like the dot); the named states keep the palette the legacy
     /// rows trained.
     private var dotColor: Color {
+        // The desk's palette (AskStateColor): amber what waits on John,
+        // teal the bot at work, green a good unread outcome, red a failure.
+        // The menubar and the desk must never disagree about a colour.
         switch row.ask.state {
-        case .question, .blocked, .failed: return .orange
-        case .answer: return row.ask.unseen ? .accentColor : .secondary.opacity(0.6)
-        case .working: return .green
-        case .wantsOk: return .blue
+        case .question, .blocked, .wantsOk: return AskStateColor.amber
+        case .failed: return AskStateColor.red
+        case .answer: return row.ask.unseen ? AskStateColor.green : .secondary.opacity(0.6)
+        case .working: return AskStateColor.teal
         default: return .secondary.opacity(0.6)
         }
     }
@@ -3271,7 +3317,7 @@ struct AskRowView: View {
             // first thing read under a Failed chip is what went wrong.
             if let reason = row.reasonLine {
                 Text(reason)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -3281,29 +3327,37 @@ struct AskRowView: View {
                         .controlSize(.small)
                         .scaleEffect(0.6)
                     Text("Reading the answer\u{2026}")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
             } else {
                 ScrollView {
-                    Text(answerText)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                    Text(plainAnswer)
+                        .font(.system(size: 12))
+                        // The answer is the thing the row exists to be read:
+                        // near-primary ink, not the secondary grey every
+                        // hint and timestamp already uses -- grey-on-white
+                        // at 12pt was the least readable text on the panel.
+                        .foregroundStyle(.primary.opacity(0.8))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 2)
+                        // Padding inside the scroll, not outside: the frame
+                        // clips whatever crosses its edge, and a text block
+                        // ending flush with it reads as cut off mid-line.
+                        .padding(.top, 2)
+                        .padding(.bottom, 6)
                 }
                 // A fixed height, not a cap: see MenuView.listHeight for why
                 // a maxHeight alone leaves a ScrollView with no floor.
                 .frame(height: Self.expandMaxHeight)
             }
             Text(peekHint)
-                .font(.system(size: 10))
+                .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
         }
-        .padding(.leading, 27)
-        .padding(.trailing, 12)
-        .padding(.bottom, 7)
+        .padding(.leading, 31)
+        .padding(.trailing, 14)
+        .padding(.bottom, 10)
     }
 
     /// The peek's one-line key hint. ⏎ names what it does on *this* row
@@ -3323,6 +3377,23 @@ struct AskRowView: View {
         return "No answer text on this row \u{2014} \u{23CE} opens the thread."
     }
 
+    /// The peek is plain text and the answer it shows is markdown-shaped:
+    /// strip the emphasis markers so **Voice** reads as Voice, not as
+    /// asterisks pretending to be bold in a 12pt menubar row. Bold and
+    /// italics pairs and code spans go; a lone asterisk (a bullet) stays.
+    private var plainAnswer: String {
+        var t = answerText
+        for pattern in ["\\*\\*([^*\\n]+)\\*\\*", "(?<!\\*)\\*([^*\\n]+)\\*(?!\\*)",
+                        "`([^`\\n]+)`"] {
+            if let re = try? NSRegularExpression(pattern: pattern) {
+                t = re.stringByReplacingMatches(
+                    in: t, range: NSRange(t.startIndex..., in: t),
+                    withTemplate: "$1")
+            }
+        }
+        return t
+    }
+
     private var helpText: String {
         var parts = [row.title, "id: \(row.id)"]
         if let door = row.ask.door { parts.append("came in by: \(door)") }
@@ -3336,8 +3407,9 @@ struct AskRowView: View {
     }
 }
 
-/// A 10-point icon button sized to sit in a row without stealing width from
-/// the title.
+/// An 11-point icon in a 22-point target: big enough to read and
+/// comfortable to hit without stealing the width a title needs -- the
+/// row's buttons are its real controls, not decoration.
 struct RowButton: View {
     let icon: String
     let help: String
@@ -3349,8 +3421,9 @@ struct RowButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 10, weight: hovering ? .semibold : .regular))
-                .frame(width: 12)
+                .font(.system(size: 11, weight: hovering ? .semibold : .regular))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(tint)
@@ -3640,20 +3713,21 @@ struct YoursSectionHeader: View {
     let count: Int
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 7) {
             Image(systemName: "person.crop.circle")
-                .font(.system(size: 9))
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             Text(AskYours.label)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 8)
             Text("\(count)")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
+                .monospacedDigit()
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
         .help("Your own to-dos -- asks with no agent work on them. "
               + "E files one done; R sets when it should nudge you; D drops it.")
@@ -3677,31 +3751,35 @@ struct YoursRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
+            HStack(spacing: 9) {
                 Circle()
                     .fill(Color.secondary.opacity(0.6))
-                    .frame(width: 7, height: 7)
+                    .frame(width: 8, height: 8)
                 Button(action: onTitle) {
                     Text(row.title)
-                        .font(.system(size: 12))
-                        .lineLimit(1)
+                        .font(.system(size: 13))
+                        .lineLimit(3)
                         .truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.leading)
                 }
                 .buttonStyle(.plain)
                 Spacer(minLength: 8)
                 if let time = row.timeText {
                     Text(time)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
-                ForEach(YoursMoves.buttons(for: row.ask)) { button in
-                    RowButton(icon: Self.symbol(for: button), help: button.helpText) {
-                        onButton(button)
+                HStack(spacing: 2) {
+                    ForEach(YoursMoves.buttons(for: row.ask)) { button in
+                        RowButton(icon: Self.symbol(for: button), help: button.helpText) {
+                            onButton(button)
+                        }
                     }
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(highlighted ? Color.accentColor.opacity(0.18)
                                     : (hovering ? Color.primary.opacity(0.06) : .clear))
@@ -3709,16 +3787,16 @@ struct YoursRowView: View {
             .help(helpText)
             if let line = row.remindLine {
                 Text(line)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
-                    .padding(.leading, 27)
+                    .padding(.leading, 31)
                     .padding(.bottom, 3)
             }
             if let line = moveLine {
                 Text(line)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                    .padding(.leading, 27)
+                    .padding(.leading, 31)
                     .padding(.bottom, 3)
             }
         }
@@ -3799,7 +3877,7 @@ struct FindRowView: View {
                 Text(line)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                    .padding(.leading, 27)
+                    .padding(.leading, 31)
                     .padding(.bottom, 3)
             }
             Text(snippetText)
@@ -3807,7 +3885,7 @@ struct FindRowView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
                 .truncationMode(.tail)
-                .padding(.leading, 27)
+                .padding(.leading, 31)
                 .padding(.trailing, 12)
                 .padding(.bottom, 3)
             if expanded {
@@ -3860,7 +3938,7 @@ struct FindRowView: View {
                 .frame(height: AskRowView.expandMaxHeight)
             }
         }
-        .padding(.leading, 27)
+        .padding(.leading, 31)
         .padding(.trailing, 12)
         .padding(.bottom, 7)
     }
