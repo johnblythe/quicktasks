@@ -35,6 +35,56 @@ class RowsCase(AskCase):
         raise AssertionError(f"{ask_id} not in {[r['id'] for s in model['sections'] for r in s['rows']]}")
 
 
+class TestMarkdownPeek(AskCase):
+    """The answer peek's markdown parse (PeekMarkdown, driven through the
+    --ask-md-blocks seam): the input the peek's AttributedString builder
+    styles. The parse is the same subset the desk's pane and the address
+    page render -- headings, nested bullets, ordered items, fences, quotes
+    -- and everything unrecognized stays a paragraph, never dropped."""
+
+    def blocks(self, md):
+        return self.seam("--ask-md-blocks", md)["blocks"]
+
+    def test_sections_bullets_and_bold_parse(self):
+        md = ("The meeting was the **Eng Managers weekly**.\n\n"
+              "**How it got there**\n"
+              "- Lindsey raised it.\n"
+              "- Others added:\n"
+              "  - Jason's team uses focus weeks.\n"
+              "\n"
+              "**Your action item**\n"
+              "1. Put together a survey.\n"
+              "2. Run it by leadership.\n")
+        self.assertEqual(self.blocks(md), [
+            {"kind": "para", "text": "The meeting was the **Eng Managers weekly**."},
+            # A lone bold line is a section label: the heading it means.
+            {"kind": "heading", "text": "How it got there"},
+            {"kind": "bullet", "depth": 0, "text": "Lindsey raised it."},
+            {"kind": "bullet", "depth": 0, "text": "Others added:"},
+            {"kind": "bullet", "depth": 1, "text": "Jason's team uses focus weeks."},
+            {"kind": "heading", "text": "Your action item"},
+            {"kind": "ordered", "number": "1", "text": "Put together a survey."},
+            {"kind": "ordered", "number": "2", "text": "Run it by leadership."},
+        ])
+
+    def test_headings_quotes_fences_and_rules(self):
+        md = ("# A heading\n\n> a quote\n\n---\n\n```python\nprint('hi')\n```\n")
+        self.assertEqual(self.blocks(md), [
+            {"kind": "heading", "text": "A heading"},
+            {"kind": "quote", "text": "a quote"},
+            {"kind": "code", "text": "print('hi')"},
+        ])
+
+    def test_unrecognized_text_is_a_paragraph_not_dropped(self):
+        # The blank line is a real paragraph break; #hashtag (no space
+        # after the hashes) is text, not a heading, and never dropped.
+        md = "just words\nflowing on\n\n#hashtag not a heading\n"
+        self.assertEqual(self.blocks(md), [
+            {"kind": "para", "text": "just words flowing on"},
+            {"kind": "para", "text": "#hashtag not a heading"},
+        ])
+
+
 class TestSectionsOrder(RowsCase):
     def test_plan_order_new_needs_working_with_the_right_rows(self):
         rows = [

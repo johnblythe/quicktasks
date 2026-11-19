@@ -3337,14 +3337,12 @@ struct AskRowView: View {
                 }
             } else {
                 ScrollView {
-                    Text(plainAnswer)
-                        .font(.system(size: 12))
+                    Text(peekAnswer)
+                        .lineSpacing(2)
                         // The answer is the thing the row exists to be read:
-                        // near-primary ink, not the secondary grey every
-                        // hint and timestamp already uses -- grey-on-white
-                        // at 12pt was the least readable text on the panel.
-                        .foregroundStyle(.primary.opacity(0.8))
-                        .textSelection(.enabled)
+                        // near-primary ink (the block styles set their own),
+                        // not the secondary grey every hint and timestamp
+                        // already uses.
                         .frame(maxWidth: .infinity, alignment: .leading)
                         // Padding inside the scroll, not outside: the frame
                         // clips whatever crosses its edge, and a text block
@@ -3382,21 +3380,21 @@ struct AskRowView: View {
         return "No answer text on this row \u{2014} \u{23CE} opens the thread."
     }
 
-    /// The peek is plain text and the answer it shows is markdown-shaped:
-    /// strip the emphasis markers so **Voice** reads as Voice, not as
-    /// asterisks pretending to be bold in a 12pt menubar row. Bold and
-    /// italics pairs and code spans go; a lone asterisk (a bullet) stays.
-    private var plainAnswer: String {
-        var t = answerText
-        for pattern in ["\\*\\*([^*\\n]+)\\*\\*", "(?<!\\*)\\*([^*\\n]+)\\*(?!\\*)",
-                        "`([^`\\n]+)`"] {
-            if let re = try? NSRegularExpression(pattern: pattern) {
-                t = re.stringByReplacingMatches(
-                    in: t, range: NSRange(t.startIndex..., in: t),
-                    withTemplate: "$1")
-            }
-        }
-        return t
+    /// The peek renders the first 12 KB; the thread page carries the rest.
+    /// A 64 KB answer would make AttributedString building the only slow
+    /// thing in an open animation, and nothing past a screenful is read
+    /// in place anyway.
+    private var cappedAnswer: String {
+        let text = answerText
+        return text.count <= 12_000 ? text
+            : String(text.prefix(12_000)) + "\n\n\u{2026} the thread has the rest"
+    }
+
+    /// The answer, rendered: blocks + styled runs from PeekMarkdown, so
+    /// headings read as headings, lists as bullets, emphasis as weight --
+    /// the same digestibility the desk's pane and the address page have.
+    private var peekAnswer: AttributedString {
+        peekAttributedString(peekBlocks(cappedAnswer))
     }
 
     private var helpText: String {

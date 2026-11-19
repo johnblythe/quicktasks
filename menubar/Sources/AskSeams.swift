@@ -107,7 +107,23 @@ enum AskSeams {
         if args.contains("--ask-dump-thread") { return dumpThread(args: args) }
         if args.contains("--ask-press") { return press(args: args) }
         if args.contains("--ask-post") { return post(args: args) }
+        if args.contains("--ask-md-blocks") { return mdBlocks(args: args) }
         return fail("unknown --ask-* seam: \(args.filter { $0.hasPrefix("--ask-") }.joined(separator: " "))")
+    }
+
+    // MARK: --ask-md-blocks (2026-11-19)
+
+    /// The answer peek's markdown parse, as JSON: one object per block
+    /// (kind, text, depth/number where they exist). Pure parse, no DOM,
+    /// no network -- so the tests pin exactly the input the peek's
+    /// AttributedString builder styles.
+    private static func mdBlocks(args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--ask-md-blocks"), i + 1 < args.count,
+              !args[i + 1].hasPrefix("--ask-") else {
+            return fail("--ask-md-blocks needs some markdown text")
+        }
+        let blocks = peekBlocks(args[i + 1]).map { $0.json }
+        return emit(["blocks": blocks])
     }
 
     // MARK: --ask-fire (Q12)
