@@ -242,6 +242,38 @@ class TestRunNowFiresQt(FieldCase):
                          [["--in", str(other), "fix it"]])
         self.assertEqual(out["receipt"]["words"], "fix it")
 
+    def test_the_model_chip_rides_the_fire_as_m(self):
+        """--ask-model stands in for the chip's choice: one `-m <name>`
+        between --in and the words, exactly the argv the chip produces."""
+        base = self.serve_field()
+        out = self.fire("route this one on kimi", "--ask-mode", "run",
+                        "--ask-model", "kimi-k3.1-pro",
+                        base=base, extra_env=self.qt_env())
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["model"], "kimi-k3.1-pro")
+        self.assertEqual(self.qt_invocations(1),
+                         [["--in", str(self.fire_dir),
+                           "-m", "kimi-k3.1-pro", "route this one on kimi"]])
+
+    def test_a_default_fire_carries_no_model_flag(self):
+        base = self.serve_field()
+        out = self.fire("no chip choice made", "--ask-mode", "run",
+                        base=base, extra_env=self.qt_env())
+        self.assertNotIn("model", out)
+        argv, = self.qt_invocations(1)
+        self.assertNotIn("-m", argv)
+
+    def test_an_unknown_model_name_reads_as_default(self):
+        """A stored name this build does not know (a newer chip's entry)
+        must not fire a -m qt cannot expand -- it reads as Default."""
+        base = self.serve_field()
+        out = self.fire("mystery chip state", "--ask-mode", "run",
+                        "--ask-model", "glm-9.9-not-yet",
+                        base=base, extra_env=self.qt_env())
+        self.assertNotIn("model", out)
+        argv, = self.qt_invocations(1)
+        self.assertNotIn("-m", argv)
+
     def test_a_refused_fire_reports_and_leaves_no_receipt(self):
         """QT_BIN at a directory passes the executable check and then throws
         on Process.run -- the same deterministic refusal test_menubar_model
@@ -278,6 +310,23 @@ class TestAskFirstPosts(FieldCase):
         self.assertEqual(receipt["kind"], "ask_first")
         self.assertEqual(receipt["line"], "Got it. It waits for your OK.")
         self.assertEqual(receipt["ask_id"], "hub-gate-9")
+
+    def test_the_model_chip_rides_ask_first_too(self):
+        """The chip's choice is part of the fire, whichever mode: the
+        ask-first body carries it as `model` (plan 1.6), so the gate item
+        records what it should later run on."""
+        created = ask_row("hub-gate-m", state="wants_ok")
+        base = self.serve_field(asks_post=(201, {"ok": True, "ask": created}))
+        out = self.fire("run this on the flash model", "--ask-mode", "ask_first",
+                        "--ask-model", "glm-5p3-flash",
+                        base=base, extra_env=self.qt_env())
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.field.asks_posts[0]["body"],
+                         {"text": "run this on the flash model",
+                          "mode": "ask_first",
+                          "door": "typed",
+                          "dir": str(self.fire_dir),
+                          "model": "glm-5p3-flash"})
 
     def test_a_typed_prefix_strips_and_carries_the_directory(self):
         other = self.tmp / "otherdir"

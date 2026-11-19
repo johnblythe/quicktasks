@@ -237,7 +237,11 @@ class ResumePromptEndToEndTests(unittest.TestCase):
             self.skipTest(f"real hub repo not found at {HUB_REPO}")
         hub_dir = Path(self.tmp.name) / "hub"
         hub_dir.mkdir()
-        for name in ("seed.py", "items_io.py"):
+        # H8 grew seed.py an import closure (asks/bell/reasons/...); the
+        # fixture needs every file it takes at import time or the seed
+        # call fails and the whole feed chain skips.
+        for name in ("seed.py", "items_io.py", "asks.py", "asks_state.py",
+                 "asks_live.py", "reasons.py", "bell.py", "local_notify.py", "notice.py"):
             source = HUB_REPO / name
             if source.is_file():
                 (hub_dir / name).write_text(source.read_text())
@@ -282,7 +286,11 @@ class ResumePromptEndToEndTests(unittest.TestCase):
             self.skipTest(f"real hub repo not found at {HUB_REPO}")
         hub_dir = Path(self.tmp.name) / "hub"
         hub_dir.mkdir()
-        for name in ("seed.py", "items_io.py"):
+        # H8 grew seed.py an import closure (asks/bell/reasons/...); the
+        # fixture needs every file it takes at import time or the seed
+        # call fails and the whole feed chain skips.
+        for name in ("seed.py", "items_io.py", "asks.py", "asks_state.py",
+                 "asks_live.py", "reasons.py", "bell.py", "local_notify.py", "notice.py"):
             source = HUB_REPO / name
             if source.is_file():
                 (hub_dir / name).write_text(source.read_text())

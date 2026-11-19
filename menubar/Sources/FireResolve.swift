@@ -97,7 +97,7 @@ enum FireResolve {
     /// `--dump-fire`/`--dump-keys` have always printed and what the
     /// ask-first flow falls back to; this function and the `--ask-fire` seam
     /// describe the POST /asks leg.
-    static func askFirstBody(text: String, dir: URL?) -> [String: Any] {
+    static func askFirstBody(text: String, dir: URL?, model: String? = nil) -> [String: Any] {
         var body: [String: Any] = [
             "text": text,
             "mode": "ask_first",
@@ -105,7 +105,56 @@ enum FireResolve {
             "door": "typed",
         ]
         if let dir { body["dir"] = dir.path }
+        if let model { body["model"] = model }
         return body
+    }
+
+    /// The model chip's menu (2026-11-19): the short names qt's Fireworks
+    /// routing expands (see qt's fireworks_model), plus the one Anthropic
+    /// reference that deliberately does NOT route -- `sonnet[1m]` keeps a
+    /// single run on the ambient Claude login even with the provider
+    /// configured. `Default` is the absence of a choice: the fire carries
+    /// no -m at all and qt's own config (provider + model) decides.
+    enum FireModel: CaseIterable {
+        case glm53
+        case glm53Flash
+        case kimiK31Pro
+        case sonnet
+
+        /// What rides the fire: a short Fireworks name, or the Anthropic
+        /// reference that opts this one run out of the provider.
+        var name: String {
+            switch self {
+            case .glm53: return "glm-5p3"
+            case .glm53Flash: return "glm-5p3-flash"
+            case .kimiK31Pro: return "kimi-k3.1-pro"
+            case .sonnet: return "sonnet[1m]"
+            }
+        }
+
+        /// The chip's own label, and the menu's.
+        var label: String {
+            switch self {
+            case .glm53: return "GLM 5.3"
+            case .glm53Flash: return "GLM 5.3 Flash"
+            case .kimiK31Pro: return "Kimi K3.1 Pro"
+            case .sonnet: return "Sonnet (Anthropic)"
+            }
+        }
+
+        var help: String {
+            self == .sonnet
+                ? "This one fire stays on your Claude login (no Fireworks routing)."
+                : "This one fire runs on Fireworks: \(name)."
+        }
+
+        /// The chosen model for a fire, nil when the chip is at Default.
+        /// An unknown stored value (a name a newer build knew) reads as
+        /// Default rather than firing a -m qt cannot expand.
+        static func resolve(_ raw: String?) -> FireModel? {
+            guard let raw else { return nil }
+            return allCases.first { $0.name == raw }
+        }
     }
 
     /// The full resolved outcome of one fire, as JSON: what `--dump-fire`
@@ -130,13 +179,19 @@ enum FireResolve {
         }
         let (prefixDir, stripped) = parsePrefix(raw)
         let resolved = runDirectory(prefixDir: prefixDir, env: env, settings: settings)
-        return [
+        let model = FireModel.resolve(settings.fireModelOverride)?.name
+        var argv = ["--in", resolved.url.path]
+        if let model { argv += ["-m", model] }
+        argv.append(stripped)
+        var out: [String: Any] = [
             "mode": "run",
             "text": stripped,
             "dir": resolved.url.path,
             "dir_source": resolved.source,
-            "argv": ["--in", resolved.url.path, stripped],
+            "argv": argv,
         ]
+        if let model { out["model"] = model }
+        return out
     }
 }
 

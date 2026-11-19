@@ -121,7 +121,8 @@ enum AskSeams {
         // The text is allowed to start with `--in`/`@` -- that is the
         // fire's own directory prefix -- so the guard rejects only this
         // seam's own flags, not every leading dash.
-        let ownFlags: Set<String> = ["--ask-mode", "--ask-panel", "--ask-undo", "--ask-aged"]
+        let ownFlags: Set<String> = ["--ask-mode", "--ask-panel", "--ask-undo",
+                                     "--ask-aged", "--ask-model"]
         guard let i = args.firstIndex(of: "--ask-fire"), i + 1 < args.count,
               !ownFlags.contains(args[i + 1]) else {
             return fail("--ask-fire needs some text")
@@ -130,6 +131,10 @@ enum AskSeams {
         let mode = value(args, "--ask-mode") ?? "run"
         let isPanel = args.contains("--ask-panel")
         let config = StoreConfig.resolve()
+        // The model chip's choice, or this seam's --ask-model stand-in for
+        // it: one fire's -m, exactly the argv the real chip produces.
+        let model = FireResolve.FireModel.resolve(
+            value(args, "--ask-model") ?? config.settings.fireModelOverride)?.name
         var out: [String: Any] = [
             "text": raw,
             "mode": mode,
@@ -139,6 +144,7 @@ enum AskSeams {
         let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: config.settings)
         out["dir"] = resolved.url.path
         out["dir_source"] = resolved.source
+        if let model { out["model"] = model }
 
         func receiptJSON(_ receipt: AskReceipt, undoable: Bool) -> [String: Any] {
             [
@@ -153,7 +159,7 @@ enum AskSeams {
 
         switch mode {
         case "run":
-            switch Actions.fire(prompt: stripped, in: resolved.url,
+            switch Actions.fire(prompt: stripped, in: resolved.url, model: model,
                                 origin: isPanel ? "summon" : "widget").map({ stripped }) {
             case .failure(let problem):
                 out["ok"] = false
@@ -174,7 +180,8 @@ enum AskSeams {
             guard let base = config.passURL else {
                 return fail("the Pass feed is off (QT_PASS_URL is empty)")
             }
-            switch Actions.askFirst(text: stripped, rawText: raw, dir: resolved.url, base: base) {
+            switch Actions.askFirst(text: stripped, rawText: raw, dir: resolved.url,
+                                    model: model, base: base) {
             case .failure(let problem):
                 out["ok"] = false
                 out["error"] = problem.message

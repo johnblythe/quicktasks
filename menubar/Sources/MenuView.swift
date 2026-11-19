@@ -859,6 +859,7 @@ struct MenuView: View {
                           + "the two; \u{2318}1/\u{2318}2 pick one directly; \u{2318}\u{21A9} "
                           + "fires the other one once.")
                 FireDirectoryChip(controller: controller)
+                FireModelChip(controller: controller)
             }
             Text("Tab swaps \u{00B7} \u{2318}\u{21A9} fires the other way")
                 .font(.system(size: 11))
@@ -1354,6 +1355,9 @@ struct MenuView: View {
         let isPanel = onEscapeExhausted != nil
         let (prefixDir, stripped) = FireResolve.parsePrefix(rawText)
         let resolved = FireResolve.runDirectory(prefixDir: prefixDir, settings: controller.settings)
+        // The model chip's choice for this fire: one -m, never persisted by
+        // the fire itself (the chip's own selection is, through Settings).
+        let model = FireResolve.FireModel.resolve(controller.settings.fireModelOverride)?.name
         if toPass {
             let base = controller.passBase
             // The outcome travels as "route:id" -- perform's report closure
@@ -1361,7 +1365,8 @@ struct MenuView: View {
             // needs (which route, which id) are exactly these.
             controller.perform(key: "askFirst", {
                 Actions.askFirst(text: stripped, rawText: rawText,
-                                 dir: resolved.url, base: base).map { "\($0.route):\($0.id ?? "")" }
+                                 dir: resolved.url, model: model,
+                                 base: base).map { "\($0.route):\($0.id ?? "")" }
             }) { outcome in
                 let (state, hidesPanel): (FireFieldState, Bool)
                 switch outcome {
@@ -1388,7 +1393,7 @@ struct MenuView: View {
             }
         } else {
             controller.perform(key: "fire", {
-                Actions.fire(prompt: stripped, in: resolved.url,
+                Actions.fire(prompt: stripped, in: resolved.url, model: model,
                             origin: isPanel ? "summon" : "widget").map { "" }
             }) { outcome in
                 if case .success = outcome {
@@ -3517,6 +3522,67 @@ struct FireModeControl: NSViewRepresentable {
 /// with no typed `--in`/`@` prefix lands. Dims and stops responding when To
 /// Pass is selected, since To Pass ignores the directory outright -- the
 /// chip would otherwise be inviting a click that changes nothing.
+struct FireModelChip: View {
+    /// The model chip beside the directory chip (2026-11-19): which model
+    /// the next fire runs on. Default (no -m) is qt's own config -- the
+    /// Fireworks provider and its model -- so the chip reads "Default
+    /// · GLM 5.3" at rest and every choice is one fire's `-m <name>`,
+    /// applied through the same Settings path the dir chip uses. The one
+    /// Anthropic entry (sonnet[1m]) opts a single run out of the provider.
+    @ObservedObject var controller: StatusController
+
+    private var chosen: FireResolve.FireModel? {
+        FireResolve.FireModel.resolve(controller.settings.fireModelOverride)
+    }
+
+    private var modelName: String? {
+        chosen?.name
+    }
+
+    var body: some View {
+        Menu {
+            Button("Default (qt's config)") { reset() }
+            Divider()
+            ForEach(FireResolve.FireModel.allCases, id: \.name) { model in
+                Button(model.label) { choose(model) }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 9))
+                Text(label)
+                    .font(.system(size: 10))
+                    .lineLimit(1)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(chipHelp)
+    }
+
+    private var label: String {
+        chosen?.label ?? "Default"
+    }
+
+    private var chipHelp: String {
+        if let chosen { return chosen.help + " Click to change; Default uses qt's own config." }
+        return "Fires use qt's own model config (provider + model). "
+            + "Click to run one fire on a different model."
+    }
+
+    private func choose(_ model: FireResolve.FireModel) {
+        var next = controller.settings
+        next.fireModelOverride = model.name
+        controller.apply(next)
+    }
+
+    private func reset() {
+        var next = controller.settings
+        next.fireModelOverride = nil
+        controller.apply(next)
+    }
+}
+
 struct FireDirectoryChip: View {
     @ObservedObject var controller: StatusController
 

@@ -64,39 +64,67 @@ sys.exit(0)
 # gets logged rather than breaking the task. This stub stands in for the
 # real notice.py at that boundary -- it logs the jobdir it was called with
 # and exits with a configurable code, never touching Slack or the network.
+# Import-safe on purpose: the hub's bell.py does `import notice`, and the
+# fixture's seed.py imports bell -- so this file's top level executes as a
+# module import too. Everything (logging, the exit code) happens only when
+# the hub actually invokes it as a script, or an import would log seed.py's
+# own argv as a phantom notice call and a failing RC would kill the import.
 FAKE_NOTICE_PY = """\
 #!/usr/bin/env python3
 import os, sys
-log = os.environ.get("FAKE_NOTICE_LOG")
-if log:
-    with open(log, "a") as f:
-        f.write(repr(sys.argv[1:]) + "\\n")
-# Optional: append a one-word tag to a shared order log, so a test can prove
-# call order (deliver before notice) without disturbing the log above, which
-# existing tests assert on verbatim.
-order_log = os.environ.get("FAKE_ORDER_LOG")
-if order_log:
-    with open(order_log, "a") as f:
-        f.write("notice\\n")
-sys.exit(int(os.environ.get("FAKE_NOTICE_RC", "0")))
+if __name__ == "__main__":
+    log = os.environ.get("FAKE_NOTICE_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(repr(sys.argv[1:]) + "\\n")
+    # Optional: append a one-word tag to a shared order log, so a test can
+    # prove call order (deliver before notice) without disturbing the log
+    # above, which existing tests assert on verbatim.
+    order_log = os.environ.get("FAKE_ORDER_LOG")
+    if order_log:
+        with open(order_log, "a") as f:
+            f.write("notice\\n")
+    sys.exit(int(os.environ.get("FAKE_NOTICE_RC", "0")))
 """
 
 # deliver.py itself lives in the hub repo, not here; its real behavior
 # (deciding whether a job auto-closes or waits in Verify) is out of scope
-# for qt's tests. Same subprocess-boundary contract as notice.py above, and
-# the same stub shape.
+# for qt's tests. Same subprocess-boundary contract as notice.py above,
+# the same stub shape, and the same import safety.
 FAKE_DELIVER_PY = """\
 #!/usr/bin/env python3
 import os, sys
-log = os.environ.get("FAKE_DELIVER_LOG")
-if log:
-    with open(log, "a") as f:
-        f.write(repr(sys.argv[1:]) + "\\n")
-order_log = os.environ.get("FAKE_ORDER_LOG")
-if order_log:
-    with open(order_log, "a") as f:
-        f.write("deliver\\n")
-sys.exit(int(os.environ.get("FAKE_DELIVER_RC", "0")))
+if __name__ == "__main__":
+    log = os.environ.get("FAKE_DELIVER_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(repr(sys.argv[1:]) + "\\n")
+    order_log = os.environ.get("FAKE_ORDER_LOG")
+    if order_log:
+        with open(order_log, "a") as f:
+            f.write("deliver\\n")
+    sys.exit(int(os.environ.get("FAKE_DELIVER_RC", "0")))
+"""
+
+# A hub that predates the bell (no bell.py, no notice.py) cannot run the
+# real seed.py -- it imports the whole asks closure. Tests that need that
+# older hub shape install this pre-bell seed instead: insert the fragment
+# idempotently beside the script, which is everything qt's _seed_hub_item
+# asks of any seed.py it meets.
+OLD_SEED_STUB = """\
+#!/usr/bin/env python3
+import json, os, sys
+frag = json.load(open(sys.argv[1]))
+here = os.path.dirname(os.path.abspath(__file__))
+path = os.path.join(here, "items.json")
+data = json.load(open(path))
+items = data.setdefault("items", [])
+if not any(i.get("id") == frag.get("id") for i in items):
+    items.insert(0, frag)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
 """
 
 
@@ -130,7 +158,11 @@ class HubFeedEndToEndTests(unittest.TestCase):
         # hub moved items.json behind a cross-process lock and an atomic
         # write; without it seed.py dies at import and the feed silently seeds
         # nothing, which reads here as "the item never landed".
-        for name in ("seed.py", "items_io.py"):
+        # H8 grew seed.py an import closure (asks/bell/reasons/...); the
+        # fixture needs every file it takes at import time or the seed
+        # call fails and the whole feed chain skips.
+        for name in ("seed.py", "items_io.py", "asks.py", "asks_state.py",
+                 "asks_live.py", "reasons.py", "bell.py", "local_notify.py", "notice.py"):
             source = HUB_REPO / name
             if source.is_file():
                 (self.hub_dir / name).write_text(source.read_text())
@@ -242,10 +274,13 @@ class HubFeedEndToEndTests(unittest.TestCase):
         self.assertIn("finished", job)
         self.assertEqual(result_md.strip(), "All done, nothing else needed.")
 
-        # notify() really did fire, and hit the shim rather than the real
-        # osascript/terminal-notifier: proof the notification-suppression
-        # fixture is doing something, not just silently unneeded.
-        self.assertTrue(self.notify_log.is_file(), "notify() never reached the fake osascript shim")
+        # Q5 / plan 1.8: with a bell.py in the hub (this fixture is a
+        # current hub), qt's own finish banner is deliberately skipped --
+        # one bell per ask, the hub rings it. The standalone-qt banner
+        # path still has its own proof in test_bell_delegation's
+        # no-hub cases, so what this asserts here is the skip.
+        self.assertFalse(self.notify_log.is_file(),
+                         "qt rang its own banner on a bell-wired hub")
 
     def test_failed_task_feeds_hub(self):
         prompt = "do something that breaks"
@@ -391,6 +426,12 @@ class HubFeedEndToEndTests(unittest.TestCase):
         """A hub dir with no notice.py (older hub, or one not yet wired for
         Slack) must not raise or log anything -- the same silent no-op the
         rest of qt uses for a hub that isn't installed for a given step."""
+        # A hub with no notice.py is a hub that predates the bell too (the
+        # current one hard-imports notice through bell), so age the whole
+        # fixture: pre-bell seed stub, no bell.py, no notice.py.
+        for name in ("notice.py", "bell.py"):
+            (self.hub_dir / name).unlink(missing_ok=True)
+        (self.hub_dir / "seed.py").write_text(OLD_SEED_STUB)
         proc = self._run_qt(
             "a task with no notice.py in the hub",
             {"result": "Fine.", "session_id": "sess-no-notice"},

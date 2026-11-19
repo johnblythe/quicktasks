@@ -70,6 +70,28 @@ BELL_STUB = """\
 # stub hub bell for qt's delegation check (plan 1.8); never executed by qt
 """
 
+# The hub's real seed.py imports the whole asks closure (asks, bell,
+# reasons, ...), which cannot exist in this fixture's old-hub scenario --
+# a hub where bell.py is absent is the entire point. Both hub ages here
+# get this pre-bell seed instead: insert the fragment idempotently into
+# the items.json beside the script, which is all qt's _seed_hub_item
+# needs from any seed.py it meets.
+OLD_SEED_STUB = """\
+#!/usr/bin/env python3
+import json, os, sys
+frag = json.load(open(sys.argv[1]))
+here = os.path.dirname(os.path.abspath(__file__))
+path = os.path.join(here, "items.json")
+data = json.load(open(path))
+items = data.setdefault("items", [])
+if not any(i.get("id") == frag.get("id") for i in items):
+    items.insert(0, frag)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+"""
+
 # Same notice.py boundary stub as test_hub_feed.py: logs the jobdir it was
 # handed, never touches Slack or the network. Proves the hub path still
 # runs while qt's own banner is skipped.
@@ -122,8 +144,14 @@ class BellDelegationBase(unittest.TestCase):
         self.qt_data = root / "qtdata"
         self.hub_dir = root / "hub"
         self.hub_dir.mkdir()
-        for name in ("seed.py", "items_io.py"):
-            (self.hub_dir / name).write_text((HUB_REPO / name).read_text())
+        # The hub's real seed.py grew an import closure over the asks waves
+        # (asks/bell/reasons/...), and this fixture's "old hub" scenario
+        # needs a hub where bell.py does not exist -- mutually exclusive
+        # with the real seed. These tests assert qt's delegation, not the
+        # seed's semantics (that is the hub repo's own suite), so both hub
+        # ages get the same minimal pre-bell seed stub: insert the fragment
+        # idempotently, next to the script, and nothing else.
+        (self.hub_dir / "seed.py").write_text(OLD_SEED_STUB)
         (self.hub_dir / "items.json").write_text(json.dumps({"items": []}))
 
         # Fake claude + notifier shims. The resolved claude path must not

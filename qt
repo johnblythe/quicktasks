@@ -263,7 +263,7 @@ def render_slack_guard_settings(tid, allow_once=()):
     allow_once set the file is written even when no guard script exists."""
     guard_path, _source = resolve_slack_guard_cmd()
     allow_once = sorted({t.strip() for t in (allow_once or ()) if t and t.strip()})
-    if not guard_path and not allow_once:
+    if not guard_path and not allow_once and not provider_fireworks():
         return None
     # The user-managed allowlist (~/.quicktasks/allow.json -- written by
     # `qt allow` and the menubar's "Always Allow Tool" action) joins the
@@ -277,6 +277,11 @@ def render_slack_guard_settings(tid, allow_once=()):
         "permissions": {"allow": sorted(set(QT_TOOLS_ALLOW) | _steerable_allowlist()
                                         | set(allow_once))},
     }
+    if provider_fireworks():
+        # Fireworks rejects Anthropic's server-side web_search tool outright,
+        # so a model that reaches for it fails mid-run. Denied here it is
+        # told no up front and does its searching another way.
+        settings["permissions"]["deny"] = ["WebSearch"]
     if guard_path:
         settings["hooks"] = {
             "PreToolUse": [
@@ -296,6 +301,147 @@ def render_slack_guard_settings(tid, allow_once=()):
         json.dump(settings, f)
     os.replace(tmp, path)
     return path
+
+
+# --- provider routing (Fireworks' Anthropic-compatible endpoint) ---------
+
+# Claude Code speaks the Anthropic Messages protocol, and Fireworks serves
+# it at api.fireworks.ai/inference -- so a quick-fire can run a Fireworks
+# model by pointing the same `claude` CLI at that endpoint with a Fireworks
+# key. Config opt-in, one key:
+#
+#     {"provider": "fireworks", "model": "glm-5p3"}
+#
+# The conventions are John's own zsh `claude-fireworks` function's: the key
+# comes from FIREWORKS_API_KEY, the main model from config's "model" (short
+# names expand to accounts/fireworks/models/<name>), the Opus/Sonnet/Haiku
+# slots map to Fireworks models so alias references still resolve, and
+# ANTHROPIC_API_KEY is cleared so Claude Code's login gate never sees two
+# credentials at once. WebSearch is denied up front: Fireworks rejects
+# Anthropic's server-side web_search tool, so a model that tries it would
+# fail mid-run rather than be told no.
+
+FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference"
+FIREWORKS_DEFAULT_SONNET = "glm-5p3"
+FIREWORKS_DEFAULT_HAIKU = "glm-5p3-flash"
+FIREWORKS_KEY_RE = re.compile(
+    r'(?:export\s+)?FIREWORKS_API_KEY=[\'"]?([A-Za-z0-9_.\-]+)')
+
+
+def _fireworks_key():
+    """FIREWORKS_API_KEY from the env, or the ~/.secrets.zsh line that
+    sets it. The env check comes first but is not enough on its own: a
+    quick-fire fired from the menu bar runs under launchd, which never
+    sources zshrc, so the only place the key lives for that path is the
+    secrets file zshrc itself sources."""
+    key = os.environ.get("FIREWORKS_API_KEY")
+    if key:
+        return key
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".secrets.zsh")) as f:
+            for line in f:
+                m = FIREWORKS_KEY_RE.match(line.strip())
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def fireworks_model(name):
+    """A Fireworks model resource name: `accounts/*` passes through, `x/y`
+    becomes accounts/fireworks/x/y (routers), a bare name becomes
+    accounts/fireworks/models/<name> -- the same expansion the zsh helper
+    applies, so 'glm-5p3' and the full spelling both work everywhere."""
+    name = (name or "").strip()
+    if not name:
+        name = FIREWORKS_DEFAULT_SONNET
+    if name.startswith("accounts/"):
+        return name
+    if "/" in name:
+        return "accounts/fireworks/" + name
+    return "accounts/fireworks/models/" + name
+
+
+def _is_anthropic_model(name):
+    """A model the ambient Anthropic login should serve instead: an alias
+    with a variant suffix (sonnet[1m]) or a claude-*/sonnet/opus prefix.
+    A run asking for one of these keeps today's behavior exactly -- no
+    Fireworks overlay, no key, the CLI's own login decides."""
+    n = (name or "").strip().lower()
+    return "[" in n or n.startswith(("claude", "sonnet", "opus"))
+
+
+def provider_fireworks(cfg=None):
+    """True when config says provider "fireworks" and a key resolves --
+    a configured provider with no reachable key is a setup error, and the
+    honest failure is the run falling back to the ambient login (which
+    then works or fails on its own terms) rather than an instant refusal."""
+    cfg = load_config() if cfg is None else cfg
+    return cfg.get("provider") == "fireworks" and bool(_fireworks_key())
+
+
+def fireworks_env(model=None):
+    """The env overlay for one headless Fireworks run, or None when no key
+    resolves. The slot vars follow the zsh function's defaults so the same
+    config behaves the same fired from a terminal (which may carry its own
+    FIREWORKS_*_MODEL overrides) and from the menu bar (which cannot)."""
+    key = _fireworks_key()
+    if not key:
+        return None
+    main = model or load_config().get("model") or FIREWORKS_DEFAULT_SONNET
+    return {
+        "ANTHROPIC_BASE_URL": FIREWORKS_BASE_URL,
+        "ANTHROPIC_AUTH_TOKEN": key,
+        "ANTHROPIC_MODEL": fireworks_model(main),
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": fireworks_model(
+            os.environ.get("FIREWORKS_OPUS_MODEL") or main),
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": fireworks_model(
+            os.environ.get("FIREWORKS_SONNET_MODEL") or FIREWORKS_DEFAULT_SONNET),
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": fireworks_model(
+            os.environ.get("FIREWORKS_HAIKU_MODEL") or FIREWORKS_DEFAULT_HAIKU),
+    }
+
+
+def claude_run_env(task=None):
+    """The env a headless claude run gets, or None to inherit as before.
+    Fireworks routing applies only when the provider is on AND this run's
+    own model is a Fireworks one -- `qt -m sonnet[1m] "..."` stays on the
+    ambient Anthropic login even with the provider configured, so the
+    per-fire model choice in the menu bar can cross providers."""
+    if not provider_fireworks():
+        return None
+    model = (task or {}).get("model")
+    if model and _is_anthropic_model(model):
+        return None
+    return fireworks_env(model)
+
+
+def claude_spawn_env(task=None):
+    """A complete env dict for subprocess.run, or None (inherit). Builds on
+    the current process env so PATH and friends survive; ANTHROPIC_API_KEY
+    is dropped when routing (the login gate reads it and reports a conflict
+    with the auth token)."""
+    overlay = claude_run_env(task)
+    if overlay is None:
+        return None
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.update(overlay)
+    return env
+
+
+def claude_model_arg(task):
+    """The --model value for a headless run, or None: the task's own model,
+    expanded to a Fireworks resource name when this run routes through the
+    Fireworks provider (short names like glm-5p3 are what config, the
+    menubar picker, and -m all carry; the CLI wants the full spelling)."""
+    model = (task or {}).get("model")
+    if not model:
+        return None
+    if claude_run_env(task) is not None:
+        return fireworks_model(model)
+    return model
 
 
 WORKSPACE_CLAUDE_MD = """\
@@ -1396,6 +1542,7 @@ def _refine_label(task):
             [claude, "--model", os.environ.get("QT_LABEL_MODEL") or "haiku",
              "-p", ask],
             capture_output=True, text=True, timeout=20,
+            env=claude_spawn_env({"model": "haiku"}),
         )
         lines = (proc.stdout or "").strip().splitlines()
         label = lines[0].strip().strip('"\'') if lines else ""
@@ -1817,7 +1964,7 @@ def run_task(tid, interactive=False):
             "--permission-mode", task.get("perm_mode") or resolve_permissions(),
         ]
         if task.get("model"):
-            cmd += ["--model", task["model"]]
+            cmd += ["--model", claude_model_arg(task)]
         # LD-224 follow-up: gate every mcp__ld-tools__ld_slack_* call behind a
         # PreToolUse hook (hub guard.py, or qt-guard.py) rather than leaving
         # quick-fires with no Slack-destination check at all. Not an
@@ -1849,6 +1996,7 @@ def run_task(tid, interactive=False):
                 proc = subprocess.run(
                     cmd, cwd=run_cwd, stdout=events_fh,
                     stderr=subprocess.PIPE, text=True, timeout=TIMEOUT,
+                    env=claude_spawn_env(task),
                 )
                 stdout = (proc.stdout if isinstance(proc.stdout, str)
                           else _read_events(events_path))
@@ -2247,7 +2395,7 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
         "--resume", sid,
     ]
     if task.get("model"):
-        cmd += ["--model", task["model"]]
+        cmd += ["--model", claude_model_arg(task)]
     settings_path = render_slack_guard_settings(tid, allow_once=allow_once)
     if settings_path:
         cmd += ["--settings", settings_path]
@@ -2270,6 +2418,7 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
             proc = subprocess.run(
                 cmd, cwd=run_cwd, stdout=events_fh,
                 stderr=subprocess.PIPE, text=True, timeout=TIMEOUT,
+                env=claude_spawn_env(task),
             )
             stdout = (proc.stdout if isinstance(proc.stdout, str)
                       else _read_events(events_path))
@@ -2626,6 +2775,7 @@ def cmd_setup(argv=None):
     print(f"\nsaved → {CONFIG_PATH}")
     print(f"terminal={cfg['terminal']} · permissions={cfg.get('permissions', 'acceptEdits')} "
           f"· model={cfg.get('model', 'unset · CLI default')} "
+          f"· provider={cfg.get('provider', 'anthropic')} "
           f"· trusted={len(cfg.get('trusted_dirs', []))} dir(s)")
     print("\nnext: qt doctor")
     print("Raycast script commands: Settings → Extensions → + → Add Script Directory → raycast/")

@@ -46,6 +46,11 @@ struct Settings {
     /// through to $HOME). QT_MENUBAR_FIRE_DIR still overrides this when set --
     /// same precedence every other override in this file follows.
     var fireDirOverride: String?
+    /// The model chip's last choice, nil when a fire uses the qt config's
+    /// own default (provider + model in ~/.quicktasks/config.json). A chosen
+    /// short name rides the fire as `qt -m <name>`; an Anthropic reference
+    /// like "sonnet[1m]" switches that one run back to the ambient login.
+    var fireModelOverride: String?
     /// The global summon shortcut. nil is a real, distinct state from "never
     /// configured": it means Clear was pressed, and the hotkey should not be
     /// registered at all. A fresh install (never configured) uses
@@ -78,6 +83,7 @@ struct Settings {
                                     visibleSections: allSectionKeys,
                                     rowLimit: defaultRowLimit,
                                     fireDirOverride: nil,
+                                    fireModelOverride: nil,
                                     hotkeyCombo: KeyCombo.defaultCombo,
                                     notifyWhenHidden: true)
 
@@ -88,6 +94,7 @@ struct Settings {
         static let visibleSections = "menubar.visibleSections"
         static let rowLimit = "menubar.rowLimit"
         static let fireDir = "menubar.fireDirOverride"
+        static let fireModel = "menubar.fireModelOverride"
         static let hotkeyKeyCode = "menubar.hotkeyKeyCode"
         static let hotkeyModifiers = "menubar.hotkeyModifiers"
         /// Distinct from the keyCode/modifiers keys being absent: absent means
@@ -113,6 +120,7 @@ struct Settings {
                 ? defaultRowLimit
                 : clamp(defaults.integer(forKey: Keys.rowLimit), to: limitRange),
             fireDirOverride: text(defaults, Keys.fireDir),
+            fireModelOverride: text(defaults, Keys.fireModel),
             hotkeyCombo: loadHotkey(defaults),
             notifyWhenHidden: defaults.object(forKey: Keys.notifyWhenHidden) == nil
                 ? true
@@ -141,6 +149,7 @@ struct Settings {
         defaults.set(Array(visibleSections).sorted(), forKey: Keys.visibleSections)
         defaults.set(Settings.clamp(rowLimit, to: Settings.limitRange), forKey: Keys.rowLimit)
         write(defaults, Keys.fireDir, fireDirOverride)
+        write(defaults, Keys.fireModel, fireModelOverride)
         if let combo = hotkeyCombo {
             defaults.set(false, forKey: Keys.hotkeyCleared)
             defaults.set(Int(combo.keyCode), forKey: Keys.hotkeyKeyCode)

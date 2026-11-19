@@ -37,15 +37,19 @@ enum Actions {
     }
 
     /// Queues a task the same way raycast/quick-task.sh does: `qt --in <dir>
-    /// <prompt>`. `--in` is what makes qt trust the directory the task
-    /// actually meant to run in rather than wherever the widget's own process
-    /// happens to have as its cwd; `dir` comes from `FireResolve`, which is
-    /// also where the widget's own `--in`/`@`-prefix parsing and the
-    /// directory chip's precedence live. `origin` is qt's source-of-truth for
-    /// which surface fired it (LD-224): "widget" for the dropdown, "summon"
-    /// for the hotkey panel -- the two call sites this widget has.
+    /// [-m <model>] <prompt>`. `--in` is what makes qt trust the directory the
+    /// task actually meant to run in rather than wherever the widget's own
+    /// process happens to have as its cwd; `dir` comes from `FireResolve`,
+    /// which is also where the widget's own `--in`/`@`-prefix parsing and the
+    /// directory chip's precedence live. `model` is the model chip's choice
+    /// (`FireResolve.FireModel.resolve`), nil at Default -- it rides the fire
+    /// as `qt -m <name>`, one fire, never persisted by this side.
+    /// `origin` is qt's source-of-truth for which surface fired it
+    /// (LD-224): "widget" for the dropdown, "summon" for the hotkey panel
+    /// -- the two call sites this widget has.
     @discardableResult
-    static func fire(prompt: String, in dir: URL, origin: String) -> Result<Void, Problem> {
+    static func fire(prompt: String, in dir: URL, model: String? = nil,
+                     origin: String) -> Result<Void, Problem> {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return .failure("nothing to fire") }
         guard let qt = qtBinary() else {
@@ -53,7 +57,10 @@ enum Actions {
         }
         let p = Process()
         p.executableURL = qt
-        p.arguments = ["--in", dir.path, text]
+        var arguments = ["--in", dir.path]
+        if let model { arguments += ["-m", model] }
+        arguments.append(text)
+        p.arguments = arguments
         p.currentDirectoryURL = dir
         var env = ProcessInfo.processInfo.environment
         env["QT_ORIGIN"] = origin
@@ -383,12 +390,13 @@ enum Actions {
     /// not a near copy of it. Any other refusal is a real failure and is
     /// reported as one rather than retried against /capture, the same line
     /// `decide`'s own 404-only fallback draws.
-    static func askFirst(text: String, rawText: String, dir: URL?,
+    static func askFirst(text: String, rawText: String, dir: URL?, model: String? = nil,
                          base: URL) -> Result<AskFirstOutcome, Problem> {
         let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !stripped.isEmpty else { return .failure("nothing to ask") }
         guard let body = try? JSONSerialization.data(
-                withJSONObject: FireResolve.askFirstBody(text: stripped, dir: dir)) else {
+                withJSONObject: FireResolve.askFirstBody(text: stripped, dir: dir,
+                                                         model: model)) else {
             return .failure("the ask body is not JSON")
         }
         var request = URLRequest(url: base.appendingPathComponent("asks"))
