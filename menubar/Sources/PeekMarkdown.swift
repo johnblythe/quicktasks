@@ -217,6 +217,10 @@ private func inlineSpans(_ text: String) -> [InlineSpan] {
     var spans: [InlineSpan] = []
     var plain = ""
     var i = text.startIndex
+    // One scan up front: a '[' past the last ']' can never open a link,
+    // so the degenerate case (a pile of unmatched brackets, arbitrary
+    // model output) costs one pass instead of one pass per bracket.
+    let lastBracket = text.lastIndex(of: "]") ?? text.startIndex
 
     func flushPlain() {
         if !plain.isEmpty { spans.append(InlineSpan(style: .plain, text: plain)); plain = "" }
@@ -246,7 +250,7 @@ private func inlineSpans(_ text: String) -> [InlineSpan] {
         }
         // [label](url): the label stays (underlined); the URL is noise in
         // a 480pt peek -- the thread page carries the real link.
-        if rest.hasPrefix("["),
+        if i <= lastBracket, rest.hasPrefix("["),
            let labelEnd = findClosing("]", in: text, after: text.index(after: i)) {
             let afterBracket = text.index(after: labelEnd)
             if afterBracket < text.endIndex, text[afterBracket] == "(",

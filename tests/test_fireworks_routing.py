@@ -212,6 +212,11 @@ class TestFireworksRouting(RoutingBase):
         self.assertEqual(argv[argv.index("--model") + 1], "sonnet[1m]")
         self.assertIsNone(env["ANTHROPIC_BASE_URL"])
         self.assertIsNone(env["ANTHROPIC_AUTH_TOKEN"])
+        # The per-run gate, not the global provider config: an ambient-
+        # login run keeps every capability it had before the provider was
+        # switched on -- WebSearch included.
+        deny = (env["_settings"] or {}).get("permissions", {}).get("deny")
+        self.assertNotIn("WebSearch", deny or [])
 
     def test_short_model_names_expand_router_and_bare_forms(self):
         for short, full in (("glm-5p3", "accounts/fireworks/models/glm-5p3"),

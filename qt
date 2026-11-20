@@ -240,7 +240,7 @@ def _steerable_allowlist():
             if t.startswith("mcp__") and guard.is_read_only_tool(t)}
 
 
-def render_slack_guard_settings(tid, allow_once=()):
+def render_slack_guard_settings(tid, allow_once=(), task=None):
     """Write a one-off Claude Code --settings file wiring the chosen Slack
     guard (see resolve_slack_guard_cmd()) as a PreToolUse hook on
     SLACK_GUARD_MATCHER, plus a `permissions.allow` list (QT_TOOLS_ALLOW)
@@ -251,8 +251,15 @@ def render_slack_guard_settings(tid, allow_once=()):
     unique per run, so two concurrent quick-fires never race on the same
     path -- same convention _seed_hub_item() uses for its own per-item
     fragment file. Returns None (skip --settings) when no guard script
-    exists at all; the caller is responsible for removing the file once
-    the run finishes.
+    exists at all and this run carries no Fireworks routing; the caller
+    is responsible for removing the file once the run finishes.
+
+    `task` (the run's own record) is what decides the WebSearch deny:
+    Fireworks rejects Anthropic's server-side web_search outright, so a
+    run ROUTED there (claude_run_env(task) is not None) denies it up
+    front -- but a run on the ambient Anthropic login (an -m sonnet[1m]
+    fire) keeps every capability it had before the provider was switched
+    on. Keyed to the run, never to the global provider config.
 
     `allow_once` (tool names, `qt continue --allow-once`) is added to this
     run's permissions.allow only: it is rendered into this per-run file and
@@ -263,7 +270,7 @@ def render_slack_guard_settings(tid, allow_once=()):
     allow_once set the file is written even when no guard script exists."""
     guard_path, _source = resolve_slack_guard_cmd()
     allow_once = sorted({t.strip() for t in (allow_once or ()) if t and t.strip()})
-    if not guard_path and not allow_once and not provider_fireworks():
+    if not guard_path and not allow_once and claude_run_env(task) is None:
         return None
     # The user-managed allowlist (~/.quicktasks/allow.json -- written by
     # `qt allow` and the menubar's "Always Allow Tool" action) joins the
@@ -277,7 +284,7 @@ def render_slack_guard_settings(tid, allow_once=()):
         "permissions": {"allow": sorted(set(QT_TOOLS_ALLOW) | _steerable_allowlist()
                                         | set(allow_once))},
     }
-    if provider_fireworks():
+    if claude_run_env(task) is not None:
         # Fireworks rejects Anthropic's server-side web_search tool outright,
         # so a model that reaches for it fails mid-run. Denied here it is
         # told no up front and does its searching another way.
@@ -1942,6 +1949,13 @@ def run_task(tid, interactive=False):
     # the task so the hub can read the live line while the ask is working.
     task["events_path"] = events_path_for(tid)
     save(task)
+    # A `qt stop` can land between the load at the top and this save --
+    # the stop's own write would be silently overwritten and the run would
+    # proceed after the user was told "stopped". Re-read once: if it
+    # flipped, the stop won and this process exits without touching the
+    # record again.
+    if load(tid).get("status") == "stopped":
+        return
 
     try:
         claude = find_claude()
@@ -1970,7 +1984,7 @@ def run_task(tid, interactive=False):
         # quick-fires with no Slack-destination check at all. Not an
         # --allowedTools change -- a quick-fire keeps its normal tool freedom,
         # the hook is the deterministic gate.
-        settings_path = render_slack_guard_settings(tid)
+        settings_path = render_slack_guard_settings(tid, task=task)
         if settings_path:
             cmd += ["--settings", settings_path]
 
@@ -2210,6 +2224,23 @@ def _signal_run(pid, sig):
         pass
 
 
+def _pid_is_ours(pid, tid):
+    """The recorded pid must still BE this task's runner before any signal
+    goes out. After a crash or reboot nothing resets a stale `running`
+    record, macOS recycles pids fast, and `qt stop` (also the menubar
+    receipt's Undo) is exactly the recovery path for those stale records
+    -- so a bare pid check can SIGKILL an innocent recycled process's
+    whole group. The runner's own argv names the task (`qt _run <tid>`,
+    `qt resume <tid> --prompt ...`, `qt continue <tid>`); a pid whose
+    command line does not mention both qt and this tid is not ours."""
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                            capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return False  # cannot verify: do not signal
+    return "qt" in out and tid in out
+
+
 def cmd_stop(fragment):
     """`qt stop <id>`: kill the run's process group, mark the task stopped
     ("Stopped by you"), and feed the hub. Exit 0 also when the task is not
@@ -2222,13 +2253,20 @@ def cmd_stop(fragment):
         return
     pid = task.get("pid")
     if isinstance(pid, int) and pid > 1 and _pid_alive(pid):
-        _signal_run(pid, signal.SIGTERM)
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and _pid_alive(pid):
-            time.sleep(0.05)
-        if _pid_alive(pid):
-            _signal_run(pid, signal.SIGKILL)
-            time.sleep(0.1)
+        if not _pid_is_ours(pid, tid):
+            # A stale record holding a recycled pid: the run is long gone,
+            # and whatever owns that pid now is not ours to kill. Mark the
+            # task stopped and move on.
+            print(f"{tid}: runner pid {pid} is no longer this task "
+                  f"(stale record; marking stopped without signaling)")
+        else:
+            _signal_run(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and _pid_alive(pid):
+                time.sleep(0.05)
+            if _pid_alive(pid):
+                _signal_run(pid, signal.SIGKILL)
+                time.sleep(0.1)
     task = load(tid)  # the run may have finished on its own while we killed it
     if task.get("status") not in ("running", "queued"):
         print(f"{tid}: not running ({task.get('status')})")
@@ -2396,7 +2434,8 @@ def cmd_resume_prompt(fragment, prompt_text, thread=None, allow_once=(), kind=No
     ]
     if task.get("model"):
         cmd += ["--model", claude_model_arg(task)]
-    settings_path = render_slack_guard_settings(tid, allow_once=allow_once)
+    settings_path = render_slack_guard_settings(tid, allow_once=allow_once,
+                                                 task=task)
     if settings_path:
         cmd += ["--settings", settings_path]
 
@@ -3507,7 +3546,11 @@ qt · fire-and-forget quicktasks for Claude Code
   qt "do a thing"        queue a task, return immediately, notify on finish
   qt -w "do a thing"     run in the foreground and print the result
   qt --in <dir> "..."    run the task in <dir> (in place if trusted)
-  qt -m <model> "..."    override the model for this task
+  qt -m <model> "..."    override the model for this task (short names
+                          like glm-5p3 run on Fireworks when provider
+                          "fireworks" is configured; sonnet/opus/claude-*
+                          stay on your Claude login; "haiku" follows the
+                          Fireworks haiku slot when routed)
   qt list [n]            recent tasks (default 15)
   qt log <id>            full record + raw log path (id fragments ok)
   qt open <id>           open the ask page (hub on), else RESULT.md / its result

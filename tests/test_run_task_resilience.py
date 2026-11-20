@@ -67,7 +67,7 @@ class RunTaskResilienceTests(unittest.TestCase):
         # failure or a real side effect in any of them can't be mistaken
         # for a run_task() resilience regression.
         self.qt.find_claude = lambda: "/usr/bin/true"
-        self.qt.render_slack_guard_settings = lambda tid: None
+        self.qt.render_slack_guard_settings = lambda tid, allow_once=(), task=None: None
         self.qt.notify = lambda *a, **k: None
         self.qt.notify_blocked = lambda *a, **k: None
         self.feed_hub_calls = []

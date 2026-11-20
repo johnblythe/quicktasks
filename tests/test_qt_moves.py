@@ -202,6 +202,35 @@ class TestStop(QtMovesBase):
         self.assertTrue(_wait_for(lambda: not _alive(claude_pid)))
         self.assertEqual(self.task()["status"], "stopped")
 
+    def test_stop_with_a_stale_recycled_pid_never_signals_it(self):
+        """After a crash nothing resets a stale `running` record, and macOS
+        recycles pids fast -- `qt stop` on such a record must verify the
+        pid still belongs to this task's runner before any signal goes
+        out, or it can SIGKILL an innocent process's whole group. A bare
+        `sleep` holding the recorded pid is not ours: it survives, the
+        task is still marked stopped."""
+        import subprocess as sp
+        sleeper = sp.Popen(["sleep", "300"])
+        self.addCleanup(lambda: _alive(sleeper.pid) and
+                        sp.run(["kill", str(sleeper.pid)],
+                               capture_output=True))
+        tid = "261119-150000-stale-recycled"
+        (self.qt_data / "tasks").mkdir(parents=True, exist_ok=True)
+        (self.qt_data / "tasks" / f"{tid}.json").write_text(json.dumps({
+            "id": tid, "prompt": "a run that crashed long ago",
+            "status": "running", "created": "2026-11-19T15:00:00",
+            "origin": "qt", "invoked_from": "/tmp", "run_cwd": "/tmp",
+            "perm_mode": "acceptEdits", "pid": sleeper.pid,
+            "session_id": None, "result": None, "cost_usd": None}))
+        r = self.qt("stop", tid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stale record", r.stdout)
+        self.assertTrue(_alive(sleeper.pid),
+                        "qt stop signaled a pid that was never this task's")
+        t = self.task()
+        self.assertEqual(t["status"], "stopped")
+        self.assertEqual(t["result"], "Stopped by you")
+
     def test_stop_unknown_id_exits_1(self):
         (self.qt_data / "tasks").mkdir(parents=True)
         r = self.qt("stop", "nope-nothing")

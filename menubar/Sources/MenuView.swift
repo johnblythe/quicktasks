@@ -3393,8 +3393,17 @@ struct AskRowView: View {
     /// The answer, rendered: blocks + styled runs from PeekMarkdown, so
     /// headings read as headings, lists as bullets, emphasis as weight --
     /// the same digestibility the desk's pane and the address page have.
+    /// Built once per answer: the row's body re-evaluates on every poll
+    /// tick, and re-parsing 12 KB each second for an unchanged answer is
+    /// the difference between an idle menu and a main-thread churner.
+    @State private var peekBuilt: (key: String, value: AttributedString)?
+
     private var peekAnswer: AttributedString {
-        peekAttributedString(peekBlocks(cappedAnswer))
+        let key = cappedAnswer
+        if let built = peekBuilt, built.key == key { return built.value }
+        let value = peekAttributedString(peekBlocks(key))
+        peekBuilt = (key, value)
+        return value
     }
 
     private var helpText: String {
