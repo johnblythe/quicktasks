@@ -18,6 +18,22 @@
 //    "denied_tools": ["mcp__claude_ai_Slack__slack_search_users"],
 //    "ts": "...", "source": "qt|hub-local-notify|hub-runner"}
 //
+// Q6 adds the v2 payload the hub's bell writes (plan 1.8) -- v1 keys all
+// still present, so an older build keeps posting, and this build keeps the
+// v1 categories for v1 payloads:
+//
+//   {"v": 2, "kind": "answer", "ask_id": "qt-...", "task_id": "...",
+//    "title": "...", "body": "...", "sound": false,
+//    "url": "http://127.0.0.1:8811/ask/qt-...", "denied_tools": [],
+//    "moves": ["follow_up", "copy", "open"], "ts": "...", "source": "hub-bell"}
+//
+// A v2 payload maps kind -> one of the ask.* categories (Notifier.swift):
+// answer/failed/blocked/question carry the actions that answer in place,
+// receipt and reminder are plain informative banners. `sound` is honored
+// only for the sounding kinds (failed, blocked, question, reminder) -- the
+// bell decides, the client enforces the ceiling, so a quiet answer stays
+// passive whatever the payload claims.
+//
 // --dump-inbox-notice <file.json> is the CLI seam: it decodes one payload
 // and prints the Notice it would post as JSON, so tests pin the mapping
 // without a display or a real Notification Center.
@@ -41,13 +57,81 @@ struct InboxNotice: Codable {
     let denied_tools: [String]?
     let ts: String?
     let source: String?
+    // Q6: the v2 bell payload (plan 1.8). All optional: a v1 drop from an
+    // older producer decodes with every one of them absent.
+    let v: Int?
+    let ask_id: String?
+    let sound: Bool?
+    let moves: [String]?
 
     private var openURL: String? { url ?? pass_url }
+
+    /// A bell (v2) payload rather than a producer's v1 drop. `v >= 2` is
+    /// the honest signal; ask_id or one of the kinds v1 never had are the
+    /// tolerant readings, so a bell that ever omits `v` still maps right.
+    var isV2: Bool {
+        if let v, v >= 2 { return true }
+        if ask_id != nil { return true }
+        return ["answer", "question", "receipt", "reminder"].contains(kind ?? "")
+    }
+
+    /// What handleInbox tells the job tracker to mark already handled, so
+    /// the poll that later observes the same landing does not banner twice
+    /// on top of the producer's own (Q6: "poll-detected fallback notices
+    /// suppressed when an inbox v2 notice for the same ask_id/run
+    /// arrived"). The tracker keys rows by their dedup id -- for a qt ask
+    /// that is the bare tid (the "qt-" prefix hub item ids carry is
+    /// stripped by PassStatus.dedupKey), for a hub item the item id, which
+    /// is the ask id verbatim -- so every spelling is suppressed.
+    struct Suppression: Equatable {
+        let id: String
+        let status: TaskStatus
+    }
+
+    func suppressions() -> [Suppression] {
+        if isV2 {
+            let statuses: [TaskStatus]
+            switch kind {
+            case "answer": statuses = [.done]
+            // A timed-out run lands as .timeout on the legacy row; the
+            // bell calls both "failed", so both keys are claimed.
+            case "failed": statuses = [.failed, .timeout]
+            case "blocked": statuses = [.blocked]
+            // question / receipt / reminder have no legacy-row transition
+            // that could double them.
+            default: return []
+            }
+            var ids = [ask_id, task_id].compactMap { $0 }
+            if let askID = ask_id, askID.hasPrefix("qt-") {
+                ids.append(String(askID.dropFirst(3)))
+            }
+            var out: [Suppression] = []
+            for status in statuses {
+                for id in ids where !out.contains(where: { $0.id == id && $0.status == status }) {
+                    out.append(Suppression(id: id, status: status))
+                }
+            }
+            return out
+        }
+        // v1: today's mapping, unchanged (plus the timeout twin for the
+        // same reason as above).
+        guard let tid = task_id else { return [] }
+        switch kind {
+        case "blocked": return [Suppression(id: tid, status: .blocked)]
+        case "failed": return [Suppression(id: tid, status: .failed),
+                               Suppression(id: tid, status: .timeout)]
+        case "timeout": return [Suppression(id: tid, status: .timeout),
+                                Suppression(id: tid, status: .failed)]
+        case "done": return [Suppression(id: tid, status: .done)]
+        default: return []
+        }
+    }
 
     /// The rich notice this payload becomes. Pure and seam-tested; the
     /// watcher and the dump seam both go through here so a banner can never
     /// drift from what the test asserted.
     func toNotice(uuid: String = UUID().uuidString) -> Notice {
+        if isV2 { return askNotice(uuid: uuid) }
         let tid = task_id
         let resume = resume_url ?? tid.map { "quicktask://resume/\($0)" }
         switch kind {
@@ -73,6 +157,32 @@ struct InboxNotice: Codable {
                           title: title, subtitle: subtitle, body: body,
                           category: .plain, passURL: openURL, taskID: tid)
         }
+    }
+
+    /// The v2 mapping: one ask.* category per bell kind, the ask's one
+    /// address as the click-through, and sound only when the bell set it
+    /// *and* the kind may interrupt.
+    private func askNotice(uuid: String) -> Notice {
+        let askID = ask_id ?? task_id
+        let category: Notice.Category
+        switch kind {
+        case "answer": category = .askAnswer
+        case "failed": category = .askFailed
+        case "blocked": category = .askBlocked
+        case "question": category = .askQuestion
+        case "receipt": category = .askReceipt
+        case "reminder": category = .askReminder
+        default: category = .plain
+        }
+        let maySound = ["failed", "blocked", "question", "reminder"].contains(kind ?? "")
+        let id = askID ?? uuid
+        return Notice(id: "ask-\(id)-\(kind ?? "notice")",
+                      title: title, subtitle: subtitle, body: body,
+                      category: category,
+                      passURL: openURL,
+                      allowTools: denied_tools ?? [],
+                      sound: maySound && (sound ?? false),
+                      askID: askID)
     }
 }
 
@@ -237,12 +347,16 @@ final class InboxWatcher {
         case .blocked: actions = ["Resume in Terminal", "Always Allow Tool", "Open in Pass"]
         case .blockedNoAllow: actions = ["Resume in Terminal", "Open in Pass"]
         case .outcome: actions = ["Open in Pass"]
+        case .askAnswer, .askFailed, .askBlocked, .askQuestion, .askReceipt, .askReminder:
+            actions = (AskNotice.actions[n.category] ?? []).map(\.title)
         case .plain: actions = []
         }
         let out: [String: Any] = [
             "id": n.id, "title": n.title,
             "subtitle": n.subtitle ?? NSNull(), "body": n.body ?? NSNull(),
             "category": n.category.rawValue, "actions": actions,
+            "sound": n.sound,
+            "ask_id": n.askID ?? NSNull(),
             "resume_url": n.resumeURL ?? NSNull(), "pass_url": n.passURL ?? NSNull(),
             "task_id": n.taskID ?? NSNull(),
             "allow_tools": n.allowTools,

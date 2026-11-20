@@ -62,6 +62,21 @@ final class StatusController: ObservableObject {
     /// reruns the whole `MenuView.body` and the chip sits in it
     /// unconditionally.
     @Published private(set) var recentDirs: [String] = []
+
+    // MARK: Q6 -- the ask feed, owned by the controller
+
+    /// The ask feed (Q6, lifted out of MenuView's @State so the cadence is
+    /// single-sourced): every poll tick loads it alongside the legacy
+    /// model, which is what lets the menu-bar badge count asks while no
+    /// window is open at all. Nil until the first ask poll lands.
+    @Published private(set) var askFeed: AskFeed?
+    /// The board the rows draw, rebuilt once per ask poll. Published apart
+    /// from `askFeed` so a view can observe the derived shape without
+    /// paying for the derivation on every read.
+    @Published private(set) var askBoard: AskBoard?
+    /// One ask poll at a time, the same rule as `pollInFlight`.
+    private var askPollInFlight = false
+
     private let defaults: UserDefaults
     private var poll: Timer?
     private var ticker: Timer?
@@ -102,6 +117,14 @@ final class StatusController: ObservableObject {
     /// (NotifyInbox.swift). Nil beside a RecordingNotifier, so no seam or
     /// test ever watches the real filesystem.
     private var inboxWatcher: InboxWatcher?
+    /// Bumped by every apply() so a refresh() that was already in flight
+    /// when the settings changed cannot write its resolve back over the
+    /// just-applied config. Without it, the launch-time poll's write-back
+    /// could land mid-`--dump-outcomes` sequence and resurrect the
+    /// pre-apply toggle -- the off -> on authorization edge then reads as
+    /// a no-op and "requested exactly once more" intermittently fails
+    /// (~15% under load, a queue-timing race, nothing environmental).
+    private var configGen = 0
 
     enum Keys {
         static let collapsed = "menubar.collapsedSections"
@@ -184,6 +207,18 @@ final class StatusController: ObservableObject {
         // between launchd and the icon, which for a login item means a menu
         // bar that comes up blank for a second and a half.
         self.model = Store.load(config: config)
+        // The ask feed's own first read follows the same rule as the model
+        // above: only the file fallback is available synchronously (the
+        // qt ledger mapped locally, no unseen, no moves -- Feed.loadAsks's
+        // no-Pass path). With a Pass configured, the network ask poll
+        // rides the first refresh() below; until it lands the badge shows
+        // the legacy aggregate, which is the honest number for a widget
+        // that has not heard from the hub yet.
+        if config.passURL == nil {
+            let feed = Feed.loadAsks(config: config)
+            askFeed = feed
+            askBoard = AskBoard.build(feed: feed)
+        }
         // The notification-authority inbox lives beside the real notifier
         // only: qt/hub drop JSON notices into $QT_DATA/notify-inbox and this
         // app posts them with action buttons under its own bundle identity.
@@ -245,6 +280,9 @@ final class StatusController: ObservableObject {
             // A banner that names its task deep-links: panel opens with the
             // row highlighted and expanded (2026-11-03).
             system.onOpenRecord = { [weak self] id in self?.revealRecord(id) }
+            // An ask banner's action or click (Q6): the move POSTs, the
+            // copy, the open, and the reveal-and-seen click-through.
+            system.onAskRoute = { [weak self] route in self?.handleAskRoute(route) }
         }
         // Asked once here if the toggle is already on at launch; `apply`
         // asks again only on an off-to-on flip, so "requested on first
@@ -275,28 +313,43 @@ final class StatusController: ObservableObject {
         // but a directory replace can drop an event, and poll cadence is
         // already the app's "check everything" heartbeat.
         inboxWatcher?.sweep()
+        // The ask feed rides this same tick (Q6): one cadence for both
+        // feeds, and the badge knows about asks whether or not any window
+        // is open. It has its own in-flight guard, so a slow ask poll
+        // never blocks the legacy model's refresh and vice versa.
+        refreshAsks()
         // Snapshotted on the main thread before the hop to background, so the
         // hold-timer logic sees exactly what the last poll left on screen,
         // with no race against this same property being read or written back
         // on the main thread while the background block is in flight.
         let previous = model
+        // Snapshotted on the main thread, like `previous`: the settings the
+        // controller holds right now, and the generation they belong to. The
+        // background resolve pins its settings to this snapshot -- a disk
+        // re-read could race the very apply() that triggered this refresh and
+        // load a stale toggle back -- and the write-back below only lands
+        // when no apply() has since bumped the generation.
+        let settingsNow = config.settings
+        let gen = configGen
         // Feed.load blocks on a loopback request, so it must never run on the
         // main thread: a wedged Pass would freeze the open menu. The config is
-        // resolved out here too, so re-reading .pass-url and the settings costs
-        // the main thread nothing either.
+        // resolved out here too, so re-reading .pass-url costs the main thread
+        // nothing either.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             // Probed here, off the main thread: this is the path that lets
             // the running widget self-heal from a stale `.pass-url` left
             // behind by a Pass that has since died, rather than polling a
             // dead port until the app is relaunched.
-            let config = StoreConfig.resolve(probeDiscovery: true)
+            let config = StoreConfig.resolve(settings: settingsNow, probeDiscovery: true)
             let fresh = Feed.load(config: config, previous: previous)
             // Same tasksDir scan the chip's menu used to run from `body`;
             // done here instead, off the main thread, at poll cadence.
             let dirs = RecentDirs.load(tasksDir: config.tasksDir)
             DispatchQueue.main.async {
                 self?.pollInFlight = false
-                self?.config = config
+                if let self, self.configGen == gen {
+                    self.config = config
+                }
                 // clearing(): presentational only -- the job tracker below
                 // still diffs the unfiltered `fresh`, so a cleared row
                 // changing state never re-notifies as a false transition.
@@ -329,6 +382,38 @@ final class StatusController: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - asks (Q6)
+
+    /// The ask poll (lifted out of MenuView's @State, Q3's flagged
+    /// follow-up): one ask list fetch at a time, off the main thread, with
+    /// the previous feed's `rev` riding along as `since_rev` exactly as the
+    /// view-local poll did -- an unchanged hub answers with the two-field
+    /// body instead of the whole list. `refresh()` calls it every tick so
+    /// the cadence is the poll's own; a completed move calls it directly so
+    /// the row reflects the write without waiting for the next tick.
+    func refreshAsks() {
+        guard !askPollInFlight else { return }
+        askPollInFlight = true
+        let previous = askFeed
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let config = StoreConfig.resolve()
+            let feed = Feed.loadAsks(config: config, previous: previous)
+            DispatchQueue.main.async {
+                self?.askPollInFlight = false
+                self?.askFeed = feed
+                self?.askBoard = AskBoard.build(feed: feed)
+            }
+        }
+    }
+
+    /// Where ask reads and writes go: the URL the ask feed itself was read
+    /// from, so the two can never point at different hubs (Q3's rule, moved
+    /// here with the poll).
+    var askBaseURL: URL? {
+        let raw = askFeed?.passURL ?? config.passURL?.absoluteString
+        return raw.flatMap(URL.init(string:))
     }
 
     // MARK: - sections
@@ -386,6 +471,9 @@ final class StatusController: ObservableObject {
         let oldCombo = config.settings.hotkeyCombo
         let oldNotify = config.settings.notifyWhenHidden
         new.save(defaults)
+        // Any refresh() already in flight must not write its resolve back
+        // over this: bump the generation its write-back checks first.
+        configGen += 1
         config = StoreConfig.resolve(settings: new)
         if abs(new.pollInterval - oldInterval) > 0.01 { restartPoll(new.pollInterval) }
         if new.hotkeyCombo != oldCombo { globalHotkey?.register(new.hotkeyCombo) }
@@ -514,20 +602,73 @@ final class StatusController: ObservableObject {
     /// regardless of the notifyWhenHidden toggle and window visibility,
     /// unlike the widget's own poll discoveries above. Authorization is
     /// requested lazily: a first-ever notice can arrive before the toggle
-    /// ever flipped on. Blocked notices also suppress the job tracker's
-    /// poll-based equivalent, so the same block never banners twice.
+    /// ever flipped on. The notice's suppressions also mark the job
+    /// tracker's poll-based equivalents handled, so the same landing never
+    /// banners twice (Q6), and the ask feed catches up right away so the
+    /// row the banner was about is there when a click reveals it.
     func handleInbox(_ payload: InboxNotice) {
-        if let tid = payload.task_id {
-            switch payload.kind {
-            case "blocked": jobTracker.suppress(id: tid, status: .blocked)
-            case "failed": jobTracker.suppress(id: tid, status: .failed)
-            case "timeout": jobTracker.suppress(id: tid, status: .timeout)
-            case "done": jobTracker.suppress(id: tid, status: .done)
-            default: break
-            }
+        for suppression in payload.suppressions() {
+            jobTracker.suppress(id: suppression.id, status: suppression.status)
         }
         notifier.requestAuthorizationIfNeeded()
         notifier.post(payload.toNotice())
+        refreshAsks()
+    }
+
+    /// What an ask banner's action or click becomes (Q6). The delegate
+    /// hands over the pure `AskNoticeRoute`; everything that touches the
+    /// network, the pasteboard, or the panel happens here, on the main
+    /// thread, where the outcome queue can say what happened.
+    func handleAskRoute(_ route: AskNoticeRoute) {
+        switch route {
+        case .click(let id):
+            // A banner click reveals the row -- panel open, highlighted,
+            // expanded -- and marks the ask seen: reading it from the
+            // banner is the same read as expanding it in the list.
+            revealRecord(id)
+            postAskSeen(id)
+        case .move(let id, let move, let body):
+            guard let base = askBaseURL else {
+                post(kind: .error, title: "The Pass is down; \(move) did not go",
+                     detail: "The move will be offered on the row once it answers.")
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = AskClient(base: base).post(id: id, move: move, body: body)
+                DispatchQueue.main.async {
+                    if result.ok {
+                        self?.refresh()
+                    } else {
+                        // The hub's own words -- a 409's message *is* the
+                        // answer ("That ask is already done."), never
+                        // "HTTP 409". Notified too: the banner is gone, so
+                        // the outcome queue is the only place left to say.
+                        self?.post(kind: .error, title: AskMoveLine.failure(result),
+                                   notify: true)
+                    }
+                }
+            }
+        case .copy(let text):
+            guard !text.isEmpty else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            post(kind: .ok, title: "Copied the answer")
+        case .open(let url):
+            if let target = URL(string: url) { NSWorkspace.shared.open(target) }
+        case .none:
+            break
+        }
+    }
+
+    /// `seen` for an ask read from its banner rather than its row. The
+    /// badge drops on the next refresh; the refresh here makes it drop
+    /// now.
+    private func postAskSeen(_ id: String) {
+        guard let base = askBaseURL else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = AskClient(base: base).post(id: id, move: "seen")
+            DispatchQueue.main.async { self?.refreshAsks() }
+        }
     }
 
     /// "Neither the dropdown nor the summon panel is visible" -- the gate
@@ -863,12 +1004,31 @@ struct QuicktaskStatusApp: App {
                       passStaleSince: controller.model.passStaleSince)
     }
 
+    /// Q6: the badge the hub counts, not the legacy aggregate, whenever the
+    /// ask feed is live. `counts.badge` is the hub's own number, verbatim
+    /// -- the same "never recount locally" rule the header applies -- with
+    /// the working count standing in when nothing needs John, and the
+    /// legacy aggregate intact for the hubs and fallbacks that do not
+    /// speak asks (before the first ask poll lands, included).
+    private var iconAggregate: Aggregate {
+        guard let board = controller.askBoard, board.speaksAsks else {
+            return controller.model.aggregate
+        }
+        if board.badge > 0 { return .attention(board.badge) }
+        if board.counts.working > 0 { return .running(board.counts.working) }
+        return .idle
+    }
+
     /// "Tooltip must name the state" -- distinct wording per health, so
     /// hovering the dot answers the question the dot's own shape only hints
-    /// at.
+    /// at. When the ask feed is live the ask board's own headline says it
+    /// ("2 asks need you"), in the same words the open menu's header uses.
     private var iconTooltip: String {
         switch iconHealth {
         case .normal:
+            if let board = controller.askBoard, board.speaksAsks {
+                return board.headline
+            }
             return controller.model.headlineText
         case .heldStale:
             return "Holding since \(sinceStale) \u{00B7} Pass isn't answering"
@@ -886,7 +1046,7 @@ struct QuicktaskStatusApp: App {
         MenuBarExtra {
             MenuView(controller: controller)
         } label: {
-            Image(nsImage: MenuBarIcon.image(for: controller.model.aggregate, health: iconHealth))
+            Image(nsImage: MenuBarIcon.image(for: iconAggregate, health: iconHealth))
                 .help(iconTooltip)
         }
         // Window style rather than a classic NSMenu: a real text field for
@@ -945,6 +1105,10 @@ enum Entry {
               --dump-decide <id> <confirm|deny|go|snooze> [comment]
                                       print the POST /decide body and exit
               --dump-search <query>   print what the quick search matches, and why
+              --ask-notice <payload.json> [--ask-action <id>] [--ask-text <text>]
+                                      print the notice one bell payload becomes
+                                      (category, sound, actions, routed POST);
+                                      --ask-action really posts that move
               --dump-settings         print the stored settings and what they resolved to
               --post-run <id>         really POST /run for an item and print the outcome
               --post-decide <id> <action>
@@ -952,6 +1116,8 @@ enum Entry {
               --dump-restart          print the POST /restart request (method, path, Origin)
               --post-restart          really POST /restart and print the outcome
               --snapshot <png>        render the dropdown to a PNG and exit
+              --expand <id-substring>
+                                      with --snapshot, pre-expand the matching ask row
               --snapshot-settings <png>
                                       render the settings window to a PNG and exit
               --dump-layout           print panel-layout measurements as JSON and exit
@@ -974,6 +1140,14 @@ enum Entry {
                                       also where LoginItem looks for it first
             """)
             return
+        }
+        // The ask seams (Q2+) used to need the --dump-model companion
+        // flag, because Entry only dispatched on that; since Q6 Entry
+        // routes any --ask-* argument straight to AskSeams, which also
+        // keeps the old `--dump-model --ask-*` spellings working (it
+        // ignores flags it does not read).
+        if args.contains(where: { $0.hasPrefix("--ask-") }) {
+            exit(AskSeams.run(args: args))
         }
         if args.contains("--dump-model") {
             exit(DumpModel.run(args: args))

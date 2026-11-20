@@ -36,6 +36,12 @@ import AppKit
 
 enum DumpModel {
     static func run(args: [String]) -> Int32 {
+        // The ask seams (`--ask-dump-model`, `--ask-post`, ...) ride in on
+        // `--dump-model` because Entry only dispatches on that flag; see
+        // AskSeams.swift.
+        if args.contains(where: { $0.hasPrefix("--ask-") }) {
+            return AskSeams.run(args: args)
+        }
         // `--poll-sequence` replaces the rest of this function with a replay
         // of several simulated polls in one process, so a test can drive the
         // hold-timer lifecycle deterministically. See `runPollSequence`.

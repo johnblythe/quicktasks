@@ -1,38 +1,50 @@
 # Quicktask menu-bar widget
 
 A macOS status-menu app for `qt` and The Pass. The menu-bar icon is a coloured
-dot showing aggregate state; the dropdown has a quick-fire field at the top,
-collapsible sections for what is running, what needs you, and what finished, and
-a footer with the feed's health and the controls.
+dot whose count badge is the hub's own "asks that need you" number; the
+dropdown has the ask field at the top ("Ask for something…"), collapsible
+sections for what is new, what needs you, what is running, and what is yours,
+and a footer with the feed's health and the controls.
 
-It is the front door to the whole loop, not just to `qt`: a run in flight, an
-item the router held at a gate, a finished job waiting on a verdict, and a dead
-run are all one click from here.
+It is the front door to the whole loop, not just to `qt`: every quicktask and
+every Pass job/item is an **ask** — one id, one address, one state machine,
+one set of moves — and this menu is one of two views over the same JSON the
+hub serves. An answer to read, a question the run ended on, a permission it is
+blocked on, a failure to redo, and your own to-dos with reminders are all one
+click from here.
 
 ```
-●3                                       <- menu bar: dot + count
+●2                                       <- menu bar: dot + badge (asks that need you)
 
-⚡ Fire a quick task…
-  [ Run now | To Pass ]
+⚡ Ask for something…
+  [ Run now | Ask me first ]
 ─────────────────────────────────────────
-● 3 tasks need you
+● 2 asks need you
 ─────────────────────────────────────────
-⌄ Running                              2
-  ● Spinnaker stale pipeline…  Running 4:13 ↗
-  ● look thru atlas and see…   Running 0:41 ↗
-⌄ Needs you                            4
-  ● Draft Q3 roadmap rev…  Verify · 49m ▤ ✓ ↺ ✕ ↗
-  ● Prep the vendor renewal…  Needs go · 7d ▶
-  ● Shepherd app for Gonfalon    Blocked · 2h ↗
-  ● Dossier: Agent Platform…    Failed · 4h ✓ ↺ ✕
-⌄ Done today                           2
-  ● Secure hiring approval…        Done · 1h ▤ ↗
-› Earlier                              1
+⌄ New for you                        1
+  ● Billing contact for the GitHub…  New answer · 3m   R ⇧R C ⏎ E
+⌄ Needs you                         4
+  ● Draft Q3 roadmap rev…  Asks you · 49m   (inline answer field)
+  ● Prep the vendor renewal…  Needs your OK · 7d
+  ● Shepherd app for Gonfalon    Blocked · 2h   A ⇧A X
+  ● Dossier: Agent Platform…    Failed · 4h   ⏎ ↺ ✕ …
+⌄ Working                            2
+  ● Spinnaker stale pipeline…  Working 4:13 · searching Slack   X
+  ● look thru atlas and see…   Working 0:41                     X
+⌄ Yours today                        1
+  ● Renew the SSL cert   Reminds you at 3:00 PM   E R D
 ─────────────────────────────────────────
-Recent runs only · the Pass has 412 jobs
+Find any ask ⌘F · Open the desk ⌘D
 Refreshed 11:55 AM  ● Pass        ▤ ↻ ⏻
 Start at login  (  )
 ```
+
+That is the asks view, drawn whenever the hub's `/asks.json` answers. When the
+hub predates the ask API (a 404) the dropdown keeps the legacy Pass view —
+Running, Needs you, Done today, Earlier, with the verdict and Run-it buttons
+documented further down — and when no Pass answers at all it falls back to the
+file ledgers, mapped to the same ask sections locally. Neither of those older
+views changed.
 
 ## Install
 
@@ -66,7 +78,7 @@ Other flags:
 
 Opening the app again while it is already running -- from Finder, Spotlight,
 or a stray `open`ing of the bundle -- does not draw a second menu-bar dot: it
-asks the one running instance to show the same quick-fire panel `⌥Q` opens,
+asks the one running instance to show the same ask panel `⌥Q` opens,
 then exits.
 
 ### Starting it at login
@@ -94,13 +106,13 @@ If you would rather use a login item: System Settings → General → Login Item
 
 ## Using it
 
-**Quick-fire, two ways.** Type into the field at the top and press return. The
-segmented toggle under it decides where the text goes, and the choice is
-remembered. `Tab` flips it without touching the field; `⌘1`/`⌘2` select Run
-now/To Pass directly; `⌘⏎` fires with whichever mode is *not* currently
-selected, once, without moving the remembered default -- the hint caption
-under the field ("Tab swaps · ⌘⏎ fires the other way") is there so this is
-never a party trick you have to remember.
+**The ask field, two ways.** Type into "Ask for something…" at the top and
+press return. The segmented toggle under it decides what ⏎ does with the
+words, and the choice is remembered. `Tab` flips it without touching the
+field; `⌘1`/`⌘2` select Run now/Ask me first directly; `⌘⏎` fires with
+whichever mode is *not* currently selected, once, without moving the
+remembered default -- the hint caption under the field ("Tab swaps · ⌘⏎ fires
+the other way") is there so this is never a party trick you have to remember.
 
 - **Run now** shells out to `qt <your text>`, the same entry point a terminal
   uses, so the task lands in the same ledger with the same notification and
@@ -109,17 +121,36 @@ never a party trick you have to remember.
   permission mode instead of silently escalating -- see **The directory
   chip** below for where that directory actually comes from and how to change
   it per fire, not just globally.
-- **To Pass** posts to `POST /capture`, which files it as an item needing your
-  go rather than running it. The flash message names the id The Pass assigned
-  (`cap-20260904-153933-7ab83a9`). Text over 4000 characters is refused here
-  rather than sent, since the route answers 400 for it. To Pass ignores the
-  directory chip and any typed `--in`/`@` prefix outright: the raw text,
-  prefix included, goes to `/capture` unstripped, because a gate item has no
-  directory field to put one in.
+- **Ask me first** posts to `POST /asks` with `{text, mode: "ask_first",
+  door, dir}` -- the `--in`/`@` prefix parsed and stripped, the resolved
+  directory sent along -- so the hub files the words as an ask that waits for
+  your OK rather than running anything. A hub old enough to answer 501/404
+  gets today's behaviour instead: the raw, unstripped text to `POST /capture`,
+  filed as a gate item, byte for byte the To-Pass fire it has always been, and
+  the success line says so ("On the Pass: \<full text\>") rather than
+  pretending the ask was created. That capture leg ignores the directory chip
+  and any typed prefix outright, and refuses text over 4000 characters rather
+  than sending it for the route's 400.
+
+A successful fire leaves a **receipt** under the field -- the fixed words plus
+the one thing you can still do about it. Run now: "Got it. Running. The
+answer will come to you here." Ask me first: "Got it. It waits for your OK."
+Run now's receipt carries an **Undo** (a 10-minute window, the same one the
+hub's own undo tokens live for): it resolves the fired ask off the board,
+stops the run (`qt stop`), and files the ask away (`drop`). The receipt is
+drawn separately from the 1.2-second success flash on purpose -- the undo
+window is minutes, not a blink, and the receipt is the only thing on the panel
+that can still act after the fire itself is done.
+
+**Ask again.** Under the field sits the recent done asks, newest first. A
+click loads that ask's own words back into the field, so re-firing is one ⏎
+in whichever mode is set, rather than a blind re-run of something finished
+days ago.
 
 **The directory chip**, next to the mode toggle, shows the directory Run now
-will use, `~`-abbreviated, and dims when To Pass is selected since it does
-not apply there. Clicking it opens a menu of the eight most recently used
+will use, `~`-abbreviated, and dims when Ask me first is selected (that mode
+sends the resolved directory along in its own POST; the chip itself is a
+Run-now control). Clicking it opens a menu of the eight most recently used
 directories (read off `run_cwd` in the `qt` task ledger, most recent first),
 plus **Choose…** (pick any folder) and **Reset to default**. The chosen
 directory is remembered across launches. You can also just type it: a prefix
@@ -130,7 +161,7 @@ chip remembers. Resolution order, highest first: the typed prefix, then
 `QT_MENUBAR_FIRE_DIR`, then the chip's own last choice, then `$HOME`.
 
 **Summon hotkey.** A global shortcut -- `⌥Q` by default, changeable (or
-clearable) in Settings -- opens quick-fire from anywhere: it shows the panel,
+clearable) in Settings -- opens the ask panel from anywhere: it shows the panel,
 brings the app forward, and focuses the field, so typing can start
 immediately. That focus lands the same way on every summon, not just the
 first: the panel is activated and made a real key window before
@@ -145,31 +176,111 @@ Accessibility or Input Monitoring permission -- unlike
 `NSEvent.addGlobalMonitorForEvents`, which would ask for one. Because
 SwiftUI's `MenuBarExtra` has no supported way to trigger its own dropdown
 from code, the summon hotkey opens a separate floating window hosting the
-same quick-fire view rather than the real menu-bar dropdown; clicking the
+same ask-field view rather than the real menu-bar dropdown; clicking the
 menu-bar dot still opens the real dropdown exactly as before, unchanged.
 
-**Firing feedback.** The quick-fire field never leaves you unsure whether a
-fire took: pressing return disables the field and the mode toggle and shows
-"Firing…" (Run now) or "Sending to the Pass…" (To Pass) in place of the hint
-caption. On success it shows "Fired: \<first 40 characters\>" (Run now) or
-"On the Pass: \<full text\>" (To Pass, never truncated) for about 1.2
-seconds, then clears the field -- and, in the summon panel only, hides it
-too; the real dropdown never closes on a fire. On failure the field stays
-exactly as typed, disabled state lifts, and the same message space shows the
-refusal in red -- "qt not found; run install.sh", "could not run qt: …", "the
-Pass is not answering" -- until the next attempt replaces it. These states
-are shared by the summon panel and the real dropdown's own quick-fire field,
-since both host the same view.
+**Firing feedback.** The ask field never leaves you unsure whether a fire
+took: pressing return disables the field and the mode toggle and shows
+"Firing…" (Run now) or "Asking…" (Ask me first) in place of the hint caption.
+On success it shows "Fired: \<first 40 characters\>" (Run now) or "On the
+Pass: \<full text\>" (the capture fallback on an older hub, never truncated)
+for about 1.2 seconds, then clears the field -- and, in the summon
+panel only, hides it too; the real dropdown never closes on a fire. While a
+live receipt is drawing, the success line itself stays quiet so the same fact
+is not said twice. On failure the field stays exactly as typed, disabled
+state lifts, and the same message space shows the refusal in red -- "qt not
+found; run install.sh", "could not run qt: …", "the Pass is not answering" --
+until the next attempt replaces it. These states are shared by the summon
+panel and the real dropdown's own ask field, since both host the same view.
 
-**Sections.** Running, Needs you, Done today, Earlier. Click a header to
-collapse it; the state is remembered in `UserDefaults`. Only Earlier starts
-collapsed: the two sections that carry actions have to be open the moment the
-menu opens, or the widget has buried the thing it exists to surface. Inside
-Needs you the order is fixed -- verify, gate, blocked, failed -- because a
-verdict is the cheapest action available and it is holding a finished job's
-result.
+**Sections (asks view).** New for you, Needs you, Working, Yours today. Click
+a header to collapse it; the state is remembered in `UserDefaults`. None of
+them starts collapsed: the sections that carry actions have to be open the
+moment the menu opens, or the widget has buried the thing it exists to
+surface.
 
-**Row actions**, left to right after the status text:
+- **New for you** holds the unseen answers -- the rows the bell rang about --
+  first, because they are the reason the menu got opened.
+- **Needs you** holds everything waiting on a decision, in attention order:
+  questions first (a run ended asking you something), then blocked, then
+  failed, then unknown states (a hub that grows a tenth state still surfaces
+  its rows, not buries them), then wants-your-OK, then the rest -- because a
+  question is the thing only you can answer and a verdict is the cheapest
+  action available.
+- **Working** holds the live runs: title, a stopwatch ticking every second
+  off the wall clock, and the live line -- the hub's `now_line`, "searching
+  Slack", "reading 14 files", "quiet for 2 min" -- when the hub sends one.
+- **Yours today** holds your own to-dos (no live agent work), sorted
+  soonest-reminder first, each showing when its nudge comes, or its age.
+- Done and dropped asks are hidden, not re-bucketed: a done ask sitting in
+  "Needs you" would be a lie with a chevron on it.
+
+**Ask rows.** A row's status word is the hub's own state -- New answer,
+Answer, Asks you, Blocked, Failed, Working, Needs your OK, Heard, Yours; an
+unknown state keeps the hub's raw word, because the row should still say what
+the hub called it rather than guess. The **eye button** at the row's tail
+expands it in place: it fetches the thread (`GET /asks/<id>.json`) and draws
+the full `answer_text` in a clipped, height-capped scroll -- one row at a
+time, the same one-peek-at-a-time gesture the menu has always had, cached per
+id + `updated_at` so re-expanding costs nothing, and opening on the hub's
+`reason` first when the row is a failure. Expanding an unseen answer also
+posts `seen`, which is the moment it stops counting toward the badge. The
+**title**, and ⏎ on the highlight, open the ask's one address in the
+browser instead -- reading a thread is the one thing every ask always allows,
+so it is never dimmed.
+
+**Move buttons and keys.** The buttons come from the hub's own `moves` list
+-- the server is the source of truth -- so a move the hub did not offer is a
+button the row does not draw, and a feed that carries no moves at all (the
+file fallback, a Pass that is down) shows rows that read but do not act.
+Curated per state:
+
+| State | Buttons (key) |
+| --- | --- |
+| answer | Follow up… (R) · Redo with changes… (⇧R) · Copy (C) · Open (⏎) · Done (E) |
+| failed | Try with changes… (⏎) · Try again · I'll do it · Drop |
+| blocked | Allow once (A) · Always allow (⇧A) · Skip · Stop (X) |
+| question | an inline Answer… field -- the one affordance a question has |
+| working | Stop |
+
+Text moves open a field right in the row. Try with changes opens it
+prefilled with the ask's original words, because "what would you change" is a
+question that starts from what was said; every other text move opens empty. A
+failed row also carries a "Last attempt: 30m · $1.12 · Sonnet" line from its
+own facts, and the hub's plain-word `reason` for the failure.
+
+Every write whose response carries an undo token draws an **undo line** under
+the row; `Z` spends the last one, and undo is about the last write, not the
+row under the cursor. A 409 or 501 is an answer, not a fault: the hub's own
+message shows (a 409 names the state the ask is actually in and the moves it
+has now), never a dead button.
+
+Keys are inert while any field has focus -- a row's editor, a question's
+answer box, find, the remind picker -- which is what keeps typing into a
+follow-up field from firing R, E, or Z under the words.
+
+**Yours rows** carry their own bare keys, resolved the same way and gated on
+the hub's `moves` list: `E` done, `R` remind (opens the same picker ⌥⏎ opens,
+prefilled with the reminder the row already carries, so adjusting one is a
+one-keystroke edit), `D` drop, and Run when the hub offers it. A yours row's
+title opens the ask's address, the same rule every other row opens by.
+
+**Find any ask (⌘F).** The find field asks the hub, not the local list:
+`GET /asks/search` over every ask ever -- done and archived included, words,
+titles, and answers -- and the results arrive as rows (title, where the query
+matched, the snippet). Typing is debounced so a phrase is one request; a
+click or ⏎ expands a result in place, the same expand a section row runs,
+`seen` included when the found ask is still unseen. Esc or an emptied field
+closes it and brings the sections back exactly as they were. Typing a bare
+letter outside any field still starts the local **filter**, which narrows the
+rows on screen across every section; Esc clears it.
+
+**The desk (⌘D).** Opens the hub's desk -- the same asks, one per thread, on
+the base URL every ask read and write uses. It is a browser page, so the
+panel's business is only opening it.
+
+**Legacy rows** (the `/status.json` view a hub without the ask API draws),
+left to right after the status text:
 
 | Icon | Shown when | Does |
 | --- | --- | --- |
@@ -224,21 +335,33 @@ model's time.
 
 | Key | Does |
 | --- | --- |
-| ↓ / ↑ | Moves a highlight through the visible rows. The ends do not wrap. |
-| ⏎ | Takes the highlighted row's primary action: resume if there is a session, else the item's deep link. |
-| ⎋ | Clears the quick-fire field, then the highlight. |
-| Tab | (in the quick-fire field) Flips Run now/To Pass and remembers the flip. |
-| ⌘1 / ⌘2 | (in the quick-fire field) Selects Run now/To Pass directly. |
-| ⌘⏎ | (in the quick-fire field) Fires with the other mode once, without moving the remembered default. |
-| ⌥Q (configurable) | Summons the panel from anywhere, even while some other app is focused, and focuses the quick-fire field every time; pressing it again while showing closes it. |
+| ↓ / ↑ | Moves a highlight through the visible rows (ask sections, yours rows, find results). The ends do not wrap. |
+| ⏎ | Takes the highlighted row's primary action. An ask row: its return-key button when it has one (Try with changes on a failed row), else opens the ask's one address. A legacy row: resume if there is a session, else the item's deep link. |
+| R / ⇧R / C / E | On a highlighted answer row: Follow up… / Redo with changes… / Copy / Done. |
+| A / ⇧A / X | On a highlighted blocked row: Allow once / Always allow / Stop. |
+| E / R / D | On a highlighted yours row: Done / Remind… / Drop. |
+| Z | Spends the last undo line's token. Undo is about the last write, not the row under the cursor. |
+| any letter | Starts the local filter, narrowing the rows on screen across every section. |
+| ⎋ | Backs out one thing at a time, innermost first: a row's open editor, the remind picker, find (its query first, then the field), the filter, the ask field, then the highlight. |
+| Tab | (in the ask field) Flips Run now/Ask me first and remembers the flip. |
+| ⌘1 / ⌘2 | (in the ask field) Selects Run now/Ask me first directly. |
+| ⌘⏎ | (in the ask field) Fires with the other mode once, without moving the remembered default. |
+| ⌥⏎ | (in the ask field) Remind me instead: opens the reminder picker over the typed words. |
+| ⌘F | Opens find across every ask ever (the hub's `/asks/search`), results as rows. |
+| ⌘D | Opens the hub's desk. |
+| ⌥Q (configurable) | Summons the panel from anywhere, even while some other app is focused, and focuses the ask field every time; pressing it again while showing closes it. |
 
-The quick-fire field owns the arrows and return while it has focus, which is
-what keeps "type, press return, task fired" working. The first arrow key the
-panel sees drops that focus, so the keys land on the list from then on. Return
-is never a verdict and never a fire: both of those ask first, and a keystroke
-that spends a job slot is not one to discover by accident. A highlight whose row
-has left the feed is dropped rather than moved, because the row under the cursor
-changing identity between polls is how you act on the wrong thing.
+A field with focus owns every key, letters included -- the ask field, the
+filter, find, the remind picker, a row's editor, a question's answer box --
+which is what keeps "type, press return, ask fired" working and typing into a
+follow-up field from firing R, E, or Z under the words. The first arrow key
+the panel sees drops the field's focus, so the keys land on the list from
+then on. Return is never a fire and never a done-without-undo: the write
+keys post their move and draw the undo line the response carries, and a
+keystroke that spends a job slot is not one to discover by accident. A
+highlight whose row has left the feed is dropped rather than moved, because
+the row under the cursor changing identity between polls is how you act on
+the wrong thing.
 
 **Tooltips** carry what the row has no width for: the item id, its lane, the
 permission-denial count, the output count, and the error text from a run that
@@ -277,17 +400,20 @@ it; an Origin the gate refused (403) reports the refusal.
 
 | Colour | Meaning |
 | --- | --- |
-| Blue | At least one run running or queued. Count badge. |
-| Orange | Nothing running; something needs you. |
+| Orange | Something needs you. Count badge. |
+| Blue | Nothing needs you; at least one run working. Count badge. |
 | Grey | All quiet. |
 
-Row dots are coloured by *why* the row needs you, not by the job status
-underneath -- teal for verify, purple for a gate, orange for blocked, red for
-failed, green for a clean finish -- because a finished job awaiting a verdict is
-not green.
-
-Running beats attention in the aggregate, because an in-flight run is the thing
-most likely to change in the next few seconds.
+In the asks view the count is the hub's own `counts.badge`, verbatim, and it
+outranks working: an in-flight run changes on its own in the next few
+seconds, an ask waiting on you does not. (The legacy `/status.json` view
+keeps its own precedence -- running beats attention -- and its own count.)
+Ask row dots follow the state: orange for question/blocked/failed, green for
+working, blue for a wants-your-OK and for an unseen answer, grey for a seen
+answer and anything quiet. Legacy row dots stay coloured by *why* the row
+needs you, not by the job status underneath -- teal for verify, purple for a
+gate, orange for blocked, red for failed, green for a clean finish -- because
+a finished job awaiting a verdict is not green.
 
 **Outcomes** (LD-201 v8). Every producer of "something just happened" --
 quick-fire, a row action, the login-item toggle, a Restart Pass verdict,
@@ -334,6 +460,39 @@ that, at most one down/back pair reaches Notification Center every ten
 minutes: a second outage that starts inside that window still records its
 own history-only outcomes, it just does not interrupt anyone a second time.
 
+**Ask notifications** (Asks, slice 2). The hub's bell writes a v2 payload
+into the notify inbox (`$QT_DATA/notify-inbox/<uuid>.json`, with
+`"source": "hub-bell"`) for every event that deserves one -- an answer, a
+failure, a block, a question, a receipt that an ask from a voice or Slack
+door landed, a reminder coming due -- and each kind maps to its own
+notification category, so the banner's buttons are the ones that ask
+carries:
+
+| Category | Buttons | Sound |
+| --- | --- | --- |
+| `ask.answer` | Follow up… (text input) · Copy · Open | no |
+| `ask.failed` | Try again · Change it… (text input) · Open | yes |
+| `ask.blocked` | Allow once · Always allow · Skip that step | yes |
+| `ask.question` | Answer… (text input) | yes |
+| `ask.receipt` | — | no |
+| `ask.reminder` | — | yes |
+
+Sound is what buys the time-sensitive interruption level, and only the
+sounding kinds (failed, blocked, question, reminder) may set it: an answer or
+a receipt is a passive banner that waits to be noticed, a block or a question
+may interrupt. The text-input buttons are real notification text inputs: the
+typed words POST as that move's body (`follow_up`, or `retry_with_changes`
+for Change it…) through the same `AskClient` the rows use, to the same ask
+id; every other button POSTs its own move; Copy and Open are client-only,
+no route. Clicking the banner itself reveals the ask's row -- the panel
+opens with that row highlighted and expanded -- and posts `seen`, so the
+badge drops the moment you have looked: reading it from the banner is the
+same read as expanding it in the list. A refused move answers in the hub's
+own words as an outcome, because the banner is already gone. Older producers
+keep dropping v1 payloads, which map to today's categories unchanged, and
+the poll-detected fallback notices are suppressed when an inbox v2 notice
+for the same ask has already landed -- an answer is one banner, not two.
+
 **The dot's health** (LD-201 v8). Independent of the blue/orange/grey
 busy-versus-attention colour above, the same dot carries a second signal for
 whether what is on screen is trustworthy: a small notch punched out of its
@@ -357,9 +516,44 @@ second too.
 
 ## Where the state comes from
 
-Two feeds, in this order.
+Three feeds, in this order -- the ask API, then (only when the hub predates
+it) the `/status.json` the menu has always read, then the file ledgers.
 
-**The Pass, over HTTP.** `GET /status.json` every 5 seconds, v2:
+**The hub's ask list.** `GET /asks.json` every 5 seconds, with the previous
+poll's `rev` riding along as `since_rev`, so an unchanged hub answers
+`{unchanged: true, rev}` instead of resending everything. The payload:
+`{v, rev, generated_at, counts:{badge, needs, working, done, yours, unseen},
+asks:[row]}`. Each row carries `id`, `title`, `words`, `state`, `place`,
+`unseen`, `suggested`, `door`, `ledger`, `ref`/`item_id`, the
+`created_at`/`updated_at`/`finished_at` stamps, `now_line` (working rows),
+`reason` (failed rows), `question`, `blocked_tools`, `answer_excerpt`,
+`facts` (elapsed, cost, model, session, run dir), `moves`, `can_run`,
+`remind_at`, and `url` -- the ask's one address. Two of those fields are
+load-bearing by design:
+
+- `counts.badge` is the menu-bar badge and the headline's number, verbatim --
+  never recounted locally, because two clients counting differently is how a
+  badge starts to lie. The working count stands in when nothing needs you.
+- `moves` is the server-computed list of moves the ask accepts right now,
+  and it is the source of truth for every button and key on the row: a move
+  the hub did not offer is a button the row does not draw, whichever feed is
+  live.
+
+Threads come from `GET /asks/<id>.json` when a row expands (`answer_text`,
+the timeline, the runs), fetched off the main thread and cached per id +
+`updated_at` so re-expanding costs nothing. Writes are
+`POST /asks/<id>/<move>`: a 409 carries `{ok:false, message, state, moves}`
+and the row shows the hub's own message -- the state the ask is actually in
+-- never an HTTP status or a dead button; a 501 (move registered but not
+built) and a 503 (ledger busy) are answers the same way. Unknown fields are
+ignored and an unknown state renders gray with the hub's raw word, never
+fatal. The hub itself delegates a qt-ledger ask's run moves to the `qt` CLI
+(`qt retry`, `qt stop`, `qt continue`, `qt resume --prompt`) -- the menu
+never spawns anything but the fire and the receipt's Undo.
+
+**The Pass, over HTTP (a hub without the ask API).** When `/asks.json`
+answers 404, the same poll falls through to `GET /status.json` every 5
+seconds, v2, exactly as before, and the dropdown draws the legacy view:
 
 ```json
 {"generated_at": "...", "pass_url": "http://127.0.0.1:8811/",
@@ -473,10 +667,14 @@ Three states, visible in both the footer and `--dump-model`:
 | Files only | grey | `files` | `false` | set once The Pass has gone down, else `null` | `null` |
 
 Even in Pass mode the qt ledger is still read and merged. A task fired with `qt`
-(or with this widget's quick-fire) does not reach The Pass until it finishes,
+(or with this widget's ask field) does not reach The Pass until it finishes,
 and "I just fired that and it is not in the list" is where the widget would lose
 trust. The hub `jobs/` directory is *not* read in Pass mode: `/status.json`
 already covers it, and reading both would give two answers for the same run.
+In the asks view the same trust is the hub's to keep, and it does: the hub
+derives `/asks.json` from the qt ledger itself, so a task fired seconds ago
+is already on the board -- queued reads as heard, running as working -- long
+before any finish feed could carry it.
 
 **The files, when The Pass does not answer.** This is the whole v1 model, not a
 degraded slice of it:
@@ -485,6 +683,20 @@ degraded slice of it:
 | --- | --- | --- |
 | `~/.quicktasks/tasks/<id>.json` | `qt` | quicktasks, plus finished Pass jobs copied in by `hub/run-job.sh` (tagged `"source": "pass"`) |
 | `<hub>/jobs/<slug>/job.json` | hub `runner.py` | Pass jobs, plus finished quicktasks copied in by `qt`'s `_feed_hub()` (as `item_id: "qt-<task id>"`) |
+
+In the asks era the file fallback still speaks asks: the qt task ledger is
+read straight off disk and mapped to ask rows locally, with the same
+status-to-state mapping the hub applies (queued → heard, running → working,
+question → question, blocked → blocked, failed/timeout/stopped → failed,
+done → answer, dropped → done), newest first, result text folded into the
+excerpt/reason/question fields, denied tools into `blocked_tools`, and the
+ask's address stitched in whenever the ledger knows the hub base. But it
+knows nothing the files do not: no unseen (nothing is ever "New for you"),
+no moves, no sidecar state -- so its rows read, open, and expand off the
+recorded result, but offer no buttons, because every move goes through the
+hub and the hub is the thing that is down. Bridge records (finished Pass
+jobs copied back into the qt ledger) are skipped, same as the hub's own
+derivation: they mirror jobs the hub already counts.
 
 The footer's Pass dot says which feed is live, green for The Pass and grey for
 the files, with the reason in its tooltip. It has to be visible: "all quiet" and
@@ -553,7 +765,28 @@ QuicktaskStatus --dump-outcomes show,login-on,restart,dismiss-newest   # drive o
 QuicktaskStatus --dump-notifications ok,fail,fail,ok \
   --poll-interval-seconds 5 --hold-window-seconds 10   # replay a poll sequence through the health-episode/job trackers
 QuicktaskStatus --snapshot out.png               # render the dropdown to a PNG
+QuicktaskStatus --snapshot out.png --expand <id-substring>   # ...with one ask row pre-expanded
 QuicktaskStatus --snapshot-settings out.png      # render the settings window to a PNG
+QuicktaskStatus --ask-dump-model [--ask-since-rev <rev>]
+                                                # the ask feed: source, rev, counts, rows
+QuicktaskStatus --ask-dump-rows [--ask-expand <id>] [--ask-done <id>] [--ask-undo]
+                                                # the ask menu: badge, sections, rows, buttons, keys
+QuicktaskStatus --ask-dump-thread <id> [--ask-updated-at <stamp>] [--ask-repeat <n>]
+                                                # a thread fetch through the cache (n proves the cache hit)
+QuicktaskStatus --ask-post <id> <move> [json]   # really POST one move; exit 1 when it did not take
+QuicktaskStatus --ask-press <id> <key> [--ask-text <text>] [--ask-in-field]
+                                                # the key walkthrough: what a bare key on that row posts
+QuicktaskStatus --ask-notice <payload.json> [--ask-action <id>] [--ask-text <text>]
+                                                # a bell payload as its notice: category, sound, actions, routes
+QuicktaskStatus --ask-fire <text> [--ask-mode run|ask_first] [--ask-panel] [--ask-undo]
+                                                # the ask field's fire, really performed, receipt and Undo included
+QuicktaskStatus --ask-again [<id-substring>]    # the Ask-again list; with an id, the words it reloads
+QuicktaskStatus --ask-remind "<text>" [--ask-at "<spec>"]
+                                                # ⌥⏎'s write, really performed; --ask-row <id> is a
+                                                # yours row's own remind move, --ask-at "none" clears
+QuicktaskStatus --ask-find "<query>" [--ask-expand <id>]
+                                                # ⌘F's search, really performed, results as rows
+QuicktaskStatus --ask-desk                      # ⌘D's target: the desk URL, printed
 QuicktaskStatus --help
 ```
 
@@ -593,13 +826,13 @@ actually succeeded, without touching a real running widget's own
 registration. `--dump-summon <tokens>` drives `toggleHotkeyPanel()` and
 `hideHotkeyPanel()` directly -- the same calls the real hotkey and Escape
 make -- through a comma-separated sequence of `summon`/`escape` tokens, and
-reports whether the panel is visible, key, and has the quick-fire field as
+reports whether the panel is visible, key, and has the ask field as
 its first responder after each one; it is how the LD-201 v7 fix (focus
 landing on every summon, not only the first) is tested without a display.
 `--dump-fire-outcome <text> [--mode run|pass] [--panel]` really performs the
 fire against whatever `QT_BIN`/`QT_PASS_URL` the environment points at, then
-runs the result through the same `FireFieldOutcome.describe()` the quick-fire
-field itself calls, so the printed state/message/`hides_panel` can never
+runs the result through the same `FireFieldOutcome.describe()` the ask field
+itself calls, so the printed state/message/`hides_panel` can never
 drift from what the field would show; `--panel` reports as the standalone
 summon panel (which closes on a successful fire) rather than the real
 dropdown (which never does). `--dump-recent-dirs` prints the directory chip's recency menu,
@@ -637,7 +870,32 @@ step's outcome plus that step's `episode_started`/`notified_down`/
 `last_pair_at` bookkeeping, and the cumulative `outcomes`/`notified` queues.
 `--snapshot` and `--snapshot-settings` render the real view
 against the real feeds using the view's own `cacheDisplay`, so neither needs
-Screen Recording permission and both work over SSH.
+Screen Recording permission and both work over SSH. `--snapshot --expand
+<id-substring>` pre-expands one ask row in the shot, through the same expand
+plan a click runs.
+
+The `--ask-*` family is the same idea pointed at the ask paths: every one of
+them runs the real feed, the real `AskClient`, and the real decode, then
+prints JSON, so a test -- or a person dogfooding -- asserts on what the
+widget would show without a display or a live hub. Both spellings work
+(`--dump-model --ask-dump-rows` or a bare `--ask-dump-rows`), since Entry
+routes any `--ask-*` argument directly. The ones worth knowing by hand:
+`--ask-dump-rows` is a read-only way to inspect the live ask menu (source,
+badge, the sections with every row's detail, affordances, and move buttons,
+plus the legacy ids when the hub predates the ask API); `--ask-dump-model`
+the raw feed behind it; `--ask-post` performs one move for real (a 409 is an
+answer, not a crash: exit 1, the hub's message printed);
+`--ask-dump-thread` proves the thread cache (`--ask-repeat 2` makes the
+second fetch hit the cache, no request); `--ask-press` resolves a bare key
+the way the root key handler does, and posts what the resolved button would
+(`--ask-in-field` proves the inert case); `--ask-notice` decodes one bell
+payload into exactly the banner it becomes, category, sound, actions, and
+the POST each action routes to; `--ask-remind` parses the same time specs
+the picker accepts ("in 2h", "3p", "15:30", "tonight", "tomorrow 9a",
+"none" to clear); and `--ask-fire` performs the ask field's fire through the
+same calls the field makes -- where `--dump-fire` describes only the
+fallback (capture) leg of Ask me first, `--ask-fire` covers both legs, lands
+the receipt, and spends its Undo.
 
 Environment:
 
@@ -662,10 +920,12 @@ settings, all without touching the real ones.
 ## Tests
 
 ```bash
+make test                # everything, including the menubar modules
+make test-quiet          # same, minus the modules whose seams put panels on screen
 python3 -m unittest discover -s tests -p 'test_menubar_model.py' -v
 ```
 
-297 tests in `tests/test_menubar_model.py` (326 across the whole suite, 38 of
+317 tests in `tests/test_menubar_model.py` (722 across the whole suite, 38 of
 them new for LD-201 v8: the persistent outcome queue's insert/cap/dismiss/
 mark-seen behaviour, the login-item and Restart Pass outcomes in both their
 success and forced-failure shapes, Settings Apply's outcome, the notification
@@ -689,7 +949,30 @@ file-feed row never offering the button, a `revivable: true` done job
 sorting into Done today with no new section, an older hub's payload
 defaulting the flag false when the field is missing outright, and the real
 subprocess environment threading `QT_ORIGIN=widget` from the dropdown
-versus `QT_ORIGIN=summon` from the hotkey panel). They build the
+versus `QT_ORIGIN=summon` from the hotkey panel). A further 146 are new for Asks,
+the daily driver, across six new modules that drive the real binary through
+the `--ask-*` seams against an `AskFixturePass` loopback server recording
+its POSTs: `test_asks_feed` (row/thread decode with unknown fields and
+states, the asks → `/status.json` → files feed order, the qt ledger mapped
+to asks locally, move POSTs and their 409 answers), `test_asks_rows`
+(section order, the badge verbatim off the hub's counts, expand-fetches-and-
+posts-seen, Open never dimmed, done with its undo line, the expanded
+snapshot), `test_asks_moves_ui` (buttons from the hub's own `moves` list,
+the try-with-changes prefill, keys posting their moves and inert inside a
+field, undo from response tokens, the 501's own message), `test_asks_bell`
+(a category per bell kind, sound only for the sounding kinds, a reply
+posting its follow-up with the typed text, v1 payload fallback, no duplicate
+against the poll's own notice), `test_asks_field` (run-now fires qt,
+ask-me-first posts `/asks` with the `/capture` fallback, the receipt's undo
+stops and drops, `now_line` and `reason` rendered), and `test_asks_yours`
+(the Yours today section, remind posts in both its forms, find results, the
+desk). The CLI side lands in the repo's own suite: `test_qt_moves`
+(`qt stop` kills a fake-claude sleeper and its child, `qt retry` keeps the
+id), `test_qt_continue` (allow-once lands in that run's settings only, the
+skip prompt, the `ASK:` question status and its off switch),
+`test_qt_stream` (events written, the result parsed from stream-json, the
+json path kept), and `test_bell_delegation` (the banner skip when the hub
+has `bell.py`, standalone and old-hub notifies unchanged). They build the
 real binary against throwaway fixtures, matching the repo's existing style of
 testing the real thing as a subprocess rather than reimplementing its logic.
 Coverage: `/status.json` v2 parsing field by field and the `needs_you` join in
@@ -753,24 +1036,28 @@ The module skips rather than fails when `swiftc` is unavailable.
 
 | File | Purpose |
 | --- | --- |
-| `Sources/Model.swift` | Status and reason vocabulary, `TaskRecord`, sections, `MenuModel`, aggregate, ordering, the keyboard highlight |
+| `Sources/Model.swift` | Status and reason vocabulary, `TaskRecord`, sections, `MenuModel`, aggregate, ordering, the keyboard highlight -- and the ask menu: `AskRowModel`, `AskSections`/`AskBoard` (badge, headline), `AskRowMoves`, `AskKeys`, `YoursMoves` |
+| `Sources/Ask.swift` | The ask vocabulary: `AskState`, `Ask`, `AskCounts`, `AskThread` -- the contract's row and thread JSON decoded, unknown fields ignored, unknown states gray |
+| `Sources/AskClient.swift` | The ask HTTP client: the list (with `since_rev`), threads (cached per id + `updated_at`), move POSTs and their 404/409/501/503 answers |
+| `Sources/AskSeams.swift` | The `--ask-*` CLI seams: the ask tests (and dogfooding) drive the real paths through here |
 | `Sources/PassStatus.swift` | Parsing `/status.json`; building the three POST bodies |
 | `Sources/PassClient.swift` | The only file that touches the network; Pass discovery |
-| `Sources/Feed.swift` | Feed selection and the Pass/ledger merge |
+| `Sources/Feed.swift` | Feed selection and the Pass/ledger merge; the ask feed -- `/asks.json` with `since_rev`, the 404 and unreachable fallbacks, the qt ledger mapped to asks locally |
 | `Sources/Store.swift` | Reads and deduplicates the two file ledgers |
-| `Sources/Actions.swift` | Fire, capture, run, resume, open a report or an item, post a verdict |
+| `Sources/Actions.swift` | Fire, capture, run, resume, open a report or an item, post a verdict; ask moves, the Ask-me-first fire, remind, find |
 | `Sources/LoginItem.swift` | The "Start at login" switch |
-| `Sources/MenuView.swift` | The dropdown, including the outcome banner |
+| `Sources/MenuView.swift` | The dropdown, including the outcome banner, the ask sections and rows, yours, find, the remind picker, the receipt |
 | `Sources/MenuBarIcon.swift` | The menu-bar dot, its busy/attention/idle colour, and its `IconHealth` (normal/held-stale/files-only) shape |
 | `Sources/Outcome.swift` | The persistent outcome queue: `Outcome`, `OutcomeStore` |
 | `Sources/Transitions.swift` | Turns a model change into an outcome: `HealthTransition`, `JobTransition`, and the cross-poll trackers behind them, `HealthEpisodeTracker` and `JobTransitionTracker` (LD-201 v9) |
-| `Sources/Notifier.swift` | The `Notifier` protocol; `SystemNotifier` (real) and `RecordingNotifier` (tests, snapshots, every headless seam) |
+| `Sources/Notifier.swift` | The `Notifier` protocol; `SystemNotifier` (real) and `RecordingNotifier` (tests, snapshots, every headless seam); the `ask.*` categories, their banner actions, and the routes they POST |
+| `Sources/NotifyInbox.swift` | The notify-inbox watcher: v1 and v2 (bell) payloads decoded into notices, and the suppressions that keep a landed answer to one banner |
 | `Sources/Freshness.swift` | The footer's always-on freshness line |
-| `Sources/App.swift` | Entry point, polling controller, `MenuBarExtra` scene |
-| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-revive`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--post-revive`, `--dump-restart`, `--post-restart`, `--dump-outcomes`, `--dump-notifications` (LD-201 v9, revive LD-224) |
-| `Sources/Snapshot.swift` | `--snapshot`, `--snapshot-settings` |
+| `Sources/App.swift` | Entry point, polling controller (asks and legacy), `MenuBarExtra` scene, ask-banner routes |
+| `Sources/DumpModel.swift` | `--dump-model`, `--dump-endpoint`, `--dump-capture`, `--dump-run`, `--dump-revive`, `--dump-decision`, `--dump-keys`, `--dump-fire`, `--dump-hotkey`, `--dump-recent-dirs`, `--post-run`, `--post-revive`, `--dump-restart`, `--post-restart`, `--dump-outcomes`, `--dump-notifications` (LD-201 v9, revive LD-224); hands any `--ask-*` argument to AskSeams |
+| `Sources/Snapshot.swift` | `--snapshot`, `--snapshot-settings`, the ask pre-expand |
 | `Sources/Hotkey.swift` | Carbon global hotkey registration, the mode-swap keys, the recorder control in Settings |
-| `Sources/FireResolve.swift` | What a fire actually does: directory precedence, `--in`/`@` prefix parsing, the recent-dirs list, and the shared description `--dump-fire` and ⌘⏎ both call |
+| `Sources/FireResolve.swift` | What a fire actually does: directory precedence, `--in`/`@` prefix parsing, the recent-dirs list, the shared description `--dump-fire` and ⌘⏎ both call, and `AskReceipt` -- the landing line and its Undo |
 | `build.sh` | Compile, bundle, sign, install, optionally register the agent |
 | `com.quicktasks.menubar.plist` | LaunchAgent template, shared by `build.sh` and the toggle |
 
@@ -794,7 +1081,8 @@ modal window rather than the inline field the reference design shows.
 arbitrary SwiftUI, which is the only one of the three that gives a genuine
 inline text field, real coloured dots, hover states, inline verdict buttons, and
 a footer row. It also turned out to be the *lowest*-maintenance option, not the
-highest: twelve source files compiled by the system `swiftc` with zero runtime
+highest: the sources -- a couple dozen files by now -- are compiled by the
+system `swiftc` with zero runtime
 dependencies, versus a pip dependency that breaks on Python upgrades. No Xcode
 needed, only Command Line Tools, verified against Swift 6.2.4 on macOS 26.4. The
 repo already builds and ad-hoc signs an app bundle this way in

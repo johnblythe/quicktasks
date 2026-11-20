@@ -256,3 +256,267 @@ enum Feed {
         return s
     }
 }
+
+// MARK: - Asks
+
+/// Where a poll's asks came from.
+///
+///   asks    GET /asks.json answered; the hub derived everything.
+///   status  this hub has no ask API (404); `model` is the /status.json feed,
+///           exactly as `Feed.load` has always produced it, and `asks` is empty.
+///   files   no Pass answered (or none is configured); `asks` is the qt ledger
+///           mapped locally, with no unseen and no moves.
+struct AskFeed {
+    enum Source: String {
+        case asks
+        case status
+        case files
+    }
+
+    let source: Source
+    let asks: [Ask]
+    let counts: AskCounts
+    let rev: String?
+    let generatedAt: String?
+    /// The Pass base URL in use, nil when the HTTP feed is off.
+    let passURL: String?
+    /// Why the Pass was not used, when it was not.
+    let passError: String?
+    /// The legacy menu model: present only on the `status` path.
+    let model: MenuModel?
+    /// True when this value is the previous poll returned as-is because the
+    /// hub said `{unchanged: true}` for its `rev`.
+    var unchanged: Bool = false
+}
+
+extension Feed {
+    /// The ask feed. Prefers `/asks.json`; a 404 hands off to the unchanged
+    /// `/status.json` path; a Pass that does not answer falls back to the qt
+    /// ledger. `previous` is the last poll this feed returned: when it came
+    /// from the ask API its `rev` rides along as `since_rev`.
+    static func loadAsks(config: StoreConfig,
+                         now: Date = Date(),
+                         previous: AskFeed? = nil,
+                         client: AskClient? = nil,
+                         passClient: PassClient? = nil) -> AskFeed {
+        guard let passURL = config.passURL else {
+            return fileAsks(config: config, now: now, passURL: nil, error: nil)
+        }
+        let asks = client ?? AskClient(base: passURL)
+        let sinceRev = (previous?.source == .asks) ? previous?.rev : nil
+
+        switch asks.list(sinceRev: sinceRev) {
+        case .success(.list(let list)):
+            return AskFeed(source: .asks, asks: list.asks, counts: list.counts,
+                           rev: list.rev, generatedAt: list.generatedAt,
+                           passURL: passURL.absoluteString, passError: nil, model: nil)
+
+        case .success(.unchanged(let rev)):
+            if var same = previous, same.source == .asks, rev == nil || rev == same.rev {
+                same.unchanged = true
+                return same
+            }
+            // Told "unchanged" about a rev we are not holding: ask for it all.
+            if case .success(.list(let list)) = asks.list() {
+                return AskFeed(source: .asks, asks: list.asks, counts: list.counts,
+                               rev: list.rev, generatedAt: list.generatedAt,
+                               passURL: passURL.absoluteString, passError: nil, model: nil)
+            }
+            return fileAsks(config: config, now: now, passURL: passURL.absoluteString,
+                            error: "the Pass answered unchanged for a rev we do not hold")
+
+        case .failure(.notFound):
+            // An older hub: today's path, untouched.
+            let model = Feed.load(config: config, now: now, previous: previous?.model,
+                                  client: passClient)
+            if model.source == .pass {
+                return AskFeed(source: .status, asks: [], counts: AskCounts(),
+                               rev: nil, generatedAt: nil,
+                               passURL: passURL.absoluteString, passError: nil, model: model)
+            }
+            return fileAsks(config: config, now: now, passURL: passURL.absoluteString,
+                            error: model.passError)
+
+        case .failure(.problem(let problem)):
+            return fileAsks(config: config, now: now, passURL: passURL.absoluteString,
+                            error: problem.message)
+        }
+    }
+
+    /// Test-only: the failure path without a network call, mirroring
+    /// `pollFailed`.
+    static func asksPollFailed(config: StoreConfig, now: Date, problem: Problem) -> AskFeed {
+        fileAsks(config: config, now: now, passURL: config.passURL?.absoluteString,
+                 error: problem.message)
+    }
+
+    private static func fileAsks(config: StoreConfig, now: Date,
+                                 passURL: String?, error: String?) -> AskFeed {
+        let hubBase = passURL
+        let asks = AskLedger.asks(tasksDir: config.tasksDir, hubBase: hubBase)
+        let trimmed = Array(asks.prefix(max(config.limit, 0)))
+        return AskFeed(source: .files, asks: trimmed, counts: AskCounts.compute(trimmed),
+                       rev: nil, generatedAt: nil, passURL: passURL,
+                       passError: error, model: nil)
+    }
+}
+
+/// The qt ledger read as asks, for the poll where no Pass answers.
+///
+/// Rule 2 of section 1.3 and nothing more: each task becomes `qt-<tid>`, the
+/// status maps to a state, and the rest is read straight off the record. It
+/// knows nothing the files do not: no unseen (so nothing is "new for you"), no
+/// sidecar overrides, and no moves, because every move goes through the hub
+/// and the hub is the thing that is down.
+enum AskLedger {
+    /// qt status -> ask state. Anything unrecognised reads as `heard` rather
+    /// than inventing a verdict about a run nobody can see.
+    static func state(forStatus raw: String?) -> AskState {
+        switch raw {
+        case "queued": return .heard
+        case "running": return .working
+        case "question": return .question
+        case "blocked": return .blocked
+        case "failed", "timeout", "stopped": return .failed
+        case "done": return .answer
+        case "dropped": return .done
+        default: return .heard
+        }
+    }
+
+    /// qt `origin` -> ask `door`.
+    static func door(forOrigin raw: String?) -> String {
+        switch raw {
+        case "qt": return "cli"
+        case "raycast": return "raycast"
+        default: return "typed"   // summon, widget, and anything new
+        }
+    }
+
+    static func asks(tasksDir: URL, hubBase: String?) -> [Ask] {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: tasksDir.path) else {
+            return []
+        }
+        var rows: [(Date, Ask)] = []
+        for name in names where name.hasSuffix(".json") {
+            let file = tasksDir.appendingPathComponent(name)
+            guard let data = try? Data(contentsOf: file),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let ask = ask(from: obj, hubBase: hubBase) else { continue }
+            rows.append((sortKey(obj), ask))
+        }
+        // Newest first, like every other list in the widget.
+        return rows.sorted { $0.0 > $1.0 }.map { $0.1 }
+    }
+
+    private static func sortKey(_ obj: [String: Any]) -> Date {
+        for key in ["finished", "started", "created"] {
+            if let d = Store.parseDate(obj[key]) { return d }
+        }
+        return .distantPast
+    }
+
+    static func ask(from obj: [String: Any], hubBase: String?) -> Ask? {
+        guard let tid = obj["id"] as? String, !tid.isEmpty else { return nil }
+        // Rule 1: a bridge record mirrors a hub job the hub already counts.
+        if (obj["source"] as? String) == "pass" { return nil }
+
+        let status = obj["status"] as? String
+        let state = state(forStatus: status)
+        let prompt = (obj["prompt"] as? String) ?? ""
+        let label = (obj["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = (label?.isEmpty == false) ? label! : Store.titleFrom(prompt.isEmpty ? tid : prompt)
+        let result = ((obj["result"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let created = Store.parseDate(obj["created"])
+        let started = Store.parseDate(obj["started"])
+        let finished = Store.parseDate(obj["finished"])
+        let updated = finished ?? started ?? created
+
+        var elapsed: Double?
+        if let s = started, let f = finished { elapsed = max(0, f.timeIntervalSince(s)) }
+        let resumes = (obj["resumes"] as? [Any])?.count ?? 0
+        var facts = AskFacts(elapsedS: elapsed,
+                             costUsd: (obj["cost_usd"] as? NSNumber)?.doubleValue,
+                             model: obj["model"] as? String,
+                             runDir: (obj["run_cwd"] as? String) ?? (obj["invoked_from"] as? String),
+                             runs: 1 + resumes,
+                             sessionId: obj["session_id"] as? String)
+        if (obj["cost_usd"] as? NSNumber) == nil { facts.costUsd = nil }
+
+        var reason: String?
+        var excerpt: String?
+        var question: String?
+        switch state {
+        case .failed, .blocked:
+            reason = result.isEmpty ? nil : AskText.plain(result, limit: 200)
+        case .answer:
+            excerpt = result.isEmpty ? nil : AskText.plain(result, limit: 600)
+        case .question:
+            question = ((obj["question"] as? String).flatMap { $0.isEmpty ? nil : $0 })
+                .map { AskText.plain($0, limit: 600) }
+        default:
+            break
+        }
+        let denials = (obj["denials"] as? [[String: Any]]) ?? []
+        let blockedTools = denials.compactMap { $0["tool_name"] as? String ?? $0["tool"] as? String }
+
+        let id = "qt-\(tid)"
+        return Ask(id: id,
+                   kind: "agent",
+                   title: title,
+                   words: prompt,
+                   state: state,
+                   unseen: false,
+                   door: door(forOrigin: obj["origin"] as? String),
+                   ledger: "qt",
+                   ref: tid,
+                   itemID: id,
+                   createdAt: iso(created),
+                   updatedAt: iso(updated),
+                   finishedAt: iso(finished),
+                   reason: reason,
+                   question: question,
+                   blockedTools: blockedTools,
+                   answerExcerpt: excerpt,
+                   facts: facts,
+                   moves: [],
+                   filed: status == "dropped" ? "dropped" : nil,
+                   url: hubBase.map { $0.hasSuffix("/") ? "\($0)ask/\(id)" : "\($0)/ask/\(id)" })
+    }
+
+    /// ISO 8601 with the local offset, the form the contract promises. qt's
+    /// own stamps are naive local time; this is the `_parse_ts` rule.
+    static func iso(_ date: Date?) -> String? {
+        guard let date else { return nil }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        f.timeZone = .current
+        return f.string(from: date)
+    }
+}
+
+enum AskText {
+    /// Markdown flattened to plain text and cut to `limit` characters, the
+    /// shape `answer_excerpt` has (section 1.4). Not a markdown parser: it
+    /// strips the marks that read badly in a menu row and collapses space.
+    static func plain(_ markdown: String, limit: Int) -> String {
+        var s = markdown
+        let rules: [(String, String)] = [
+            ("```[a-zA-Z0-9_+-]*", ""),            // fence lines
+            ("!?\\[([^\\]]*)\\]\\([^)]*\\)", "$1"),  // links and images keep their text
+            ("(?m)^\\s{0,3}#{1,6}\\s*", ""),        // headings
+            ("(?m)^\\s*>\\s?", ""),                 // quotes
+            ("(?m)^\\s*[-*+]\\s+", ""),             // bullets
+            ("[*_`~]+", ""),                        // emphasis and code marks
+            ("\\s+", " "),
+        ]
+        for (pattern, template) in rules {
+            s = s.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
+        }
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.count <= limit { return s }
+        return String(s.prefix(max(limit - 1, 0))) + "\u{2026}"
+    }
+}

@@ -870,7 +870,7 @@ enum RowFilter {
         fold(query).split(whereSeparator: { $0.isWhitespace }).map(String.init)
     }
 
-    private static func fold(_ s: String) -> String {
+    static func fold(_ s: String) -> String {
         s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
 }
@@ -907,13 +907,13 @@ enum KeyboardNav {
 
     /// Where Return goes when it lands on the panel/dropdown's root
     /// `.onKeyPress`, rather than inside a text field's own `.onSubmit`.
-    /// A focused field -- quick-fire's own, or the search field -- always
-    /// keeps Return for itself; the root handler only gets to act on a
-    /// highlighted row once neither field owns the keystroke. This is the
-    /// fix for the stale-highlight bug: a row highlighted on an earlier
-    /// visit used to steal Return the moment quick-fire regained focus on a
-    /// fresh summon, because the root handler checked only `highlighted`
-    /// and never the field's own focus.
+    /// A focused field -- quick-fire's own, the search field, or a row's
+    /// editor/answer field (Q9) -- always keeps Return for itself; the root
+    /// handler only gets to act on a highlighted row once no field owns the
+    /// keystroke. This is the fix for the stale-highlight bug: a row
+    /// highlighted on an earlier visit used to steal Return the moment
+    /// quick-fire regained focus on a fresh summon, because the root
+    /// handler checked only `highlighted` and never the field's own focus.
     enum ReturnTarget: Equatable {
         case field
         case row(String)
@@ -921,8 +921,8 @@ enum KeyboardNav {
     }
 
     static func returnTarget(highlighted: String?, fieldFocused: Bool,
-                             searchFocused: Bool) -> ReturnTarget {
-        if fieldFocused || searchFocused { return .field }
+                             searchFocused: Bool, rowFieldFocused: Bool = false) -> ReturnTarget {
+        if fieldFocused || searchFocused || rowFieldFocused { return .field }
         if let id = highlighted { return .row(id) }
         return .none
     }
@@ -951,4 +951,575 @@ func stopwatch(_ seconds: TimeInterval) -> String {
     let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60)
     if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
     return String(format: "%d:%02d", m, s)
+}
+
+// MARK: - Ask rows (Q3: rows that read the answer)
+
+/// The sections the menu draws ask rows in, in the order the plan fixes:
+/// unseen answers first (they are the reason the bell rang), then everything
+/// that needs John, then what is running. `yours` has no section until slice
+/// 5 (Q11) and `done` is excluded by the hub's own default list, so neither
+/// is a case here.
+enum AskSection: String, CaseIterable {
+    case newForYou = "new_for_you"
+    case needsYou = "needs_you"
+    case working
+
+    var label: String {
+        switch self {
+        case .newForYou: return "New for you"
+        case .needsYou: return "Needs you"
+        case .working: return "Working"
+        }
+    }
+
+    var order: Int {
+        switch self {
+        case .newForYou: return 0
+        case .needsYou: return 1
+        case .working: return 2
+        }
+    }
+}
+
+/// One ask as the menu draws it. Pure over the `Ask` row, so the seam
+/// (`--ask-dump-rows`) and MenuView's rows are built by the same code and
+/// cannot drift apart.
+struct AskRowModel: Equatable, Identifiable {
+    let ask: Ask
+    let section: AskSection
+
+    var id: String { ask.id }
+    var title: String { ask.title }
+    var gray: Bool { ask.state.isGray }
+
+    /// The state word for the row's right-hand column. An unknown state keeps
+    /// the hub's own raw string -- the row still says what the hub called it
+    /// rather than guessing a verdict about a state it cannot read.
+    var detail: String {
+        switch ask.state {
+        case .heard: return "Heard"
+        case .wantsOk: return "Needs your OK"
+        case .working: return "Working"
+        case .question: return "Asks you"
+        case .blocked: return "Blocked"
+        case .failed: return "Failed"
+        case .answer: return ask.unseen ? "New answer" : "Answer"
+        case .done: return "Done"
+        case .yours: return "Yours"
+        case .unknown(let raw): return raw.isEmpty ? "Unknown" : raw
+        }
+    }
+
+    /// Coarse age of the ask's last real activity, in qt's own `age()` style.
+    var ageText: String? {
+        guard let at = ask.finishedDate ?? ask.updatedDate ?? ask.createdDate else { return nil }
+        return shortAge(from: at)
+    }
+
+    /// The live line, drawn only while a run is working. A `now_line` on any
+    /// other state is the hub speaking ahead of slice 4; the row keeps quiet
+    /// rather than showing a stale "reading 14 files" under a finished ask.
+    var nowLine: String? {
+        guard ask.state == .working || ask.state == .heard else { return nil }
+        return ask.nowLine
+    }
+
+    /// ⏎'s target: the ask's one address. Opening is never gated on what the
+    /// server would accept, because reading a thread is the one thing every
+    /// ask always allows -- hence "never dimmed" in the plan.
+    var openURL: URL? { ask.url.flatMap(URL.init(string:)) }
+    var openEnabled: Bool { openURL != nil }
+
+    /// Whether E (done) is offered. The hub's own `moves` list decides: the
+    /// server is the source of truth, and a row whose feed carried no moves
+    /// (the file fallback, a Pass that is down) offers no write it cannot
+    /// honour. Q9 generalises this to every move.
+    var canDone: Bool { ask.moves.contains("done") }
+
+    /// The move buttons the row draws (Q9), curated per state and gated on
+    /// the hub's own `moves` list. Pure over the ask, so the row, the
+    /// keyboard, and the `--ask-dump-rows` / `--ask-press` seams all read
+    /// one table and cannot drift.
+    var moveButtons: [AskMoveButton] { AskRowMoves.buttons(for: ask) }
+
+    /// The "Last attempt: 30m · $1.12 · Sonnet" line a failed row carries:
+    /// what the last run took, in the row's own facts. nil on any other
+    /// state, and on a failed row whose facts say nothing.
+    var lastAttempt: String? { AskRowMoves.lastAttempt(for: ask) }
+
+    /// Whether the row draws its inline answer field (a question): the one
+    /// affordance a question has, offered exactly when the hub says the
+    /// ask still takes a follow-up.
+    var answersInline: Bool {
+        ask.state == .question && ask.moves.contains("follow_up")
+    }
+}
+
+/// Rows grouped into the menu's sections, in draw order.
+enum AskSections {
+    struct Entry: Equatable {
+        let section: AskSection
+        let rows: [AskRowModel]
+    }
+
+    /// Asks the menu does not draw: `done` (the hub's default list already
+    /// excludes it; the file fallback's dropped rows land here) and `yours`
+    /// (John's own to-dos are slice 5, Q11). Hidden, not re-bucketed: a done
+    /// ask sitting in "Needs you" would be a lie with a chevron on it.
+    static func isHidden(_ ask: Ask) -> Bool {
+        ask.place == "done" || ask.place == "yours"
+    }
+
+    static func section(of ask: Ask) -> AskSection? {
+        guard !isHidden(ask) else { return nil }
+        if ask.state == .answer && ask.unseen { return .newForYou }
+        // Anything the menu cannot place reads as needing John -- an unknown
+        // place is a claim this build cannot verify, and the safe reading of
+        // that is "look at it", not "it is fine".
+        return ask.place == "working" ? .working : .needsYou
+    }
+
+    /// Attention order inside Needs you: the rows asking for a decision
+    /// outrank the ones that were merely read. Unknown states sit just after
+    /// the named attention states so a hub that grows a tenth state still
+    /// surfaces its rows, not buries them.
+    private static func rank(_ ask: Ask) -> Int {
+        switch ask.state {
+        case .question: return 0
+        case .blocked: return 1
+        case .failed: return 2
+        case .unknown: return 3
+        case .wantsOk: return 4
+        default: return 5
+        }
+    }
+
+    static func build(asks: [Ask]) -> [Entry] {
+        var buckets: [AskSection: [AskRowModel]] = [:]
+        for ask in asks {
+            guard let s = section(of: ask) else { continue }
+            buckets[s, default: []].append(AskRowModel(ask: ask, section: s))
+        }
+        return AskSection.allCases
+            .sorted { $0.order < $1.order }
+            .compactMap { s -> Entry? in
+                guard let rows = buckets[s], !rows.isEmpty else { return nil }
+                let ordered = rows.sorted { lhs, rhs in
+                    let lr = rank(lhs.ask), rr = rank(rhs.ask)
+                    if lr != rr { return lr < rr }
+                    let l = lhs.ask.finishedDate ?? lhs.ask.updatedDate
+                        ?? lhs.ask.createdDate ?? .distantPast
+                    let r = rhs.ask.finishedDate ?? rhs.ask.updatedDate
+                        ?? rhs.ask.createdDate ?? .distantPast
+                    if l != r { return l > r }
+                    return lhs.id < rhs.id
+                }
+                return Entry(section: s, rows: ordered)
+            }
+    }
+}
+
+/// Everything the menu draws when the feed speaks asks: the sections, the
+/// badge, and -- only on the legacy `/status.json` path -- the model the menu
+/// has always drawn. Built once per poll, pure over the feed.
+struct AskBoard: Equatable {
+    let source: AskFeed.Source
+    let sections: [AskSections.Entry]
+    let counts: AskCounts
+    /// The Pass base the ask feed itself was read from; the client for
+    /// threads and moves writes there, so the two can never disagree.
+    let passURL: String?
+    /// The legacy menu model, present only when this hub predates the ask
+    /// API (a 404 on /asks.json). The menu keeps drawing those rows exactly
+    /// as it always has.
+    let legacy: MenuModel?
+
+    /// The count the badge shows. The hub's own number, verbatim -- never
+    /// recomputed locally, because two clients counting differently is how a
+    /// badge starts to lie.
+    var badge: Int { counts.badge }
+
+    /// Whether the menu should draw ask rows rather than legacy ones. The
+    /// file fallback speaks asks too (Q2 maps the qt ledger locally), so a
+    /// Pass that is down changes the section names, not the shape of the
+    /// menu.
+    var speaksAsks: Bool { source != .status }
+
+    var rows: [AskRowModel] { sections.flatMap { $0.rows } }
+
+    static func build(feed: AskFeed) -> AskBoard {
+        AskBoard(source: feed.source,
+                 sections: AskSections.build(asks: feed.asks),
+                 counts: feed.counts,
+                 passURL: feed.passURL,
+                 legacy: feed.model)
+    }
+
+    func row(id: String) -> AskRowModel? { rows.first { $0.id == id } }
+
+    /// The row whose id contains `needle`, or nil. Substring rather than
+    /// equality because the snapshot seam takes an id-substring and a person
+    /// takes a slug fragment.
+    func row(matching needle: String) -> AskRowModel? {
+        rows.first { $0.id.contains(needle) }
+    }
+
+    /// The header line. Worded from the badge because the badge is the
+    /// number that matters: it is what the bell counts and what clearing an
+    /// answer moves.
+    var headline: String {
+        if badge > 0 { return badge == 1 ? "1 ask needs you" : "\(badge) asks need you" }
+        if counts.working > 0 {
+            return counts.working == 1 ? "1 running" : "\(counts.working) running"
+        }
+        return "All quiet"
+    }
+
+    /// The titles under the header: the unseen answers first (they are the
+    /// headline's newest members), then the rest of what needs John.
+    func headlinePreview(limit: Int = 3) -> [String] {
+        let pool = (sections.first { $0.section == .newForYou }?.rows ?? [])
+            + (sections.first { $0.section == .needsYou }?.rows ?? [])
+        return Array(pool.prefix(limit).map { $0.title })
+    }
+}
+
+/// What expanding a row does, decided purely so the view and the seam run the
+/// same plan. The thread fetch happens only when the hub is the source (the
+/// file fallback has no thread endpoint; it shows the row's excerpt), and
+/// `seen` is posted only for a row still marked unseen -- expanding is the
+/// moment an answer stops counting toward the badge.
+enum AskExpand {
+    struct Plan: Equatable {
+        let fetchThread: Bool
+        let postSeen: Bool
+    }
+
+    static func plan(ask: Ask, source: AskFeed.Source) -> Plan {
+        Plan(fetchThread: source == .asks,
+             postSeen: source == .asks && ask.unseen)
+    }
+}
+
+/// The one-line verdict a move leaves under its row. The wording lives here,
+/// not in the view, so `--ask-done` prints the exact line the menu would
+/// draw, and a refusal shows the hub's own words -- a 409's message *is* the
+/// answer ("That ask is already done."), never "HTTP 409".
+enum AskMoveLine {
+    /// The line for a move that took. A token means Z can take it back, so
+    /// the line says so while the window is open.
+    static func success(verb: String, undo: AskUndo?) -> String {
+        guard undo != nil else { return verb }
+        return "\(verb) \u{00B7} Z to undo"
+    }
+
+    /// The line for a move the hub refused or that never reached it.
+    static func failure(_ result: MoveResult) -> String { result.message }
+
+    static func done(_ result: MoveResult) -> String { line(move: "done", result: result) }
+
+    static func undo(_ result: MoveResult) -> String {
+        result.ok ? "Undone" : failure(result)
+    }
+
+    /// The verb each move's success line carries, so a write says what
+    /// happened rather than naming the hub's route for it.
+    static func verb(for move: String) -> String {
+        switch move {
+        case "done": return "Done"
+        case "drop": return "Dropped"
+        case "stop": return "Stopped"
+        case "allow_once": return "Allowed once"
+        case "allow_always": return "Always allowed"
+        case "skip": return "Skipped that step"
+        case "retry": return "Trying again"
+        case "mine": return "Taken as yours"
+        case "follow_up": return "Follow-up sent"
+        case "retry_with_changes": return "Redoing it with your changes"
+        case "note": return "Note queued"
+        default: return move.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    /// The line any move leaves under its row (Q9 generalizes E's): the
+    /// verb plus Z's offer when the hub handed back a token, the hub's own
+    /// words when it refused. A 409/501 message *is* the answer ("allow_once
+    /// is not built yet"), never "HTTP 501".
+    static func line(move: String, result: MoveResult) -> String {
+        result.ok ? success(verb: verb(for: move), undo: result.undo) : failure(result)
+    }
+}
+
+// MARK: - Moves in the row (Q9)
+
+/// One affordance a row offers, derived from the hub's own `moves` list --
+/// the server is the source of truth, so a move the hub did not offer is a
+/// button the row does not draw, and a refusal that comes back anyway is
+/// shown in the hub's words rather than as a dead button.
+struct AskMoveButton: Equatable, Identifiable {
+    /// What pressing it does.
+    enum Act: Equatable {
+        /// POST /asks/<id>/<move> with an empty body.
+        case post(String)
+        /// POST with one typed field: the move and the JSON body key its
+        /// words travel under (`text` for follow_up/note, `prompt` for the
+        /// moves that replace the words).
+        case text(move: String, bodyKey: String)
+        /// Client-only (section 1.2): the answer onto the pasteboard.
+        case copyAnswer
+        /// Client-only: the ask's one address, always allowed.
+        case openThread
+    }
+
+    let act: Act
+    let title: String
+    /// The key glyph the row shows in its tooltip and the root handler
+    /// matches: "r", "R" (shifted), "c", "e", "a", "A", "x", or "return".
+    /// nil for the buttons the plan leaves unkeyed.
+    let key: String?
+    /// Drawn as the row's inline field (a question's answer box) rather
+    /// than as a button in the row's tail.
+    var inline: Bool = false
+
+    var id: String { move ?? "client:\(title)" }
+
+    /// The server move this button posts, nil for the client-only acts.
+    var move: String? {
+        switch act {
+        case .post(let m), .text(let m, _): return m
+        default: return nil
+        }
+    }
+
+    /// Whether it opens a text field before anything is posted.
+    var wantsText: Bool {
+        if case .text = act { return true }
+        return false
+    }
+
+    /// The SF Symbol the row draws for it.
+    var symbol: String {
+        switch act {
+        case .text("follow_up", _): return "bubble.left"
+        case .text: return "square.and.pencil"
+        case .copyAnswer: return "doc.on.doc"
+        case .openThread: return "arrow.up.forward.app"
+        case .post("done"): return "checkmark.circle"
+        case .post("retry"): return "arrow.clockwise"
+        case .post("mine"): return "person.crop.circle"
+        case .post("drop"): return "xmark.circle"
+        case .post("allow_once"): return "checkmark.circle"
+        case .post("allow_always"): return "lock.open"
+        case .post("skip"): return "forward"
+        case .post("stop"): return "stop.fill"
+        default: return "circle"
+        }
+    }
+
+    /// The key as a person reads it: ⏎ for return, ⇧ before the shifted
+    /// letters, the bare letter otherwise.
+    var keyLabel: String? {
+        guard let key else { return nil }
+        if key == "return" { return "\u{23CE}" }
+        return key == key.uppercased() && key != key.lowercased()
+            ? "\u{21E7}\(key)" : key
+    }
+
+    /// The tooltip: what it does, and the key that does it when it has one.
+    var helpText: String {
+        keyLabel.map { "\(title) (\($0))" } ?? title
+    }
+}
+
+/// The buttons each state's row offers, curated in the plan's order and
+/// gated on the hub's `moves` list; the prefill, body key, and placeholder
+/// a text move's field opens with; and the last-attempt line a failed row
+/// draws. One pure table, so the view, the keyboard, and the seams cannot
+/// disagree about what a row can do.
+enum AskRowMoves {
+    /// The plan's curated buttons for one ask. `answer`: Follow up R, Redo
+    /// with changes ⇧R, Copy C, Open ⏎, Done E. `failed`: Try with changes
+    /// ⏎, Try again, I'll do it, Drop. `blocked`: Allow once A, Always
+    /// allow ⇧A, Skip, Stop X. `question`: the inline answer field.
+    /// `working`: Stop. Every other state (and the file fallback, whose
+    /// rows carry no moves at all) offers nothing here.
+    static func buttons(for ask: Ask) -> [AskMoveButton] {
+        func offers(_ move: String) -> Bool { ask.moves.contains(move) }
+        switch ask.state {
+        case .answer:
+            var out: [AskMoveButton] = []
+            if offers("follow_up") {
+                out.append(AskMoveButton(act: .text(move: "follow_up", bodyKey: "text"),
+                                         title: "Follow up\u{2026}", key: "r"))
+            }
+            if offers("retry_with_changes") {
+                out.append(AskMoveButton(act: .text(move: "retry_with_changes", bodyKey: "prompt"),
+                                         title: "Redo with changes\u{2026}", key: "R"))
+            }
+            if offers("copy") {
+                out.append(AskMoveButton(act: .copyAnswer, title: "Copy", key: "c"))
+            }
+            // Client-only and ungated: reading the thread is the one thing
+            // every ask always allows (Q3's "never dimmed" rule).
+            out.append(AskMoveButton(act: .openThread, title: "Open", key: "return"))
+            if offers("done") {
+                out.append(AskMoveButton(act: .post("done"), title: "Done", key: "e"))
+            }
+            return out
+        case .failed:
+            var out: [AskMoveButton] = []
+            if offers("retry_with_changes") {
+                out.append(AskMoveButton(act: .text(move: "retry_with_changes", bodyKey: "prompt"),
+                                         title: "Try with changes\u{2026}", key: "return"))
+            }
+            if offers("retry") {
+                out.append(AskMoveButton(act: .post("retry"), title: "Try again", key: nil))
+            }
+            if offers("mine") {
+                out.append(AskMoveButton(act: .post("mine"), title: "I'll do it", key: nil))
+            }
+            if offers("drop") {
+                out.append(AskMoveButton(act: .post("drop"), title: "Drop", key: nil))
+            }
+            return out
+        case .blocked:
+            var out: [AskMoveButton] = []
+            if offers("allow_once") {
+                out.append(AskMoveButton(act: .post("allow_once"), title: "Allow once", key: "a"))
+            }
+            if offers("allow_always") {
+                out.append(AskMoveButton(act: .post("allow_always"),
+                                         title: "Always allow", key: "A"))
+            }
+            if offers("skip") {
+                out.append(AskMoveButton(act: .post("skip"), title: "Skip", key: nil))
+            }
+            if offers("stop") {
+                out.append(AskMoveButton(act: .post("stop"), title: "Stop", key: "x"))
+            }
+            return out
+        case .question:
+            return offers("follow_up")
+                ? [AskMoveButton(act: .text(move: "follow_up", bodyKey: "text"),
+                                 title: "Answer\u{2026}", key: nil, inline: true)]
+                : []
+        case .working:
+            return offers("stop")
+                ? [AskMoveButton(act: .post("stop"), title: "Stop", key: nil)]
+                : []
+        default:
+            return []
+        }
+    }
+
+    /// The JSON body key a text move's typed words travel under (section
+    /// 1.6): follow_up and note say `text`; the moves that replace the
+    /// words (retry_with_changes, edit_and_run) say `prompt`.
+    static func bodyKey(for move: String) -> String {
+        switch move {
+        case "follow_up", "note": return "text"
+        default: return "prompt"
+        }
+    }
+
+    /// The words a text move's field opens with. Try-with-changes opens on
+    /// the original words -- "what would you change" is a question that
+    /// starts from what was said -- and every other text move opens empty.
+    static func prefill(for ask: Ask, move: String) -> String? {
+        move == "retry_with_changes" ? ask.words : nil
+    }
+
+    /// The placeholder a text move's field carries while empty.
+    static func placeholder(for move: String) -> String {
+        switch move {
+        case "follow_up": return "Follow up, or tell it what to change\u{2026}"
+        case "retry_with_changes": return "Change the words and run it again\u{2026}"
+        default: return "What should it do?"
+        }
+    }
+
+    /// The "Last attempt: 30m · $1.12 · Sonnet" line under a failed row:
+    /// the last run's elapsed time, cost, and model from the row's own
+    /// facts, joined only from the facts that exist.
+    static func lastAttempt(for ask: Ask) -> String? {
+        guard ask.state == .failed else { return nil }
+        var parts: [String] = []
+        if let elapsed = ask.facts.elapsedS {
+            let s = Int(elapsed)
+            parts.append(s >= 60 ? "\(s / 60)m" : "\(s)s")
+        }
+        if let cost = ask.facts.costUsd {
+            parts.append(String(format: "$%.2f", cost))
+        }
+        if let model = ask.facts.model, !model.isEmpty {
+            parts.append(model.prefix(1).uppercased() + model.dropFirst().lowercased())
+        }
+        guard !parts.isEmpty else { return nil }
+        return "Last attempt: " + parts.joined(separator: " \u{00B7} ")
+    }
+}
+
+/// What one bare keypress does on a highlighted ask row. Pure, and the one
+/// path both the root key handler and the `--ask-press` seam take, so a key
+/// can never do one thing in a test and another in the menu.
+///
+/// A field with focus owns every key: `fieldHasFocus` returns nil for them
+/// all -- letters included -- which is what keeps typing into a row's
+/// follow-up field from firing R, E, or Z under the words.
+enum AskKeys {
+    static func target(ask: Ask, key: String, fieldHasFocus: Bool) -> AskMoveButton? {
+        guard !fieldHasFocus else { return nil }
+        return AskRowMoves.buttons(for: ask).first { $0.key == key }
+    }
+
+    /// The row's ⏎ target: the button that carries the return key (Try
+    /// with changes on a failed row, Open on an answer), nil when ⏎ keeps
+    /// its default meaning of opening the thread.
+    static func returnTarget(ask: Ask, fieldHasFocus: Bool) -> AskMoveButton? {
+        target(ask: ask, key: "return", fieldHasFocus: fieldHasFocus)
+    }
+}
+
+/// The row editor's open state (Q9): the row, the move its field feeds,
+/// that move's body key, and the words the field holds (the prefill it
+/// opened with, plus whatever has been typed since).
+struct AskEditState: Equatable {
+    let id: String
+    let move: String
+    let bodyKey: String
+    var text: String
+}
+
+/// The quick filter over ask rows. Same folding and AND-of-terms rule as
+/// RowFilter, over what an ask row shows or carries -- so typing into the
+/// field the footer's ⌘F opens narrows the ask list the same way it has
+/// always narrowed the legacy one.
+enum AskFilter {
+    static func matches(_ ask: Ask, query: String) -> Bool {
+        let terms = RowFilter.terms(query)
+        guard !terms.isEmpty else { return true }
+        let haystack = RowFilter.fold([
+            ask.title,
+            ask.words,
+            ask.state.raw,
+            ask.answerExcerpt ?? "",
+            ask.reason ?? "",
+            ask.question ?? "",
+            ask.door ?? "",
+            ask.id,
+        ].joined(separator: "\u{1F}"))
+        return terms.allSatisfy { haystack.contains($0) }
+    }
+
+    static func apply(_ rows: [AskRowModel], query: String) -> [AskRowModel] {
+        guard !RowFilter.terms(query).isEmpty else { return rows }
+        return rows.filter { matches($0.ask, query: query) }
+    }
+}
+
+/// The footer stub's text, fixed by the plan. Slice 1 says the words only:
+/// ⌘F find across every ask and the ⌘D desk are Q11's to wire.
+enum AskFooter {
+    static let stub = "Find any ask \u{2318}F / Open the desk \u{2318}D"
 }
